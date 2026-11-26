@@ -78,6 +78,7 @@ class Prefiller {
   __nv_bfloat16* wscratch_;  // dequantized FP8 rows of wproj / wo (dense_fp8)
   std::int64_t* ids_;
   int kpos_rows_;
+  bool split_sliding_;
 };
 
 }  // namespace ingine::model

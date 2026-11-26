@@ -17,6 +17,7 @@ inline constexpr int kKvDim = kKvHeads * kHeadDim;  // 1024
 inline constexpr int kInter = 1152, kExperts = 128, kTopK = 8;
 inline constexpr int kAttnKeyTile = 64;    // keys per attention tile (tile bounds granularity)
 inline constexpr int kAttnMaxTiles = 64;   // explicit-position key tiles per call (ring + chunk)
+inline constexpr int kAttnBlockRows = 128;  // query rows (token, head of the GQA group) per attention block
 
 // ------------------------------------------------------------------------------------------------- GEMM
 
