@@ -291,7 +291,8 @@ constexpr uint64_t kLock[8][kLocks] = {
     {0x96acab9db3688209ull, 0x0860e87ad1181b6bull, 0xed4e557d3be4bc9full, 0x40873edc05b60326ull, 0x1ead80b992b2cc6aull, 0xeb11175f858ef93eull},
 };
 
-// Recorded on sm_86 (RTX 3090), same inputs; kLock above is sm_120a (RTX 5090).
+// Recorded on sm_86 (RTX 3090), same inputs; sm_89 (RTX 4090) gives the same bits.
+// kLock above is sm_120a (RTX 5090).
 constexpr uint64_t kLock86[8][kLocks] = {
     {0xeaaffb36e3fef998ull, 0x790e36f18198ffb7ull, 0xb70817049b1d2fa3ull, 0x95f383aced6e315eull, 0xa84475ae5a0634c4ull, 0x2a8f3dcf4b8c8d5bull},
     {0x92dd6b80b87f5996ull, 0xf8fd15853a2fb395ull, 0x6ec12fda055a92d2ull, 0x1a0890341370ce17ull, 0xeb84b861bb999757ull, 0x7bcce14792fdb4e7ull},
@@ -339,7 +340,7 @@ int main() {
   }
   // [Agent] Each GPU generation has its own hashes; a GPU with none recorded prints its hashes and is not checked.
   const int cc = device_cc();
-  const uint64_t(*lock)[kLocks] = cc == 120 ? kLock : cc == 86 ? kLock86 : nullptr;
+  const uint64_t(*lock)[kLocks] = cc == 120 ? kLock : cc == 86 || cc == 89 ? kLock86 : nullptr;
   for (int M = 1; M <= 8; ++M) {
     bool same = true;
     std::string diff;

@@ -632,7 +632,8 @@ constexpr uint64_t kLock[8][3] = {
     {0x485152f0b0ead6f4ull, 0xd6dded13cf36fa5cull, 0xffe0d044657686f0ull},
 };
 
-// Recorded on sm_86 (RTX 3090), same inputs; kLock above is sm_120a (RTX 5090).
+// Recorded on sm_86 (RTX 3090), same inputs; sm_89 (RTX 4090) gives the same bits.
+// kLock above is sm_120a (RTX 5090).
 constexpr uint64_t kLock86[8][3] = {
     {0x2b27dd32a1dd100eull, 0x5cf894dc6987c9aaull, 0x51c35a315b7e90b3ull},
     {0x75334db64229e2e1ull, 0x1940463968d37814ull, 0xea1ef0b8721fb3ffull},
@@ -648,7 +649,7 @@ bool test_bit_lock() {
   bool ok = true;
   // [Agent] Each GPU generation has its own hashes; a GPU with none recorded prints its hashes and is not checked.
   const int cc = device_cc();
-  const uint64_t(*lock)[3] = cc == 120 ? kLock : cc == 86 ? kLock86 : nullptr;
+  const uint64_t(*lock)[3] = cc == 120 ? kLock : cc == 86 || cc == 89 ? kLock86 : nullptr;
   for (int M = 1; M <= 8; ++M) {
     LockGen gm{0x5eed0000ull + uint64_t(M)}, gg{0x5eed1000ull + uint64_t(M)}, gr{0x5eed2000ull + uint64_t(M)};
     bool pair_ok = true;
