@@ -33,6 +33,10 @@ struct DecodeArgs {
   void* workspace = nullptr;        // workspace_bytes(M) bytes, zeroed once at allocation
   std::size_t workspace_size = 0;
   __nv_bfloat16* out = nullptr;     // bf16 [M, 3072]
+  // [Agent] Blocks per KV head of a full layer at width > 1 on GPUs without clusters (sm_86, sm_89), 1..16; 0 = enough
+  // to fill the GPU in one wave. A different split sums the softmax in another order (other bits, same math). Ignored
+  // with clusters, at width 1 and on sliding layers (16).
+  int split = 0;
 };
 
 // Bytes of workspace attn_decode needs for up to max_m tokens: a counter (zero the workspace once; the
