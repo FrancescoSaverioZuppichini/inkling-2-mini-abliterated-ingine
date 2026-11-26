@@ -80,6 +80,25 @@ driver holds CUDA programs at. On an RTX 5090 that raises the memory clock by 1.
 0.8%; outputs and idle power are unchanged. It needs driver 595 or newer;
 `INGINE_GPU_PROFILE=0 bash setup.sh --update` removes it.
 
+## RTX 3090 and RTX 4090
+
+The installer targets the RTX 5090. On a 24 GB RTX 3090 (sm_86) or RTX 4090 (sm_89), build by hand with a system CUDA 13
+toolkit, CMake 3.28 or newer and GCC 12 to 16:
+
+```bash
+cd native
+cmake --preset ampere            # sm_86 and sm_89 in one binary
+cmake --build --preset ampere
+build-ampere/apps/serve/ingine-serve --engine --model-dir <Inkling-2-Mini folder> --port 8003 \
+  --max-ctx 245760 --kv-fp8 --spec --spec-threshold 0.8 --no-vision --embed-host --prefill-chunk 1024
+```
+
+That serves the original checkpoint in BF16 with 245,760 tokens of context in about 23.6 GB. `--embed-host` keeps the
+embedding table (0.86 GiB) in host memory that the GPU reads over PCIe, and `--prefill-chunk 1024` shrinks the prefill
+workspace; both make room for the context on 24 GB. Without clusters, PDL or FP4/FP8 converts these GPUs take their own
+kernel paths (exact decoders, a cooperative exchange for the router and message gates, one-wave attention); the
+`ampere-dev` preset adds the tests.
+
 ## Use
 
 ```bash
