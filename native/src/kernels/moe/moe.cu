@@ -759,16 +759,27 @@ void moe_down(const __nv_bfloat16* act, int M, const int* idx, const float* wts,
     const bool nv = fmt == Format::NVFP4;
     const uint8_t* const w = static_cast<const uint8_t*>(w2);
     const uint8_t* const s = static_cast<const uint8_t*>(w2_scale);
-    // [Agent] The split kernel only for NVFP4 (44 of 48 visits): MXFP8 rows are twice the bytes, so the old kernel's
-    // 18 KB-per-round blocks already keep enough in flight, and the split one measured 3-5 % slower at widths >= 2.
-    if (device_has_clusters() || !nv) {
+    // [Agent] MXFP8 rows are twice the bytes, so the old kernel's 36 KB-per-round blocks keep enough in flight; what
+    // decides is its last wave of 144 one-per-SM tiles. On the RTX 3090 (82 SMs) that wave is 62 tiles and the split
+    // kernel measured 3-5 % slower at widths >= 2; on the RTX 4090 (128 SMs) it is 16 tiles and the split kernel is
+    // 11-14 % faster. NVFP4 (44 of 48 visits) always splits.
+    static const bool split_mxfp8 = [] {
+        int dev = 0, sms = 0;
+        CUDA_CHECK(cudaGetDevice(&dev));
+        CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
+        return H / TILE % sms < sms / 2;
+    }();
+    if (device_has_clusters() || (!nv && !split_mxfp8)) {
         launch(nv ? moe_down_kernel<0> : moe_down_kernel<1>, dim3(H / TILE), DOWN_WARPS * 32, pdl, stream, act, idx,
                wts, w, s, nv ? w2_factor : nullptr, M, conv_w, conv_state, out, conv_hist);
         return;
     }
     const int gy = M == 1 ? TOPK : std::max(TOPK, M * TOPK / SPLIT_SLOT_DIV);
-    launch(gy < M * TOPK ? moe_down_split_kernel<0, true> : moe_down_split_kernel<0, false>, dim3(H / TILE, gy),
-           SPLIT_WARPS * 32, false, stream, act, idx, wts, w, s, w2_factor, M, conv_w, conv_state, out, conv_hist);
+    const bool loop = gy < M * TOPK;
+    launch(nv ? (loop ? moe_down_split_kernel<0, true> : moe_down_split_kernel<0, false>)
+              : (loop ? moe_down_split_kernel<1, true> : moe_down_split_kernel<1, false>),
+           dim3(H / TILE, gy), SPLIT_WARPS * 32, false, stream, act, idx, wts, w, s, nv ? w2_factor : nullptr, M, conv_w,
+           conv_state, out, conv_hist);
 }
 
 }  // namespace ingine::kernels::moe
