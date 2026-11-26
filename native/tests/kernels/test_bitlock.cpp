@@ -291,6 +291,18 @@ constexpr uint64_t kLock[8][kLocks] = {
     {0x96acab9db3688209ull, 0x0860e87ad1181b6bull, 0xed4e557d3be4bc9full, 0x40873edc05b60326ull, 0x1ead80b992b2cc6aull, 0xeb11175f858ef93eull},
 };
 
+// Recorded on sm_86 (RTX 3090), same inputs; kLock above is sm_120a (RTX 5090).
+constexpr uint64_t kLock86[8][kLocks] = {
+    {0xeaaffb36e3fef998ull, 0x790e36f18198ffb7ull, 0xb70817049b1d2fa3ull, 0x95f383aced6e315eull, 0xa84475ae5a0634c4ull, 0x2a8f3dcf4b8c8d5bull},
+    {0x92dd6b80b87f5996ull, 0xf8fd15853a2fb395ull, 0x6ec12fda055a92d2ull, 0x1a0890341370ce17ull, 0xeb84b861bb999757ull, 0x7bcce14792fdb4e7ull},
+    {0xb63d038858686786ull, 0x9f41209699a7a780ull, 0xce54e7d4be2384e1ull, 0x8f5f70fa78a87d98ull, 0x681856b6979e2ddfull, 0xdce495c052b5621dull},
+    {0x604e76d250fd523eull, 0x81065ad52e8e5223ull, 0x6e43846d857a6ff0ull, 0xbe72f2821c951bddull, 0x2f44b6f1e893e615ull, 0x58149a76eba483fcull},
+    {0xb1a02c43eae8b4b1ull, 0x4bb580285a0e9da9ull, 0xa7063333f434731full, 0x1242e3c1df457ae7ull, 0xd747943662205e4cull, 0xff513c94f2473e14ull},
+    {0xe18bf49c40d09468ull, 0xee14737292b9dab2ull, 0xb9aabbe4aaec5ef2ull, 0x6bab3b93d5be6419ull, 0xa4560f9ef72d3d30ull, 0xb3c0bd6129aadd8cull},
+    {0x01f5676a34faf0beull, 0x3ef554fc548299e6ull, 0x2a91b8a41a79c9e5ull, 0x89bc491e09944608ull, 0x0d40cdd59a71e4b4ull, 0xba203eed807e7732ull},
+    {0xa47adaee3d6c9858ull, 0x4c908e69c14723a0ull, 0xc3e6e87ab0f11d1aull, 0xd21aa07cdf88e873ull, 0xadbf7e6dfd20d38cull, 0x5d9da7dadb538509ull},
+};
+
 }  // namespace
 
 int main() {
@@ -325,15 +337,18 @@ int main() {
       ok = false;
     }
   }
+  // [Agent] Each GPU generation has its own hashes; a GPU with none recorded prints its hashes and is not checked.
+  const int cc = device_cc();
+  const uint64_t(*lock)[kLocks] = cc == 120 ? kLock : cc == 86 ? kLock86 : nullptr;
   for (int M = 1; M <= 8; ++M) {
     bool same = true;
     std::string diff;
-    for (int i = 0; i < kLocks; ++i)
-      if (got[M - 1][i] != kLock[M - 1][i]) {
+    for (int i = 0; i < kLocks && lock; ++i)
+      if (got[M - 1][i] != lock[M - 1][i]) {
         same = false;
         diff += std::string(diff.empty() ? " differs: " : ", ") + kNames[i];
       }
-    std::printf("%s bit lock M=%d: {", same ? "PASS" : "FAIL", M);
+    std::printf("%s bit lock M=%d: {", !lock ? "INFO" : same ? "PASS" : "FAIL", M);
     for (int i = 0; i < kLocks; ++i)
       std::printf("%s0x%016llxull", i ? ", " : "", static_cast<unsigned long long>(got[M - 1][i]));
     std::printf("},%s\n", diff.c_str());

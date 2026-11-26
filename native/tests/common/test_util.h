@@ -47,6 +47,16 @@ inline bool skip_without_gpu() {
 }
 
 // Returns the value of an environment variable or an empty string (and prints a skip line).
+// [Agent] Compute capability of the current device as 10 * major + minor (86 = RTX 3090, 120 = RTX 5090). Bit-lock
+// hashes are recorded per GPU generation: tensor cores and special-function units round differently between them.
+inline int device_cc() {
+    int dev = 0, major = 0, minor = 0;
+    cudaGetDevice(&dev);
+    cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+    cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
+    return 10 * major + minor;
+}
+
 inline std::string env_or_skip(const char* name) {
   const char* v = std::getenv(name);
   if (!v || !*v) {

@@ -30,8 +30,16 @@ __device__ __forceinline__ void cluster_wait() { asm volatile("barrier.cluster.w
 // completed and its writes are visible. pdl_trigger() lets the next kernel of the stream start its own
 // prologue (it still waits for this grid's completion before reading our outputs). Both are no-ops when
 // the kernel was not launched with the PDL attribute.
-__device__ __forceinline__ void pdl_wait() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
-__device__ __forceinline__ void pdl_trigger() { asm volatile("griddepcontrol.launch_dependents;" ::: "memory"); }
+__device__ __forceinline__ void pdl_wait() {
+#if __CUDA_ARCH__ >= 900
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
+}
+__device__ __forceinline__ void pdl_trigger() {
+#if __CUDA_ARCH__ >= 900
+  asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+#endif
+}
 // griddepcontrol.wait that keeps the loads issued before it ahead of it. ptxas sinks independent loads
 // below a plain griddepcontrol.wait (legal: the wait only orders later accesses), even below a
 // __syncthreads, which silently turns the "weights in flight before the wait" prefetch into loads issued
@@ -39,16 +47,21 @@ __device__ __forceinline__ void pdl_trigger() { asm volatile("griddepcontrol.lau
 // `zero` must be 0 at run time and opaque to the compiler (a kernel argument).
 __device__ __forceinline__ void pdl_wait_fenced(uint32_t zero) {
 #pragma unroll 1
-  for (uint32_t i = 0; i <= zero; ++i) asm volatile("griddepcontrol.wait;" ::: "memory");
+  for (uint32_t i = 0; i <= zero; ++i) {
+#if __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
+  }
 }
 
-// Launches `kernel` on `stream` (graph capturable): as clusters of `cl` CTAs if cl > 1, with
-// the programmatic-stream-serialization attribute if `pdl` (captured as a programmatic graph edge).
-// Cluster sizes above 8 need the non-portable opt-in; shared memory above 48 KB the dynamic-size opt-in.
+// Launches `kernel` on `stream` (graph capturable): as clusters of `cl` CTAs if cl > 1 ([Agent] before sm_90 one
+// cooperative grid: the cluster kernels then exchange through a global mailbox and cg::this_grid().sync()), with the programmatic-stream-serialization attribute if `pdl` (captured as a programmatic graph
+// edge). Cluster sizes above 8 need the non-portable opt-in; shared memory above 48 KB the dynamic-size opt-in.
 template <class... KArgs, class... Args>
 void launch_ex(void (*kernel)(KArgs...), dim3 grid, int block, int smem, int cl, bool pdl, cudaStream_t stream,
                Args&&... args) {
-  if (cl > 8) CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
+  const bool clusters = device_has_clusters();
+  if (cl > 8 && clusters) CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
   // static + dynamic shared memory above 48 KB needs the opt-in, whatever the split
   if (smem > 0) CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
   cudaLaunchConfig_t cfg = {};
@@ -58,11 +71,15 @@ void launch_ex(void (*kernel)(KArgs...), dim3 grid, int block, int smem, int cl,
   cfg.stream = stream;
   cudaLaunchAttribute attr[2];
   int n = 0;
-  if (cl > 1) {
+  if (cl > 1 && clusters) {
     attr[n].id = cudaLaunchAttributeClusterDimension;
     attr[n].val.clusterDim.x = cl;
     attr[n].val.clusterDim.y = 1;
     attr[n].val.clusterDim.z = 1;
+    ++n;
+  } else if (cl > 1) {
+    attr[n].id = cudaLaunchAttributeCooperative;
+    attr[n].val.cooperative = 1;
     ++n;
   }
   if (pdl) {

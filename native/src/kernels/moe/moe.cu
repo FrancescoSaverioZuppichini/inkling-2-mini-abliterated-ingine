@@ -43,6 +43,7 @@
 // Ported from engine/csrc/moe/moe.cu (kernel bodies unchanged; torch launchers -> raw pointers).
 #include "kernels/moe/moe.h"
 
+#include "kernels/common/fp8x.cuh"
 #include "kernels/common/l2.cuh"
 
 #include "core/device.h"
@@ -50,6 +51,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -63,6 +65,7 @@ constexpr int TOPK = 8;
 constexpr int MAXM = 8;
 constexpr int TILE = 16;                    // weight rows per block
 constexpr int UP_WARPS = H / 128;           // 18: one column group of W13 per warp
+constexpr int UP_SLOT_DIV = 4;  // pre-sm_90: moe_up launches M*8/UP_SLOT_DIV slot blocks (at least 8); 4 by kbench (hold 8)
 constexpr int DOWN_GROUPS = I / 128;        // 9 column groups of W2
 constexpr int DOWN_PAR = 2;                 // experts per round
 constexpr int DOWN_WARPS = DOWN_GROUPS * DOWN_PAR;
@@ -159,12 +162,7 @@ __device__ __forceinline__ Chunk<FMT> load_chunk(const uint8_t* codes, const uin
 
 // ------------------------------------------------------------------------------------------ decode
 
-__device__ __forceinline__ uint32_t f16x2_from_e4m3x2(uint16_t v) {
-    uint32_t r;
-    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(r) : "h"(v));
-    return r;
-}
-
+#if __CUDA_ARCH__ >= 1000  // [Agent] the hardware E2M1 convert; below sm_100 decode() uses the lookup table
 __device__ __forceinline__ void f16x2_from_e2m1x4(uint32_t w, uint32_t (&h)[4]) {
     asm("{\n"
         ".reg .b8 b0, b1, b2, b3;\n"
@@ -177,16 +175,60 @@ __device__ __forceinline__ void f16x2_from_e2m1x4(uint32_t w, uint32_t (&h)[4]) 
         : "=r"(h[0]), "=r"(h[1]), "=r"(h[2]), "=r"(h[3])
         : "r"(w));
 }
+#endif
 
 __device__ __forceinline__ uint32_t pack_bf16(float lo, float hi) {
     __nv_bfloat162 v = __floats2bfloat162_rn(lo, hi);
     return *reinterpret_cast<uint32_t*>(&v);
 }
 
+__device__ __forceinline__ uint32_t prmt(uint32_t a, uint32_t b, uint32_t sel) {
+    uint32_t r;
+    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(r) : "r"(a), "r"(b), "r"(sel));
+    return r;
+}
+
+// [Agent] Below sm_100 there is no E2M1 convert, and the per-element path (bit placement, f16 multiply by the scale,
+// widen, multiply by the factor, pack) cost ~20 instructions per element pair: on the RTX 3090 that made moe_up
+// issue-bound (~25 of its 37 us at width 1). A 16-element block has one scale, so its elements can only take 8
+// magnitudes: the table holds their final BF16 values, low bytes in (l0, l1) and high bytes in (h0, h1), and each
+// element is then a byte select by its 3 magnitude bits plus a sign flip, ~7 instructions per pair in all.
+// Table entries are exactly decode_experts' values: code * scale is exact (it is exact even in f16), so the value
+// is round_fp32(mag * s * f), then BF16. Only two such products are rounded: a = s f and b = (1.5 s) f (1.5 s is
+// exact); every other magnitude is a or b times a power of two, which is exact in fp32 for any scale and factor
+// whose product stays far from the subnormal range (|s f| > 2^-120). A negative code is the negated value, which
+// rounds to the negated BF16 (round to nearest even is symmetric), so the sign is an XOR of bit 15.
+struct Lut {
+    uint32_t l0, l1, h0, h1;  // byte k of l0|l1 (h0|h1) = low (high) byte of the BF16 value of magnitude code k
+};
+__device__ __forceinline__ Lut make_lut(float s, float f) {
+    const float a = s * f, b = (1.5f * s) * f;
+    // magnitude codes 0..7 = 0, 0.5, 1, 1.5, 2, 3, 4, 6
+    const uint32_t w0 = pack_bf16(0.f * a, 0.5f * a), w1 = pack_bf16(a, b);
+    const uint32_t w2 = pack_bf16(2.f * a, 2.f * b), w3 = pack_bf16(4.f * a, 4.f * b);
+    return Lut{prmt(w0, w1, 0x6420), prmt(w2, w3, 0x6420), prmt(w0, w1, 0x7531), prmt(w2, w3, 0x7531)};
+}
+// 8 E2M1 codes (element k in nibble k) -> 4 bf16x2 words (elements 2i, 2i + 1 in word i, low half first).
+__device__ __forceinline__ void lut_word(uint32_t w, const Lut& t, uint32_t* o) {
+    const uint32_t sel = w & 0x77777777u;  // magnitude bits; prmt treats a selector's bit 3 as sign-replicate
+    const uint32_t lo03 = prmt(t.l0, t.l1, sel), lo47 = prmt(t.l0, t.l1, sel >> 16);
+    uint32_t hi03 = prmt(t.h0, t.h1, sel), hi47 = prmt(t.h0, t.h1, sel >> 16);
+    // sign of element n (nibble bit 3) to bit 7 of byte n: bytes [c0, c0, c1, c1] of the codes, the even elements'
+    // sign bits shifted up by 4
+    const uint32_t x03 = prmt(w, 0u, 0x1100), x47 = prmt(w, 0u, 0x3322);
+    hi03 ^= ((x03 << 4) & 0x00800080u) | (x03 & 0x80008000u);
+    hi47 ^= ((x47 << 4) & 0x00800080u) | (x47 & 0x80008000u);
+    o[0] = prmt(lo03, hi03, 0x5140);
+    o[1] = prmt(lo03, hi03, 0x7362);
+    o[2] = prmt(lo47, hi47, 0x5140);
+    o[3] = prmt(lo47, hi47, 0x7362);
+}
+
 // Decodes a chunk into 16 bf16x2 words (element pairs 0..15) holding exactly decode_experts' values.
 __device__ __forceinline__ void decode(const Chunk<0>& ch, float factor, uint32_t (&o)[16]) {
-    const uint32_t s2 = f16x2_from_e4m3x2(ch.s);
+    const uint32_t s2 = fp8x::e4m3x2_to_f16x2(ch.s);
     const __half2 sc = *reinterpret_cast<const __half2*>(&s2);
+#if __CUDA_ARCH__ >= 1000
     const __half2 slo = __low2half2(sc), shi = __high2half2(sc);
     const uint32_t words[4] = {ch.q.x, ch.q.y, ch.q.z, ch.q.w};
 #pragma unroll
@@ -202,21 +244,50 @@ __device__ __forceinline__ void decode(const Chunk<0>& ch, float factor, uint32_
             o[4 * w + b] = pack_bf16(v.x * factor, v.y * factor);
         }
     }
+#else
+    const float2 sf = __half22float2(sc);
+    const Lut tlo = make_lut(sf.x, factor), thi = make_lut(sf.y, factor);
+    lut_word(ch.q.x, tlo, o);
+    lut_word(ch.q.y, tlo, o + 4);
+    lut_word(ch.q.z, thi, o + 8);
+    lut_word(ch.q.w, thi, o + 12);
+#endif
 }
 
 __device__ __forceinline__ void decode(const Chunk<1>& ch, float /*factor*/, uint32_t (&o)[16]) {
-    // E8M0 -> 2^(s-127); s = 0 is 2^-127 (fp32 subnormal), s = 255 would be NaN (never produced).
-    const float sc = ch.s ? __uint_as_float(uint32_t(ch.s) << 23) : __uint_as_float(0x00400000u);
     const uint32_t words[8] = {ch.q0.x, ch.q0.y, ch.q0.z, ch.q0.w, ch.q1.x, ch.q1.y, ch.q1.z, ch.q1.w};
+#if __CUDA_ARCH__ < 890
+    // [Agent] sm_86 has no FP8 convert; the generic path below (bit placement into f16, x256, widen, scale, pack) costs
+    // ~12 instructions per pair. An E4M3 code's bits placed in a BF16 word (exponent field = E4M3 exponent, mantissa
+    // top 3 bits = E4M3 mantissa, sign at bit 15) read exactly as code * 2^-120, subnormal codes included; x 2^120
+    // gives the code itself (every E4M3 value is a BF16), and x 2^(s-127) (a BF16 for every s, 2^-127 subnormal) is
+    // the exact product rounded once to BF16, as the reference does through FP32. ~7 instructions per pair.
+    const __nv_bfloat162 up = __bfloat162bfloat162(__ushort_as_bfloat16(uint16_t(247u << 7)));  // 2^120
+    const __nv_bfloat162 sc2 = __bfloat162bfloat162(
+        __ushort_as_bfloat16(ch.s ? uint16_t(uint32_t(ch.s) << 7) : uint16_t(0x0040u)));  // 2^(s-127)
 #pragma unroll
     for (int w = 0; w < 8; ++w) {
 #pragma unroll
         for (int hh = 0; hh < 2; ++hh) {
-            const uint32_t h2 = f16x2_from_e4m3x2(uint16_t(words[w] >> (16 * hh)));
+            const uint32_t t = prmt(words[w], 0u, hh ? 0x4342u : 0x4140u);  // 16-bit lanes = codes 2hh, 2hh + 1
+            const uint32_t b = ((t << 4) & 0x07f007f0u) | ((t << 8) & 0x80008000u);
+            const __nv_bfloat162 v = __hmul2(__hmul2(*reinterpret_cast<const __nv_bfloat162*>(&b), up), sc2);
+            o[2 * w + hh] = *reinterpret_cast<const uint32_t*>(&v);
+        }
+    }
+#else
+    // E8M0 -> 2^(s-127); s = 0 is 2^-127 (fp32 subnormal), s = 255 would be NaN (never produced).
+    const float sc = ch.s ? __uint_as_float(uint32_t(ch.s) << 23) : __uint_as_float(0x00400000u);
+#pragma unroll
+    for (int w = 0; w < 8; ++w) {
+#pragma unroll
+        for (int hh = 0; hh < 2; ++hh) {
+            const uint32_t h2 = fp8x::e4m3x2_to_f16x2(uint16_t(words[w] >> (16 * hh)));
             const float2 v = __half22float2(*reinterpret_cast<const __half2*>(&h2));
             o[2 * w + hh] = pack_bf16(v.x * sc, v.y * sc);  // exact: fp8 value times a power of two
         }
     }
+#endif
 }
 
 // ------------------------------------------------------------------------------------------- mma
@@ -266,8 +337,16 @@ __device__ __forceinline__ void load_x(Frag<FMT>& f, const __nv_bfloat16* xrow, 
 }
 
 // Programmatic dependent launch (no-ops when the kernel is launched without the PDL attribute).
-__device__ __forceinline__ void pdl_wait() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
-__device__ __forceinline__ void pdl_trigger() { asm volatile("griddepcontrol.launch_dependents;" ::: "memory"); }
+__device__ __forceinline__ void pdl_wait() { 
+#if __CUDA_ARCH__ >= 900
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
+}
+__device__ __forceinline__ void pdl_trigger() { 
+#if __CUDA_ARCH__ >= 900
+  asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+#endif
+}
 
 template <int FMT>
 __device__ __forceinline__ void mma_frag(const Frag<FMT>& f, float (&d)[4]) {
@@ -288,9 +367,10 @@ __device__ __forceinline__ uint64_t slot_mask(int e, int lo, int hi) {
 
 __device__ __forceinline__ float bf16_round(float v) { return __bfloat162float(__float2bfloat16_rn(v)); }
 
+
 // --------------------------------------------------------------------------------------- moe_up
 
-template <int FMT>
+template <int FMT, bool LOOP>
 __global__ void __launch_bounds__(UP_WARPS * 32)
 moe_up_kernel(const __nv_bfloat16* __restrict__ x, const int* __restrict__ idx, const uint8_t* __restrict__ w,
               const uint8_t* __restrict__ ws, const float* __restrict__ wfactor, int M,
@@ -302,53 +382,68 @@ moe_up_kernel(const __nv_bfloat16* __restrict__ x, const int* __restrict__ idx, 
 
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int g = lane >> 2, t = lane & 3;
-    const int tile = blockIdx.x, slot = blockIdx.y;
+    const int tile = blockIdx.x;
     const int nslots = M * TOPK;
     pdl_wait();     // x and idx come from earlier kernels
     pdl_trigger();  // moe_down may launch once every block got here (it waits for us before reading act)
     const int lo = lane < nslots ? ld_dep(idx + lane) : -1;
     const int hi = lane + 32 < nslots ? ld_dep(idx + lane + 32) : -1;
-    const int e = ld_dep(idx + slot);
-    const uint64_t mask = slot_mask(e, lo, hi);
-    if (__ffsll(static_cast<long long>(mask)) - 1 != slot) return;  // an earlier slot owns this expert
+    // [Agent] LOOP (pre-sm_90 at widths >= 2): a block owns slots y, y + gridDim.y, ... and computes the ones that first
+    // select their expert. With real routing ~half of the M*8 slots repeat an expert, and each such slot block of the
+    // one-per-slot grid still cost a launch and an idx round trip. At width 1 (one block per slot, never a repeat) the
+    // loop-free body keeps its own expert load in parallel with the idx row.
+    auto run = [&](const int slot, const int e, const uint64_t mask) {
+        const size_t row = static_cast<size_t>(e) * R + tile * TILE + g;
+        const bool on = g < M && ((mask >> (8 * g)) & 0xffu);
+        Frag<FMT> f;
+        load_w<FMT, K>(f, w + row * CB, ws + row * SB, 4 * warp + t, FMT == 0 ? wfactor[e] : 1.f,
+                       l2::policy<WEIGHT_L2>());
+        load_x(f, on ? x + static_cast<size_t>(g) * K : nullptr, 4 * warp + t);
+        float d[4] = {0.f, 0.f, 0.f, 0.f};
+        mma_frag(f, d);
 
-    const size_t row = static_cast<size_t>(e) * R + tile * TILE + g;
-    const bool on = g < M && ((mask >> (8 * g)) & 0xffu);
-    Frag<FMT> f;
-    load_w<FMT, K>(f, w + row * CB, ws + row * SB, 4 * warp + t, FMT == 0 ? wfactor[e] : 1.f,
-                   l2::policy<WEIGHT_L2>());
-    load_x(f, on ? x + static_cast<size_t>(g) * K : nullptr, 4 * warp + t);
-    float d[4] = {0.f, 0.f, 0.f, 0.f};
-    mma_frag(f, d);
-
 #pragma unroll
-    for (int v = 0; v < 4; ++v) red[warp][lane][v] = d[v];
-    __syncthreads();
-    if (threadIdx.x < 32) {
-        float s[4] = {0.f, 0.f, 0.f, 0.f};
+        for (int v = 0; v < 4; ++v) red[warp][lane][v] = d[v];
+        __syncthreads();
+        if (threadIdx.x < 32) {
+            float s[4] = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll
-        for (int ww = 0; ww < UP_WARPS; ++ww)
+            for (int ww = 0; ww < UP_WARPS; ++ww)
 #pragma unroll
-            for (int v = 0; v < 4; ++v) s[v] += red[ww][lane][v];
-        tile_out[g][2 * t] = s[0];
-        tile_out[g][2 * t + 1] = s[1];
-        tile_out[g + 8][2 * t] = s[2];
-        tile_out[g + 8][2 * t + 1] = s[3];
-    }
-    __syncthreads();
-    if (threadIdx.x < TILE / 2 * MAXM) {
-        const int p = threadIdx.x & 7, n = threadIdx.x >> 3;  // gate/up pair p, token n
-        uint32_t kmask = n < M ? uint32_t(mask >> (8 * n)) & 0xffu : 0u;
-        if (kmask) {
-            const float gate = bf16_round(tile_out[2 * p][n]);
-            const float up = bf16_round(tile_out[2 * p + 1][n]);
-            const float a = tanhf(gate / 4.f) * 4.f * (1.f / (1.f + expf(-gate))) * (tanhf(up / 25.f) * 25.f);
-            const __nv_bfloat16 ab = __float2bfloat16_rn(a);
-            while (kmask) {
-                const int k = __ffs(kmask) - 1;
-                kmask &= kmask - 1;
-                out[(static_cast<size_t>(n) * TOPK + k) * I + tile * (TILE / 2) + p] = ab;
+                for (int v = 0; v < 4; ++v) s[v] += red[ww][lane][v];
+            tile_out[g][2 * t] = s[0];
+            tile_out[g][2 * t + 1] = s[1];
+            tile_out[g + 8][2 * t] = s[2];
+            tile_out[g + 8][2 * t + 1] = s[3];
+        }
+        __syncthreads();
+        if (threadIdx.x < TILE / 2 * MAXM) {
+            const int p = threadIdx.x & 7, n = threadIdx.x >> 3;  // gate/up pair p, token n
+            uint32_t kmask = n < M ? uint32_t(mask >> (8 * n)) & 0xffu : 0u;
+            if (kmask) {
+                const float gate = bf16_round(tile_out[2 * p][n]);
+                const float up = bf16_round(tile_out[2 * p + 1][n]);
+                const float a = tanhf(gate / 4.f) * 4.f * (1.f / (1.f + expf(-gate))) * (tanhf(up / 25.f) * 25.f);
+                const __nv_bfloat16 ab = __float2bfloat16_rn(a);
+                while (kmask) {
+                    const int k = __ffs(kmask) - 1;
+                    kmask &= kmask - 1;
+                    out[(static_cast<size_t>(n) * TOPK + k) * I + tile * (TILE / 2) + p] = ab;
+                }
             }
+        }
+    };
+    if constexpr (!LOOP) {
+        const int slot = blockIdx.y, e = ld_dep(idx + slot);
+        const uint64_t mask = slot_mask(e, lo, hi);
+        if (__ffsll(static_cast<long long>(mask)) - 1 != slot) return;  // an earlier slot owns this expert
+        run(slot, e, mask);
+    } else {
+#pragma unroll 1
+        for (int slot = blockIdx.y; slot < nslots; slot += gridDim.y) {
+            const int e = __shfl_sync(0xffffffffu, slot < 32 ? lo : hi, slot & 31);
+            const uint64_t mask = slot_mask(e, lo, hi);
+            if (__ffsll(static_cast<long long>(mask)) - 1 == slot) run(slot, e, mask);
         }
     }
 }
@@ -503,6 +598,7 @@ void launch(void (*kernel)(Params...), dim3 grid, int threads, bool pdl, cudaStr
     CUDA_CHECK(cudaLaunchKernelEx(&cfg, kernel, static_cast<Params>(args)...));
 }
 
+
 }  // namespace
 
 void moe_up(const __nv_bfloat16* x, int M, const int* idx, const void* w13, const void* w13_scale,
@@ -511,8 +607,12 @@ void moe_up(const __nv_bfloat16* x, int M, const int* idx, const void* w13, cons
     require(x && idx && w13 && w13_scale && out, "moe_up: null argument");
     require(fmt == Format::MXFP8 || w13_factor, "NVFP4 experts need a factor tensor");
     const bool nv = fmt == Format::NVFP4;
-    const dim3 grid(2 * I / TILE, M * TOPK);
-    launch(nv ? moe_up_kernel<0> : moe_up_kernel<1>, grid, UP_WARPS * 32, pdl, stream, x, idx,
+    // pre-sm_90: fewer slot blocks, each looping over its slots (see moe_up_kernel); identical outputs
+    const int gy = device_has_clusters() ? M * TOPK : std::max(TOPK, M * TOPK / UP_SLOT_DIV);
+    const dim3 grid(2 * I / TILE, gy);
+    const bool loop = gy < M * TOPK;
+    launch(nv ? (loop ? moe_up_kernel<0, true> : moe_up_kernel<0, false>)
+              : (loop ? moe_up_kernel<1, true> : moe_up_kernel<1, false>), grid, UP_WARPS * 32, pdl, stream, x, idx,
            static_cast<const uint8_t*>(w13), static_cast<const uint8_t*>(w13_scale), nv ? w13_factor : nullptr, M,
            out);
 }

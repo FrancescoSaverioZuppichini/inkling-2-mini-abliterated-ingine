@@ -44,6 +44,7 @@
 // L2: the weight rows are read once per step, so their lines are filled evict-first (kernels/common/l2.cuh):
 // they stop evicting the activations, KV rings and the small kernels' evict-last constants.
 // Ported from engine/csrc/dense/gemv.cu (kernel bodies unchanged; torch launchers -> raw pointers).
+#include "kernels/common/fp8x.cuh"
 #include "kernels/common/l2.cuh"
 #include "kernels/dense/cluster.cuh"
 #include "kernels/dense/dense.cuh"
@@ -212,13 +213,6 @@ __device__ __forceinline__ void mma_bf16(float (&c)[4], uint32_t a0, uint32_t a1
                : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 
-// 2 E4M3 (low 16 bits of u) -> BF16x2, exact: one instruction (cvt.rn.bf16x2.e4m3x2; through FP16 and
-// FP32 it took four, 16 per mma)
-__device__ __forceinline__ uint32_t e4m3x2_to_bf16x2(uint32_t u) {
-  uint32_t r;
-  asm("cvt.rn.bf16x2.e4m3x2 %0, %1;" : "=r"(r) : "h"(static_cast<unsigned short>(u)));
-  return r;
-}
 
 #ifndef MMA_U_BF16
 #define MMA_U_BF16 6
@@ -293,8 +287,8 @@ __global__ void __launch_bounds__(32 * SPLITK) gemv_mma_kernel(const uint8_t* __
                                   X[u][1].x, X[u][1].y, X[u][1].z, X[u][1].w};
 #pragma unroll
           for (int s = 0; s < 4; ++s)
-            mma_bf16(c, e4m3x2_to_bf16x2(aw[s]), e4m3x2_to_bf16x2(bw[s]), e4m3x2_to_bf16x2(aw[s] >> 16),
-                     e4m3x2_to_bf16x2(bw[s] >> 16), xw[2 * s] ^ dep, xw[2 * s + 1]);
+            mma_bf16(c, fp8x::e4m3x2_to_bf16x2(aw[s]), fp8x::e4m3x2_to_bf16x2(bw[s]), fp8x::e4m3x2_to_bf16x2(aw[s] >> 16),
+                     fp8x::e4m3x2_to_bf16x2(bw[s] >> 16), xw[2 * s] ^ dep, xw[2 * s + 1]);
         } else {
           mma_bf16(c, A[u].x, B[u].x, A[u].y, B[u].y, X[u][0].x ^ dep, X[u][0].y);
           mma_bf16(c, A[u].z, B[u].z, A[u].w, B[u].w, X[u][0].z ^ dep, X[u][0].w);

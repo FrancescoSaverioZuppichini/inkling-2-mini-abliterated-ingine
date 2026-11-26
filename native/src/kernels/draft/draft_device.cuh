@@ -2,6 +2,7 @@
 #pragma once
 
 #include "core/device.h"
+#include "kernels/common/fp8x.cuh"
 #include "kernels/common/pdl.cuh"
 #include "kernels/draft/rng.h"
 
@@ -23,12 +24,6 @@ __device__ __forceinline__ void store_cache(void* cache, size_t at, float x, boo
   if (fp8) static_cast<__nv_fp8_storage_t*>(cache)[at] = __nv_cvt_float_to_fp8(x, __NV_SATFINITE, __NV_E4M3);
   else static_cast<__nv_bfloat16*>(cache)[at] = __float2bfloat16_rn(x);
 }
-// 2 E4M3 (low 16 bits of u) -> BF16x2, exact: one cvt.rn.bf16x2.e4m3x2 on sm_120a (cuda_fp8.hpp)
-__device__ __forceinline__ uint32_t e4m3x2_to_bf16x2(uint32_t u) {
-  const __nv_bfloat162_raw b = __nv_cvt_fp8x2_to_bf162raw(static_cast<__nv_fp8x2_storage_t>(u & 0xffffu), __NV_E4M3);
-  return uint32_t(b.x) | (uint32_t(b.y) << 16);
-}
-
 // 8 BF16 values (one uint4) -> 8 floats.
 __device__ __forceinline__ void unpack8(const uint4& v, float* f) {
   const uint32_t w[4] = {v.x, v.y, v.z, v.w};

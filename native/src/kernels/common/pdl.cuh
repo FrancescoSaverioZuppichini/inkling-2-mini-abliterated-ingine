@@ -36,9 +36,17 @@
 
 namespace ingine::kernels {
 
-__device__ __forceinline__ void pdl_trigger() { asm volatile("griddepcontrol.launch_dependents;"); }
+__device__ __forceinline__ void pdl_trigger() {
+#if __CUDA_ARCH__ >= 900
+  asm volatile("griddepcontrol.launch_dependents;");
+#endif
+}
 
-__device__ __forceinline__ void pdl_wait() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
+__device__ __forceinline__ void pdl_wait() {
+#if __CUDA_ARCH__ >= 900
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
+}
 
 // `pointer` without its kernel-parameter provenance (see above): loads through it are coherent.
 template <class T>

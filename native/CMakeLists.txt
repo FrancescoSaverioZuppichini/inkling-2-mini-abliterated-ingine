@@ -1,21 +1,22 @@
 # Adapted from fngine (github.com/satellitedown/fngine, Apache-2.0) for ingine.
 cmake_minimum_required(VERSION 3.28)
 
-# ingine is compiled only for sm_120a (RTX 5090 class). Set and validate the architecture before
-# CUDA compiler detection.
+# [Agent] sm_120a is the original RTX 5090 build. 86 (RTX 3090) and 89 (RTX 4090) take the pre-Hopper paths:
+# no clusters or PDL, software FP4 decode, and FP8 decode in software on 86. Any mix of the three can go in one
+# fat binary.
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   set(CMAKE_CUDA_ARCHITECTURES 120a CACHE STRING "CUDA architectures to build")
 endif()
-if(NOT CMAKE_CUDA_ARCHITECTURES STREQUAL "120a")
-  message(FATAL_ERROR
-    "ingine supports only CMAKE_CUDA_ARCHITECTURES=120a; got "
-    "'${CMAKE_CUDA_ARCHITECTURES}'")
-endif()
+foreach(_arch ${CMAKE_CUDA_ARCHITECTURES})
+  if(NOT _arch MATCHES "^(120a|86|89)$")
+    message(FATAL_ERROR "ingine builds for 120a, 86 and 89; got '${_arch}'")
+  endif()
+endforeach()
 
 # Prefer the installer's private toolkit, then /opt/cuda, when nvcc is not chosen explicitly.
 if(NOT DEFINED CMAKE_CUDA_COMPILER AND NOT DEFINED ENV{CUDACXX})
   foreach(_nvcc ${CMAKE_CURRENT_SOURCE_DIR}/../.cuda-toolkit/nvidia/cu13/bin/nvcc
-                ${CMAKE_CURRENT_SOURCE_DIR}/../.cuda-toolkit/bin/nvcc /opt/cuda/bin/nvcc)
+                ${CMAKE_CURRENT_SOURCE_DIR}/../.cuda-toolkit/bin/nvcc /opt/cuda/bin/nvcc /usr/local/cuda/bin/nvcc)
     if(EXISTS ${_nvcc})
       set(CMAKE_CUDA_COMPILER ${_nvcc} CACHE FILEPATH "CUDA compiler")
       break()

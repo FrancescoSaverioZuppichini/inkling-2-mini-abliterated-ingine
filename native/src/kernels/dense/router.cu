@@ -38,6 +38,11 @@ constexpr int EXPERTS = 128, TOPK = 8;
 // L2 class of the weight loads (l2.cuh): none (see gates.cu: evict-last residency made the step slower)
 constexpr l2::Evict WEIGHT_L2 = l2::Evict::none;
 
+// [Agent] Pre-sm_90 mailbox: each CTA writes its slice of every token's logits here, the cooperative grid syncs,
+// and CTA m reads token m's 128 logits back. Launches on the stream never overlap without PDL, so one buffer serves
+// every call.
+__device__ float g_router_logits[8][EXPERTS];
+
 template <int CL, bool WF32, int M>
 __global__ void __launch_bounds__(32 * EXPERTS / CL) router_kernel(const __nv_bfloat16* __restrict__ x,
                                                                    const void* __restrict__ w,
@@ -49,13 +54,16 @@ __global__ void __launch_bounds__(32 * EXPERTS / CL) router_kernel(const __nv_bf
   constexpr int CH = H / (EPC * 32);
   __shared__ __align__(16) __nv_bfloat16 xs[M][H];
   __shared__ __align__(16) float logits[EXPERTS];  // token `rank`'s logits (CTAs rank < M)
+#if __CUDA_ARCH__ >= 900
   __shared__ __align__(8) uint64_t mbar;           // completes when the 128 logits arrived
+#endif
   __shared__ __align__(16) float part[M][RPC];     // this CTA's logits
   __shared__ unsigned long long keys[EXPERTS];    // selection keys of sigmoid + bias
   __shared__ int cnt[NT];                          // partial ranks
   __shared__ float sel_s[TOPK];
   __shared__ int sel_e[TOPK];
 
+#if __CUDA_ARCH__ >= 900
   cg::cluster_group cluster = cg::this_cluster();
   const int rank = cluster.block_rank();
   const uint32_t logits_u = smem_u32(logits), mb = smem_u32(&mbar);
@@ -65,6 +73,9 @@ __global__ void __launch_bounds__(32 * EXPERTS / CL) router_kernel(const __nv_bf
     if (rank < M) mb_expect(mb, 4u * EXPERTS);
   }
   cluster_arrive_relaxed();
+#else
+  const int rank = blockIdx.x;
+#endif
   const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
   const int row = rank * RPC + warp;
 
@@ -115,6 +126,7 @@ __global__ void __launch_bounds__(32 * EXPERTS / CL) router_kernel(const __nv_bf
   // gather the CTA's RPC logits of each token, then one 16-byte store per (token, 4 rows)
   if (lane < M) part[lane][warp] = logit;
   __syncthreads();
+#if __CUDA_ARCH__ >= 900
   cluster_wait();  // every CTA has started and initialised its barrier
   if (t < M * (RPC / 4)) {
     const int tok = t % M, grp = t / M;
@@ -123,6 +135,13 @@ __global__ void __launch_bounds__(32 * EXPERTS / CL) router_kernel(const __nv_bf
   }
   if (rank >= M) return;
   mb_wait(mb);
+#else
+  if (t < M * RPC) g_router_logits[t % M][rank * RPC + t / M] = part[t % M][t / M];
+  cg::this_grid().sync();
+  if (rank >= M) return;
+  for (int e = t; e < EXPERTS; e += NT) logits[e] = __ldcg(&g_router_logits[rank][e]);
+  __syncthreads();
+#endif
 
   // selection: unique 39-bit keys (order-preserving bits of v, then 127 - e: ties go to the lower expert),
   // rank = number of greater keys, counted by all NT threads (NT / 128 parts of the key range)
@@ -190,6 +209,7 @@ void launch_router(int M, const __nv_bfloat16* x, const void* w, const float* bi
 
 // 16-CTA clusters need the non-portable opt-in and a GPC with 16 free SMs; fall back to 8 otherwise.
 int router_cluster_size() {
+  if (!device_has_clusters()) return 16;  // one cooperative grid of 16 CTAs: no GPC constraint
   static const int cl = [] {
     auto k = router_kernel<16, true, 8>;
     if (cudaFuncSetAttribute(k, cudaFuncAttributeNonPortableClusterSizeAllowed, 1) != cudaSuccess) {

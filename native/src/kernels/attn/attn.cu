@@ -78,6 +78,7 @@
 // Ported from engine/csrc/attn/attn.cu (kernel bodies unchanged; torch launcher -> raw pointers).
 #include "kernels/attn/attn.h"
 
+#include "kernels/common/fp8x.cuh"
 #include "kernels/common/l2.cuh"
 
 #include "core/device.h"
@@ -86,6 +87,7 @@
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -100,6 +102,10 @@ constexpr int OFF_GATE = 3072, OFF_REL = 6144, OFF_SINK = 6528, OFF_K = 6552, OF
 constexpr int R_SLIDING = 8600, R_FULL = 8664;
 constexpr int CS = 16;  // blocks per KV head = cluster size; block r outputs dims [8r, 8r + 8)
 constexpr int OD = D / CS;
+// [Agent] Without clusters (sm_86, sm_89) nothing ties the split to the output layout: the head's last block merges
+// all its partials. So the blocks per KV head (Params::cs) are chosen per GPU and width, up to MAXCS; with clusters
+// cs is always CS.
+constexpr int MAXCS = 16;
 constexpr int MAXM = 8;
 constexpr int U = 2;  // key pairs per warp per register buffer
 constexpr int MAXWARPS = 8;
@@ -113,7 +119,10 @@ constexpr float INV_3 = 1.f / 3.f;
 // fp32 [HKV][CS][3M][PSTR]: o (D) then (max, sum)
 constexpr size_t WS_PART = 256;
 constexpr int PSTR = D + 4;
-constexpr size_t ws_bytes(int M) { return WS_PART + size_t(HKV) * CS * GQA * M * PSTR * 4; }
+constexpr size_t ws_part_bytes(int M) { return size_t(HKV) * MAXCS * GQA * M * PSTR * 4; }
+// [Agent] Pre-sm_90 only: counters 1..8 (one per KV head, in the reserved first 256 bytes) and the owner's new K/V
+// rows staged bf16 [HKV][2][M][D] after the partials, for the head's last block to write into the ring.
+constexpr size_t ws_bytes(int M) { return WS_PART + ws_part_bytes(M) + size_t(HKV) * 2 * M * D * 2; }
 
 constexpr int NT = 256;  // threads per block (8 warps) for every M
 
@@ -217,6 +226,7 @@ struct Params {
     float* part;
     __nv_bfloat16* out;
     int zero;  // 0 at run time, opaque to the compiler (fenced griddepcontrol.wait)
+    int cs;    // blocks per KV head (gridDim.x): CS with clusters, else 1..MAXCS
 };
 
 __device__ __forceinline__ float bf16r(float x) { return __bfloat162float(__float2bfloat16_rn(x)); }
@@ -242,7 +252,8 @@ __device__ __forceinline__ void unpack8(const uint4 u, float f[8]) {
 
 // E4M3 pair (low byte = lower dim) to floats, exact (cvt.f16x2.e4m3x2, then FP16 -> FP32)
 __device__ __forceinline__ float2 e4m3x2_f2(uint32_t pair) {
-    return __half22float2(__half2(__nv_cvt_fp8x2_to_halfraw2(__nv_fp8x2_storage_t(pair), __NV_E4M3)));
+    const uint32_t h = fp8x::e4m3x2_to_f16x2(pair);
+    return __half22float2(*reinterpret_cast<const __half2*>(&h));
 }
 
 // 8 E4M3 values (dims 8c..8c+7, byte 0 = lowest dim)
@@ -352,8 +363,18 @@ struct Buf {
     float rp[U];  // rel_proj[c][dp] (0 if dp >= 1024)
 };
 
+// [Agent] Width > 1 needs 59-98 KB of shared memory, so on sm_86 / sm_89 (100 KB per SM) one block fits per SM anyway:
+// asking for two only capped registers at 128 and made ptxas spill in the full-layer loop.
+constexpr int min_blocks(int M, bool full) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900
+    return M > 1 && full ? 1 : 2;
+#else
+    return 2;
+#endif
+}
+
 template <int M, bool FULL, bool F8>
-__global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Params p) {
+__global__ void __launch_bounds__(MAXWARPS * 32, min_blocks(M, FULL)) attn_decode_kernel(const Params p) {
     static_assert(FULL || !F8, "FP8 caches are full-layer only");
     using CT = std::conditional_t<F8, __nv_fp8_storage_t, __nv_bfloat16>;  // cache element
     using KV = std::conditional_t<F8, uint2, uint4>;                        // 8 dims of a cache row
@@ -366,7 +387,9 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, half = lane >> 4, c = lane & 15;
     const int tok = warp / KW, kw = warp % KW;
     const bool owner = rank == 0;
-    const int R = p.R;
+    // [Agent] Only full layers at width > 1 take the per-GPU split; width 1 and the sliding rings keep the compile-time
+    // 16 and with it their old code (a runtime split made them 6-8 % slower and they are not wave-bound).
+    const int R = p.R, cs = FULL && M > 1 ? p.cs : CS;
     CT* const kc = static_cast<CT*>(p.k_cache);
     CT* const vc = static_cast<CT*>(p.v_cache);
 
@@ -391,7 +414,8 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
     // ---- K/V streaming: two register buffers; the first two are issued now, K/V before the rel_proj
     // columns (whose addresses wait for `pos`). Keys go to the blocks in tiles of 2 STEP, round robin, so
     // the expensive relative-bias tail (distance < 1024) is spread over the whole cluster.
-    constexpr int STEP = KW * 2 * U, TILE = 2 * STEP, STRIDE = CS * TILE;
+    constexpr int STEP = KW * 2 * U, TILE = 2 * STEP;
+    const int STRIDE = cs * TILE;
     const int c0 = rank * TILE, old_end = L_old;
     const std::uint64_t kvpol = l2::policy<KV_L2>();
     auto load_kv = [&](Buf<KV>& b, const int base) {
@@ -475,7 +499,7 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
     char* const raw = reinterpret_cast<char*>(sm + L::KVS);
     __half* const wv = reinterpret_cast<__half*>(sm);  // E4M3: the widened V tile [KT][D], chunks swizzled
     auto issue_raw = [&](const int t) {
-        const int base = rank * KT + t * CS * KT;
+        const int base = rank * KT + t * cs * KT;
         if (base < L_old) {
             for (int i = tid; i < KT * 2 * (D / 16); i += NT) {
                 const int key = i / (2 * (D / 16)), kv = (i / (D / 16)) % 2, ch = i % (D / 16), j = base + key;
@@ -501,17 +525,23 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
     }
     // a loop ptxas cannot see through: it would sink the loads above below a plain wait
 #pragma unroll 1
-    for (int i = 0; i <= p.zero; ++i) asm volatile("griddepcontrol.wait;" ::: "memory");
+    for (int i = 0; i <= p.zero; ++i) {
+#if __CUDA_ARCH__ >= 900
+        asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
+    }
     for (int i = tid; i < M * GQA * D / 4; i += NT)       // q rows of heads 3g..3g+2 are contiguous
         cp16(sm + L::Q + 4 * i, p.proj + size_t(i / (GQA * D / 4)) * R + g * GQA * D + 4 * (i % (GQA * D / 4)));
     for (int i = tid; i < M * GQA * DREL / 4; i += NT)
         cp16(sm + L::REL + 4 * i,
              p.proj + size_t(i / (GQA * DREL / 4)) * R + OFF_REL + g * GQA * DREL + 4 * (i % (GQA * DREL / 4)));
+#if __CUDA_ARCH__ >= 900  // [Agent] this block's output gates: only the cluster merge reads them
     for (int i = tid; i < ROWS * OD / 4; i += NT) {
         const int row = i / (OD / 4), part = i % (OD / 4);
         cp16(sm + L::GATE + 4 * i,
              p.proj + size_t(row / GQA) * R + OFF_GATE + (g * GQA + row % GQA) * D + rank * OD + 4 * part);
     }
+#endif
     for (int i = tid; i < ROWS; i += NT) cp4(sm + L::SINK + i, p.proj + size_t(i / GQA) * R + OFF_SINK + g * GQA + i % GQA);
     if (owner) {
         for (int i = tid; i < 3 * 2 * D / 4; i += NT) {  // [j][kv][D]
@@ -542,7 +572,9 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
         }
     }
     // dependents (proj_conv) may launch now: their weight stream queues behind this block's K/V requests
+#if __CUDA_ARCH__ >= 900
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+#endif
 
     // ---- q and rel post-processing, once per block. q: one warp per row (lane = 4 dims); rel: one
     // half-warp per row. Fixed trip counts and clamped rows (no branches), so the reductions of a warp's
@@ -797,7 +829,7 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
         }
         __syncthreads();
         // this block's partial (unnormalised o, then max and sum per row) to the workspace (L2)
-        float* part = p.part + size_t(g * CS + rank) * ROWS * PSTR;
+        float* part = p.part + size_t(g * cs + rank) * ROWS * PSTR;
         for (int idx = tid; idx < ROWS * (D / 4); idx += NT) {
             const int row = idx / (D / 4), d4 = idx % (D / 4);
             float mx = NEG_INIT;
@@ -860,8 +892,13 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
                     uint32_t o[4];
 #pragma unroll
                     for (int e = 0; e < 4; ++e) {
-                        const float2 f = e4m3x2_f2((w[2 * h + e / 2] >> (16 * (e % 2))) & 0xffffu);
+                        const uint32_t pr = (w[2 * h + e / 2] >> (16 * (e % 2))) & 0xffffu;
+#if __CUDA_ARCH__ >= 890  // the hardware convert turns NaN codes (unused slots) into NaN: filter them out
+                        const float2 f = e4m3x2_f2(pr);
                         o[e] = half2_of(f.x, f.y);
+#else  // [Agent] the bit-copy decode is already FP16 and never NaN/Inf (max code -> 480): no f32 round trip
+                        o[e] = fp8x::e4m3x2_to_f16x2(pr);
+#endif
                     }
                     *reinterpret_cast<uint4*>(wv + roff(key, 2 * ch + h)) = make_uint4(o[0], o[1], o[2], o[3]);
                 }
@@ -904,10 +941,8 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
                         const char* kr = kraw + key * D + ((ks ^ (key & 7)) * 16) + 4 * t4;
                         const uint32_t u0 = *reinterpret_cast<const uint32_t*>(kr);
                         const uint32_t u1 = *reinterpret_cast<const uint32_t*>(kr + 8 * D);
-                        const float2 f0 = e4m3x2_f2(u0 & 0xffffu), f1 = e4m3x2_f2(u1 & 0xffffu);
-                        const float2 f2 = e4m3x2_f2(u0 >> 16), f3 = e4m3x2_f2(u1 >> 16);
-                        af[0] = pack2(f0.x, f0.y), af[1] = pack2(f1.x, f1.y);
-                        af[2] = pack2(f2.x, f2.y), af[3] = pack2(f3.x, f3.y);
+                        af[0] = fp8x::e4m3x2_to_bf16x2(u0), af[1] = fp8x::e4m3x2_to_bf16x2(u1);
+                        af[2] = fp8x::e4m3x2_to_bf16x2(u0 >> 16), af[3] = fp8x::e4m3x2_to_bf16x2(u1 >> 16);
                     } else {
                         const int q = lane >> 3, key = km * 16 + (q & 1) * 8 + (lane & 7);
                         ldsm_x4(smem_u32(kaddr(key, ks * 2 + (q >> 1))), af);
@@ -1061,7 +1096,7 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
         }
         if constexpr (F8) {
             int t = 0;
-            for (int base = rank * KT; base < L_old; base += CS * KT, ++t) {
+            for (int base = rank * KT; base < L_old; base += cs * KT, ++t) {
                 asm volatile("cp.async.wait_group %0;" ::"n"(NRAW - 1) : "memory");  // this thread's part of tile t
                 __syncthreads();  // tile t landed for everyone; the previous tile's P V is done with wv
                 expand_v(t % NRAW);
@@ -1072,11 +1107,11 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
             }
         } else {
             int st = 0;
-            for (int base = rank * KT; base < L_old; base += CS * KT, st ^= 1) {
+            for (int base = rank * KT; base < L_old; base += cs * KT, st ^= 1) {
                 asm volatile("cp.async.wait_group 0;" ::: "memory");  // tile `base` (the only one in flight)
                 convert_v(st);
                 __syncthreads();  // tile landed for everyone; the previous tile's P V is done
-                if (base + CS * KT < L_old) issue(st ^ 1, base + CS * KT);
+                if (base + cs * KT < L_old) issue(st ^ 1, base + cs * KT);
                 consume([&](int key, int ch) { return kvs + kv_off(st, key, 0, ch); },
                         [&](int key, int ch) { return kvs + kv_off(st, key, 1, ch); }, SmemK{}, nullptr, st, base, false,
                         nothing);
@@ -1084,7 +1119,7 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
         }
 
         // this block's partial (unnormalised o, then max and sum per row) to the workspace (L2)
-        float* part = p.part + size_t(g * CS + rank) * ROWS * PSTR;
+        float* part = p.part + size_t(g * cs + rank) * ROWS * PSTR;
 #pragma unroll
         for (int n = 0; n < NTN; ++n) {
 #pragma unroll
@@ -1101,6 +1136,64 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
             }
         }
     }
+    // The owner's global writes: the new K/V rows (if `rows`) and the conv states of this head's channels.
+    auto owner_writes = [&](bool rows) {
+        if (rows) {
+            for (int idx = tid; idx < 2 * M * 16; idx += NT) {  // new K/V rows
+                const int kv = idx / (M * 16), m = (idx / 16) % M, c8 = idx % 16;
+                const int row = FULL ? p0 + m : (p0 + m) & (WIN - 1);
+                const uint4 u = reinterpret_cast<const uint4*>(&s_nkv[kv][m][0])[c8];
+                CT* const dst = (kv ? vc : kc) + (size_t(row) * HKV + g) * D;
+                if constexpr (F8) {  // exact: the values are E4M3 already
+                    float f[8];
+                    unpack8(u, f);
+                    reinterpret_cast<uint2*>(dst)[c8] = make_uint2(pack_e4m3x2(f[0], f[1]) | pack_e4m3x2(f[2], f[3]) << 16,
+                                                                   pack_e4m3x2(f[4], f[5]) | pack_e4m3x2(f[6], f[7]) << 16);
+                } else {
+                    reinterpret_cast<uint4*>(dst)[c8] = u;
+                }
+            }
+        }
+        for (int idx = tid; idx < 3 * 2 * D; idx += NT) {  // conv states of this head's channels
+            const int i = idx / (2 * D), kv = (idx / D) % 2, ch = idx % D;
+            (kv ? p.conv_v : p.conv_k)[i * CONV_C + g * D + ch] = sm[L::NST + idx];
+        }
+        if (!FULL && M == 1 && g == 0 && tid == 0) p.kpos[p0 & (WIN - 1)] = p0;
+    };
+    // Row `row`, output dim `dim`: merge the head's CS partials with the sink logit, apply the sigmoid gate.
+    auto merge = [&](int row, int dim, float gate_logit) {
+        const float* src = p.part + size_t(g * cs) * ROWS * PSTR + row * PSTR;
+        // [Agent] Arrays of the largest split so every load is issued at once (one L2 round trip); only the first cs
+        // take part, in the same order as the old fixed-size merge, so cs = 16 keeps its bits.
+        float2 ml[MAXCS];
+        float o[MAXCS];
+#pragma unroll
+        for (int q = 0; q < MAXCS; ++q) {
+            ml[q] = make_float2(NEG_INIT, 0.f), o[q] = 0.f;
+            if (q < cs) {
+                ml[q] = __ldcg(reinterpret_cast<const float2*>(src + q * ROWS * PSTR + D));
+                o[q] = __ldcg(src + q * ROWS * PSTR + dim);
+            }
+        }
+        const float sink = sm[L::SINK + row] * LOG2E;
+        float mx = sink;
+#pragma unroll
+        for (int q = 0; q < MAXCS; ++q)
+            if (q < cs) mx = fmaxf(mx, ml[q].x);
+        float l = exp2f(sink - mx), a = 0.f;
+#pragma unroll
+        for (int q = 0; q < MAXCS; ++q) {
+            if (q < cs) {  // predicated, not a break: the loop stays unrolled and the arrays in registers
+                const float f = exp2f(ml[q].x - mx);
+                l += ml[q].y * f;
+                a += o[q] * f;
+            }
+        }
+        const float gate = 1.f / (1.f + expf(-gate_logit));
+        p.out[size_t(row / GQA) * HQ * D + (g * GQA + row % GQA) * D + dim] = __float2bfloat16_rn(bf16r(a / l) * gate);
+    };
+
+#if __CUDA_ARCH__ >= 900
     // every partial of the head is written, and every block of the head is done reading the ring
     asm volatile("barrier.cluster.arrive.release.aligned;\n\tbarrier.cluster.wait.acquire.aligned;" ::: "memory");
     if (!FULL && M > 1 && owner && tid == NT - 1) {  // kpos is read by every head: the last head writes it
@@ -1113,54 +1206,54 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
     }
 
     // block `rank` outputs dims 8 rank .. 8 rank + 7 of every row: thread (row, dim) = (tid / 8, tid % 8)
-    if (tid < ROWS * OD) {
-        const int row = tid / OD, dim = rank * OD + tid % OD;
-        const float* src = p.part + size_t(g * CS) * ROWS * PSTR + row * PSTR;
-        float2 ml[CS];
-        float o[CS];
-#pragma unroll
-        for (int q = 0; q < CS; ++q) {
-            ml[q] = __ldcg(reinterpret_cast<const float2*>(src + q * ROWS * PSTR + D));
-            o[q] = __ldcg(src + q * ROWS * PSTR + dim);
-        }
-        const float sink = sm[L::SINK + row] * LOG2E;
-        float mx = sink;
-#pragma unroll
-        for (int q = 0; q < CS; ++q) mx = fmaxf(mx, ml[q].x);
-        float l = exp2f(sink - mx), a = 0.f;
-#pragma unroll
-        for (int q = 0; q < CS; ++q) {
-            const float f = exp2f(ml[q].x - mx);
-            l += ml[q].y * f;
-            a += o[q] * f;
-        }
-        const float gate = 1.f / (1.f + expf(-sm[L::GATE + tid]));
-        p.out[size_t(row / GQA) * HQ * D + (g * GQA + row % GQA) * D + dim] = __float2bfloat16_rn(bf16r(a / l) * gate);
-    }
+    if (tid < ROWS * OD) merge(tid / OD, rank * OD + tid % OD, sm[L::GATE + tid]);
 
     // owner: the global writes, at the end so they delay nothing (and, for M > 1 on a ring, because the
     // overwritten slots were still being read)
+    if (owner) owner_writes(true);
+#else
+    // [Agent] No clusters, and the 128 blocks may not all be resident (82 SMs on an RTX 3090), so no block may wait
+    // for another. Each block publishes its partials and arrives on its head's counter; the last arrival knows the
+    // head is done and merges all 128 output dims with exactly the arithmetic above. The owner's rows go out before
+    // it arrives where nothing in this call reads them (full layers write positions >= p0; a sliding M = 1 write
+    // replaces an entry at distance 1024, ignored either way). The overwritten ring slots of M > 1 are still being
+    // read, so the owner stages those rows and the head's last block writes them.
+    __nv_bfloat16* const stage = reinterpret_cast<__nv_bfloat16*>(reinterpret_cast<char*>(p.part) + ws_part_bytes(M)) +
+                                 size_t(g) * 2 * M * D;
     if (owner) {
-        for (int idx = tid; idx < 2 * M * 16; idx += NT) {  // new K/V rows
+        owner_writes(FULL || M == 1);
+        if (!FULL && M > 1)
+            for (int idx = tid; idx < 2 * M * 16; idx += NT)
+                reinterpret_cast<uint4*>(stage)[idx] = reinterpret_cast<const uint4*>(&s_nkv[0][0][0])[idx];
+    }
+    __shared__ int s_last;
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) s_last = atomicAdd(p.counter + 1 + g, 1) == cs - 1;
+    __syncthreads();
+    if (!s_last) return;
+    __threadfence();
+    if (tid == 0) p.counter[1 + g] = 0;
+    for (int i = tid; i < ROWS * D; i += NT) {
+        const int row = i / D, dim = i % D;
+        merge(row, dim, __ldcg(p.proj + size_t(row / GQA) * R + OFF_GATE + (g * GQA + row % GQA) * D + dim));
+    }
+    if constexpr (!FULL && M > 1) {
+        for (int idx = tid; idx < 2 * M * 16; idx += NT) {  // the staged rows into the ring
             const int kv = idx / (M * 16), m = (idx / 16) % M, c8 = idx % 16;
-            const int row = FULL ? p0 + m : (p0 + m) & (WIN - 1);
-            const uint4 u = reinterpret_cast<const uint4*>(&s_nkv[kv][m][0])[c8];
-            CT* const dst = (kv ? vc : kc) + (size_t(row) * HKV + g) * D;
-            if constexpr (F8) {  // exact: the values are E4M3 already
-                float f[8];
-                unpack8(u, f);
-                reinterpret_cast<uint2*>(dst)[c8] = make_uint2(pack_e4m3x2(f[0], f[1]) | pack_e4m3x2(f[2], f[3]) << 16,
-                                                               pack_e4m3x2(f[4], f[5]) | pack_e4m3x2(f[6], f[7]) << 16);
-            } else {
-                reinterpret_cast<uint4*>(dst)[c8] = u;
+            CT* const dst = (kv ? vc : kc) + (size_t((p0 + m) & (WIN - 1)) * HKV + g) * D;
+            reinterpret_cast<uint4*>(dst)[c8] = __ldcg(reinterpret_cast<const uint4*>(stage) + idx);
+        }
+        if (tid == 0) {  // kpos is read by every head: the last head writes it
+            __threadfence();
+            if (atomicAdd(p.counter, 1) == HKV - 1) {
+                __threadfence();
+                for (int m = 0; m < M; ++m) p.kpos[(p0 + m) & (WIN - 1)] = p0 + m;
+                *p.counter = 0;
             }
         }
-        for (int idx = tid; idx < 3 * 2 * D; idx += NT) {  // conv states of this head's channels
-            const int i = idx / (2 * D), kv = (idx / D) % 2, ch = idx % D;
-            (kv ? p.conv_v : p.conv_k)[i * CONV_C + g * D + ch] = sm[L::NST + idx];
-        }
-        if (!FULL && M == 1 && g == 0 && tid == 0) p.kpos[p0 & (WIN - 1)] = p0;
     }
+#endif
 }
 
 void require(bool ok, const char* what) {
@@ -1173,15 +1266,27 @@ struct Kernel {
     KernelFn fn;
     int M;
     size_t smem;
+    int split;  // default blocks per KV head on this GPU
 };
 
 template <int M, bool FULL, bool F8>
 Kernel kernel_of() {
     static const Kernel k = [] {
         const KernelFn f = attn_decode_kernel<M, FULL, F8>;
-        CUDA_CHECK(cudaFuncSetAttribute(f, cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
+        if (device_has_clusters()) CUDA_CHECK(cudaFuncSetAttribute(f, cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
         CUDA_CHECK(cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, int(Smem<M, F8>::BYTES)));
-        return Kernel{f, M, Smem<M, F8>::BYTES};
+        // [Agent] Without clusters: as many blocks per KV head as fill the GPU in ONE wave (all heads' blocks resident
+        // at once), at most CS. The 16 of the 5090 put the width > 1 kernels (one block per SM) in two waves on the
+        // 3090's 82 SMs: 82 + 46 blocks, the second wave as long as the first.
+        int split = CS;
+        if (!device_has_clusters()) {
+            int dev = 0, sms = 0, per_sm = 0;
+            CUDA_CHECK(cudaGetDevice(&dev));
+            CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
+            CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, f, NT, Smem<M, F8>::BYTES));
+            split = std::max(1, std::min(MAXCS, sms * per_sm / HKV));
+        }
+        return Kernel{f, M, Smem<M, F8>::BYTES, split};
     }();
     return k;
 }
@@ -1202,9 +1307,9 @@ Kernel select(int M) {
 
 // attrs[0]: cluster of CS blocks; attrs[1]: programmatic dependent launch (the kernel waits with
 // griddepcontrol.wait before touching anything an earlier kernel may write; a no-op without PDL)
-cudaLaunchConfig_t launch_config(const Kernel& k, cudaStream_t stream, cudaLaunchAttribute* attrs) {
+cudaLaunchConfig_t launch_config(const Kernel& k, cudaStream_t stream, cudaLaunchAttribute* attrs, int cs = CS) {
     cudaLaunchConfig_t cfg{};
-    cfg.gridDim = dim3(CS, HKV);
+    cfg.gridDim = dim3(cs, HKV);
     cfg.blockDim = dim3(NT);
     cfg.dynamicSmemBytes = k.smem;
     cfg.stream = stream;
@@ -1214,6 +1319,7 @@ cudaLaunchConfig_t launch_config(const Kernel& k, cudaStream_t stream, cudaLaunc
     attrs[1].val.programmaticStreamSerializationAllowed = 1;
     cfg.attrs = attrs;
     cfg.numAttrs = 2;
+    if (!device_has_clusters()) cfg.attrs = attrs + 1, cfg.numAttrs = 1;  // plain grid (+ the ignored PDL attribute)
     return cfg;
 }
 
@@ -1273,8 +1379,9 @@ void attn_decode(const DecodeArgs& a, cudaStream_t stream) {
     p.part = reinterpret_cast<float*>(static_cast<char*>(a.workspace) + WS_PART);
     p.out = a.out;
     const Kernel k = full ? (a.cache_fp8 ? select<true, true>(M) : select<true>(M)) : select<false>(M);
+    p.cs = device_has_clusters() || !full || M == 1 ? CS : k.split;
     cudaLaunchAttribute attrs[2];
-    const cudaLaunchConfig_t cfg = launch_config(k, stream, attrs);
+    const cudaLaunchConfig_t cfg = launch_config(k, stream, attrs, p.cs);
     CUDA_CHECK(cudaLaunchKernelEx(&cfg, k.fn, p));
 }
 

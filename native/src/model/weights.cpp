@@ -332,7 +332,7 @@ Layer load_layer_into(Loader& ld, int l, ExpertFormat fmt, bool dense_fp8) {
 
 }  // namespace
 
-Weights load_weights(const fs::path& model_dir, bool dense_fp8, cudaStream_t stream) {
+Weights load_weights(const fs::path& model_dir, bool dense_fp8, bool embed_host, cudaStream_t stream) {
   const SafetensorsModel m(model_dir);
   DeviceUploader up;
   Weights w;
@@ -357,7 +357,15 @@ Weights load_weights(const fs::path& model_dir, bool dense_fp8, cudaStream_t str
     }
     w.message_queries = ld.upload_f32(mq, {n, 4, H});
   }
-  w.embed = ld.raw("model.llm.embed.weight");
+  if (embed_host) {
+    const SafetensorsRef ref = m.at("model.llm.embed.weight");
+    const std::vector<std::byte> bytes = m.read("model.llm.embed.weight");
+    w.embed_host = MappedHostBuffer(bytes.size());
+    std::memcpy(w.embed_host.data(), bytes.data(), bytes.size());
+    w.embed = ref->view(w.embed_host.device_ptr());
+  } else {
+    w.embed = ld.raw("model.llm.embed.weight");
+  }
   if (w.embed.dtype != DType::BF16) throw std::runtime_error("weights: embed must be BF16");
   w.embed_norm = ld.f32("model.llm.embed_norm.weight", {H});
   w.final_query = ld.f32("model.llm.attn_res.output_query", {1, H});

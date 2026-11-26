@@ -33,12 +33,31 @@
         "CMAKE_BUILD_WITH_INSTALL_RPATH": "ON",
         "CMAKE_INSTALL_RPATH": "$ORIGIN/../../../../.cuda-toolkit/nvidia/cu13/lib"
       }
+    },
+    {
+      "name": "ampere",
+      "displayName": "RTX 3090 and RTX 4090 binaries (sm_86, sm_89)",
+      "inherits": "release",
+      "binaryDir": "${sourceDir}/build-ampere",
+      "cacheVariables": {
+        "CMAKE_CUDA_ARCHITECTURES": "86;89"
+      }
+    },
+    {
+      "name": "ampere-dev",
+      "displayName": "RTX 3090 and RTX 4090 binaries and tests",
+      "inherits": "ampere",
+      "cacheVariables": {
+        "INGINE_BUILD_TESTS": "ON"
+      }
     }
   ],
   "buildPresets": [
     { "name": "release", "configurePreset": "release" },
     { "name": "dev", "configurePreset": "dev" },
-    { "name": "install", "configurePreset": "install" }
+    { "name": "install", "configurePreset": "install" },
+    { "name": "ampere", "configurePreset": "ampere" },
+    { "name": "ampere-dev", "configurePreset": "ampere-dev" }
   ],
   "testPresets": [
     {
