@@ -90,6 +90,9 @@ struct RuntimeOptions {
   // than 2048 for 0.38 GB more scratch; results differ between chunk sizes only by rounding.
   int prefill_chunk = 3072;
   bool dense_fp8 = true, kv_fp8 = false, spec = false;
+  // [Agent] Keep the BF16 embedding table (0.86 GiB) in pinned host memory that the GPU reads over PCIe. A step reads
+  // only its 1-8 token rows (4.6 KB each), so it costs about a microsecond and frees the memory for context on 24 GB.
+  bool embed_host = false;
   float spec_threshold = 0.8f;
   // Conversation parking: device memory (MiB) for the checkpoints of conversations displaced by another
   // one, least recently used evicted, all released when a device allocation fails; 0 disables; negative:

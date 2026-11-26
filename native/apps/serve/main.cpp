@@ -66,8 +66,9 @@ ingine::model::Sampling generation_defaults(const std::filesystem::path& model_d
 
 int main(int argc, char** argv) {
   std::string model_dir, host = "127.0.0.1", ablation, backend = "fast", model_id, log_level = "INFO";
-  int port = 8003, max_ctx = 65536, max_queue = 4, max_model_len = 0, park_mb = -1;
+  int port = 8003, max_ctx = 65536, max_queue = 4, max_model_len = 0, park_mb = -1, prefill_chunk = 3072;
   bool engine = false, fake = false, dense_fp8 = false, kv_fp8 = false, spec = false, no_vision = false;
+  bool embed_host = false;
   int image_max_tokens = 4096, max_images = 16, max_image_tokens = 32768;
   double spec_threshold = 0.8, fake_delay = 0.02;
   // sampling defaults; negative: from generation_config.json
@@ -94,6 +95,11 @@ int main(int argc, char** argv) {
             "device memory (MiB) for conversations displaced by another one, released when memory runs short, "
             "0 = off (default: min(3072, free memory after start-up - 4096))",
             &park_mb);
+  ap.option("--prefill-chunk", "",
+            "prompt tokens per prefill step; its workspace is ~0.37 GB per 1024 tokens, so 1024 frees ~0.75 GB of "
+            "context on a 24 GB card (default 3072)",
+            &prefill_chunk);
+  ap.flag("--embed-host", "keep the embedding table (0.86 GiB) in pinned host memory, read over PCIe", &embed_host);
   ap.flag("--no-vision", "text only: do not load the vision tower (saves 0.6 GB) and reject requests with images",
           &no_vision);
   ap.option("--image-max-tokens", "",
@@ -149,6 +155,8 @@ int main(int argc, char** argv) {
       options.spec_threshold = float(spec_threshold);
       options.park_mb = park_mb;
       options.vision = !no_vision;
+      options.prefill_chunk = prefill_chunk;
+      options.embed_host = embed_host;
       generator = ingine::model::make_generator(options);
 #else
       log.critical("--engine: this ingine-serve was built without ingine_model (src/model)");

@@ -8,6 +8,7 @@
 #pragma once
 
 #include "core/arena.h"
+#include "core/host_memory.h"
 #include "core/tensor.h"
 
 #include <array>
@@ -204,6 +205,7 @@ struct Weights {
   bool dense_fp8 = false;     // wproj (+ views), wo and unembed are FP8 rows
 
   std::vector<DeviceBuffer> storage;  // device allocations behind the views
+  MappedHostBuffer embed_host;        // the embedding table when it is kept in host memory
 };
 
 // model.Ablation: per visit y <- y - w * r * max(r . y - offset, floor) on the attention / MLP writes; offset 0
