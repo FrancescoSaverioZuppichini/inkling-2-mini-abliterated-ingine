@@ -578,6 +578,139 @@ moe_down_kernel(const __nv_bfloat16* __restrict__ act, const int* __restrict__ i
     }
 }
 
+// [Agent] Pre-sm_90 moe_down. The kernel above keeps a tile's experts in one block (1 block of 18 warps per SM at
+// 95 registers, 144 blocks = 1.76 waves on 82 SMs) and walks them in rounds of 2 with a block barrier each: ncu shows
+// the barrier as its top stall and 55-75 % of DRAM peak. Here each (tile, slot) that first selects its expert is
+// its own short block of 9 warps, like moe_up, so 4 blocks share an SM and one block's barrier hides behind the
+// others' loads. The expert outputs go through a global workspace and the tile's last block to arrive does the
+// weighted sum and the conv. Every value is computed as above: the same 9 partial dots summed in the same order
+// and rounded to BF16, the same slot-order weighted sum and conv, so the outputs are bit-identical.
+constexpr int SPLIT_WARPS = DOWN_GROUPS;
+constexpr int SPLIT_SLOT_DIV = 4;  // widths >= 2: M*8/4 slot blocks per tile, each looping over its slots (as moe_up)
+__device__ __nv_bfloat16 g_down_y[H / TILE][TOPK * MAXM][TILE][MAXM];  // [tile][slot][row][token] expert outputs
+__device__ unsigned g_down_arrived[H / TILE];                         // blocks done per tile; reset by the last
+
+template <int FMT, bool LOOP>
+__global__ void __launch_bounds__(SPLIT_WARPS * 32)
+moe_down_split_kernel(const __nv_bfloat16* __restrict__ act, const int* __restrict__ idx, const float* __restrict__ wts,
+                      const uint8_t* __restrict__ w, const uint8_t* __restrict__ ws, const float* __restrict__ wfactor,
+                      int M, const float* __restrict__ conv_w, float* __restrict__ conv_state, float* __restrict__ out,
+                      float* __restrict__ conv_hist) {
+    constexpr int K = I, R = H;
+    constexpr int CB = Layout<FMT>::code_bytes(K), SB = Layout<FMT>::scale_bytes(K);
+    __shared__ float part[SPLIT_WARPS][32][4];
+    __shared__ int first[TOPK * MAXM + 128];  // [0, 128): lowest slot per expert; then slot -> that slot
+    __shared__ float sbuf[MAXM][TILE];
+    __shared__ bool last;
+
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int g = lane >> 2, t = lane & 3;
+    const int tile = blockIdx.x;
+    const int nslots = M * TOPK;
+    const int lo = lane < nslots ? ld_dep(idx + lane) : -1;
+    const int hi = lane + 32 < nslots ? ld_dep(idx + lane + 32) : -1;
+    const int c = 4 * warp + t;
+    const std::uint64_t wpol = l2::policy<WEIGHT_L2>();
+
+    auto run = [&](const int slot, const int e, const uint64_t mask) {
+        const size_t row = static_cast<size_t>(e) * R + tile * TILE + g;
+        const uint32_t kmask = g < M ? uint32_t(mask >> (8 * g)) & 0xffu : 0u;
+        Frag<FMT> f;
+        load_w<FMT, K>(f, w + row * CB, ws + row * SB, c, FMT == 0 ? wfactor[e] : 1.f, wpol);
+        load_x(f, kmask ? act + (static_cast<size_t>(g) * TOPK + (__ffs(kmask) - 1)) * K : nullptr, c);
+        float d[4] = {0.f, 0.f, 0.f, 0.f};
+        mma_frag(f, d);
+#pragma unroll
+        for (int v = 0; v < 4; ++v) part[warp][lane][v] = d[v];
+        __syncthreads();
+        if (warp == 0) {
+            float s[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+            for (int j = 0; j < SPLIT_WARPS; ++j)
+#pragma unroll
+                for (int v = 0; v < 4; ++v) s[v] += part[j][lane][v];
+            __nv_bfloat16(&y)[TILE][MAXM] = g_down_y[tile][slot];
+            if (2 * t < M) y[g][2 * t] = __float2bfloat16_rn(s[0]), y[g + 8][2 * t] = __float2bfloat16_rn(s[2]);
+            if (2 * t + 1 < M) y[g][2 * t + 1] = __float2bfloat16_rn(s[1]), y[g + 8][2 * t + 1] = __float2bfloat16_rn(s[3]);
+        }
+        __syncthreads();  // part is reused by the next slot
+    };
+    if constexpr (!LOOP) {
+        const int slot = blockIdx.y, e = ld_dep(idx + slot);
+        const uint64_t mask = slot_mask(e, lo, hi);
+        if (__ffsll(static_cast<long long>(mask)) - 1 == slot) run(slot, e, mask);
+    } else {
+#pragma unroll 1
+        for (int slot = blockIdx.y; slot < nslots; slot += gridDim.y) {
+            const int e = __shfl_sync(0xffffffffu, slot < 32 ? lo : hi, slot & 31);
+            const uint64_t mask = slot_mask(e, lo, hi);
+            if (__ffsll(static_cast<long long>(mask)) - 1 == slot) run(slot, e, mask);
+        }
+    }
+
+    // [Agent] Publish, then the tile's last block (the classic threadfence + counter pattern) sums the slots.
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) last = atomicAdd(&g_down_arrived[tile], 1u) == gridDim.y - 1;
+    __syncthreads();
+    if (!last) return;
+    __threadfence();
+    if (threadIdx.x == 0) g_down_arrived[tile] = 0;
+    if (warp == 0) {
+        for (int i = lane; i < 128; i += 32) first[i] = TOPK * MAXM;
+        __syncwarp();
+        if (lo >= 0) atomicMin(&first[lo], lane);
+        if (hi >= 0) atomicMin(&first[hi], lane + 32);
+        __syncwarp();
+        if (lo >= 0) first[128 + lane] = first[lo];
+        if (hi >= 0) first[128 + lane + 32] = first[hi];
+    }
+    __syncthreads();
+    if (threadIdx.x < TILE * M) {
+        const int r = threadIdx.x & (TILE - 1), n = threadIdx.x / TILE;
+        float s = 0.f;
+#pragma unroll
+        for (int k = 0; k < TOPK; ++k) {
+            const int sl = n * TOPK + k;
+            const __nv_bfloat16 y = __ldcg(&g_down_y[tile][first[128 + sl]][r][n]);
+            s = __fadd_rn(s, __fmul_rn(ld_dep(wts + sl), __bfloat162float(y)));
+        }
+        sbuf[n][r] = bf16_round(s);
+    }
+    __syncthreads();
+    if (threadIdx.x < TILE) {
+        const int ch = tile * TILE + threadIdx.x;
+        const float4 cw = *reinterpret_cast<const float4*>(conv_w + 4 * ch);
+        float ext[MAXM + 3];
+        ext[0] = ld_dep(conv_state + ch);
+        ext[1] = ld_dep(conv_state + H + ch);
+        ext[2] = ld_dep(conv_state + 2 * H + ch);
+#pragma unroll
+        for (int m = 0; m < MAXM; ++m) ext[m + 3] = m < M ? sbuf[m][threadIdx.x] : 0.f;
+        constexpr float inv_sqrt5 = 1.f / 2.2360679774997896f;
+#pragma unroll
+        for (int m = 0; m < MAXM; ++m) {
+            if (m < M) {
+                float acc = __fmul_rn(cw.x, ext[m]);
+                acc = __fadd_rn(acc, __fmul_rn(cw.y, ext[m + 1]));
+                acc = __fadd_rn(acc, __fmul_rn(cw.z, ext[m + 2]));
+                acc = __fadd_rn(acc, __fmul_rn(cw.w, ext[m + 3]));
+                out[static_cast<size_t>(m) * H + ch] = __fmul_rn(__fadd_rn(acc, ext[m + 3]), inv_sqrt5);
+                if (conv_hist) conv_hist[static_cast<size_t>(m) * H + ch] = ext[m + 3];
+            }
+        }
+        // [Agent] The new state is ext[M .. M + 2]; a select chain keeps ext[] in registers (indexing it by M put it on
+        // the stack, a local-memory round trip on the kernel's tail).
+#pragma unroll
+        for (int j = 0; j < 3; ++j) {
+            float v = ext[j];
+#pragma unroll
+            for (int m = 1; m <= MAXM; ++m) v = m <= M ? ext[m + j] : v;
+            conv_state[j * H + ch] = v;
+        }
+    }
+}
+
 void require(bool ok, const char* what) {
     if (!ok) throw std::invalid_argument(std::string("moe: ") + what);
 }
@@ -624,9 +757,18 @@ void moe_down(const __nv_bfloat16* act, int M, const int* idx, const float* wts,
     require(act && idx && wts && w2 && w2_scale && conv_w && conv_state && out, "moe_down: null argument");
     require(fmt == Format::MXFP8 || w2_factor, "NVFP4 experts need a factor tensor");
     const bool nv = fmt == Format::NVFP4;
-    launch(nv ? moe_down_kernel<0> : moe_down_kernel<1>, dim3(H / TILE), DOWN_WARPS * 32, pdl, stream, act, idx,
-           wts, static_cast<const uint8_t*>(w2), static_cast<const uint8_t*>(w2_scale), nv ? w2_factor : nullptr,
-           M, conv_w, conv_state, out, conv_hist);
+    const uint8_t* const w = static_cast<const uint8_t*>(w2);
+    const uint8_t* const s = static_cast<const uint8_t*>(w2_scale);
+    // [Agent] The split kernel only for NVFP4 (44 of 48 visits): MXFP8 rows are twice the bytes, so the old kernel's
+    // 18 KB-per-round blocks already keep enough in flight, and the split one measured 3-5 % slower at widths >= 2.
+    if (device_has_clusters() || !nv) {
+        launch(nv ? moe_down_kernel<0> : moe_down_kernel<1>, dim3(H / TILE), DOWN_WARPS * 32, pdl, stream, act, idx,
+               wts, w, s, nv ? w2_factor : nullptr, M, conv_w, conv_state, out, conv_hist);
+        return;
+    }
+    const int gy = M == 1 ? TOPK : std::max(TOPK, M * TOPK / SPLIT_SLOT_DIV);
+    launch(gy < M * TOPK ? moe_down_split_kernel<0, true> : moe_down_split_kernel<0, false>, dim3(H / TILE, gy),
+           SPLIT_WARPS * 32, false, stream, act, idx, wts, w, s, w2_factor, M, conv_w, conv_state, out, conv_hist);
 }
 
 }  // namespace ingine::kernels::moe
