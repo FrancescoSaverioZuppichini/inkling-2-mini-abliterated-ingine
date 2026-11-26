@@ -74,6 +74,24 @@ __device__ __forceinline__ float group_sum(float v) {
 
 constexpr int pow2_ceil(int n) { return n <= 1 ? 1 : 2 * pow2_ceil((n + 1) / 2); }
 
+// [Agent] One transposing butterfly stage per template instance (O = P/2, P/4, ..., 1). Written as a loop nest
+// (inner trip count = outer variable) nvcc unrolled it only up to P = 8: for P = 16 and 32 the array went to local
+// memory (STACK 64/128 B) and every stage became stack stores and loads, the slowest part of the mixes with 10 or
+// more reduced values. Same additions in the same order, so the results are bit-identical.
+template <int O, int P>
+__device__ __forceinline__ void transpose_stage(float (&t)[P], unsigned mask, int lane) {
+  if constexpr (O >= 1) {
+    const bool up = lane & O;
+#pragma unroll
+    for (int i = 0; i < O; ++i) {
+      const float send = up ? t[i] : t[i + O];
+      const float keep = up ? t[i + O] : t[i];
+      t[i] = keep + __shfl_xor_sync(mask, send, O);
+    }
+    transpose_stage<O / 2>(t, mask, lane);
+  }
+}
+
 // Sums N values over a group of LANES lanes and scatters the totals: returns, in every lane l of the
 // group, the total of value (l % P), P = pow2_ceil(N) (lanes with l % P >= N get 0). Plain butterflies
 // down to P lanes, then a transposing butterfly (each lane ships the half of its partials its partner
@@ -91,16 +109,7 @@ __device__ __forceinline__ float reduce_scatter(const float (&in)[N]) {
   for (int o = LANES / 2; o >= P; o >>= 1)
 #pragma unroll
     for (int i = 0; i < P; ++i) t[i] += __shfl_xor_sync(mask, t[i], o);
-#pragma unroll
-  for (int o = P / 2; o >= 1; o >>= 1) {
-    const bool up = lane & o;
-#pragma unroll
-    for (int i = 0; i < o; ++i) {
-      const float send = up ? t[i] : t[i + o];
-      const float keep = up ? t[i + o] : t[i];
-      t[i] = keep + __shfl_xor_sync(mask, send, o);
-    }
-  }
+  transpose_stage<P / 2>(t, mask, lane);
   return t[0];
 }
 
