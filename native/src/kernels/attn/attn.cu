@@ -373,7 +373,7 @@ constexpr int min_blocks(int M, bool full) {
 #endif
 }
 
-template <int M, bool FULL, bool F8>
+template <int M, bool FULL, bool F8, int SCS = CS>
 __global__ void __launch_bounds__(MAXWARPS * 32, min_blocks(M, FULL)) attn_decode_kernel(const Params p) {
     static_assert(FULL || !F8, "FP8 caches are full-layer only");
     using CT = std::conditional_t<F8, __nv_fp8_storage_t, __nv_bfloat16>;  // cache element
@@ -387,9 +387,9 @@ __global__ void __launch_bounds__(MAXWARPS * 32, min_blocks(M, FULL)) attn_decod
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, half = lane >> 4, c = lane & 15;
     const int tok = warp / KW, kw = warp % KW;
     const bool owner = rank == 0;
-    // [Agent] Only full layers at width > 1 take the per-GPU split; width 1 and the sliding rings keep the compile-time
-    // 16 and with it their old code (a runtime split made them 6-8 % slower and they are not wave-bound).
-    const int R = p.R, cs = FULL && M > 1 ? p.cs : CS;
+    // [Agent] Full layers at width > 1 take the per-GPU split at run time. Width 1 keeps the compile-time 16, and the
+    // sliding rings at width > 1 a compile-time SCS (a runtime split cost them 6-8 %: their loop is 2-4 tiles long).
+    const int R = p.R, cs = FULL && M > 1 ? p.cs : M > 1 ? SCS : CS;
     CT* const kc = static_cast<CT*>(p.k_cache);
     CT* const vc = static_cast<CT*>(p.v_cache);
 
@@ -1269,10 +1269,10 @@ struct Kernel {
     int split;  // default blocks per KV head on this GPU
 };
 
-template <int M, bool FULL, bool F8>
+template <int M, bool FULL, bool F8, int SCS = CS>
 Kernel kernel_of() {
     static const Kernel k = [] {
-        const KernelFn f = attn_decode_kernel<M, FULL, F8>;
+        const KernelFn f = attn_decode_kernel<M, FULL, F8, SCS>;
         if (device_has_clusters()) CUDA_CHECK(cudaFuncSetAttribute(f, cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
         CUDA_CHECK(cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, int(Smem<M, F8>::BYTES)));
         // [Agent] Without clusters: as many blocks per KV head as fill the GPU in ONE wave (all heads' blocks resident
@@ -1286,13 +1286,42 @@ Kernel kernel_of() {
             CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, f, NT, Smem<M, F8>::BYTES));
             split = std::max(1, std::min(MAXCS, sms * per_sm / HKV));
         }
-        return Kernel{f, M, Smem<M, F8>::BYTES, split};
+        return Kernel{f, M, Smem<M, F8>::BYTES, FULL ? split : SCS};
+    }();
+    return k;
+}
+
+// [Agent] Sliding rings at width > 1: 32 tiles of 32 keys. At one block per SM (98 KB of shared memory) the 16 blocks
+// per head of the 5090 run in 1.6 waves on the 3090's 82 SMs (ncu: 1.56 waves per SM), so where 16 per head do not
+// fit in one wave the ring is split 8 ways (64 blocks, 4 tiles each): -16 to -19 % per call at widths 2-8.
+template <int M>
+Kernel sliding_kernel() {
+    static const Kernel k = [] {
+        const Kernel k16 = kernel_of<M, false, false, CS>();
+        if (M == 1 || device_has_clusters()) return k16;
+        int dev = 0, sms = 0, per_sm = 0;
+        CUDA_CHECK(cudaGetDevice(&dev));
+        CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
+        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, k16.fn, NT, k16.smem));
+        return sms * per_sm >= HKV * CS ? k16 : kernel_of<M, false, false, CS / 2>();
     }();
     return k;
 }
 
 template <bool FULL, bool F8 = false>
 Kernel select(int M) {
+    if constexpr (!FULL) {
+        switch (M) {
+            case 1: return sliding_kernel<1>();
+            case 2: return sliding_kernel<2>();
+            case 3: return sliding_kernel<3>();
+            case 4: return sliding_kernel<4>();
+            case 5: return sliding_kernel<5>();
+            case 6: return sliding_kernel<6>();
+            case 7: return sliding_kernel<7>();
+            default: return sliding_kernel<8>();
+        }
+    }
     switch (M) {
         case 1: return kernel_of<1, FULL, F8>();
         case 2: return kernel_of<2, FULL, F8>();
@@ -1379,7 +1408,7 @@ void attn_decode(const DecodeArgs& a, cudaStream_t stream) {
     p.part = reinterpret_cast<float*>(static_cast<char*>(a.workspace) + WS_PART);
     p.out = a.out;
     const Kernel k = full ? (a.cache_fp8 ? select<true, true>(M) : select<true>(M)) : select<false>(M);
-    p.cs = device_has_clusters() || !full || M == 1 ? CS : k.split;
+    p.cs = device_has_clusters() || M == 1 ? CS : k.split;
     cudaLaunchAttribute attrs[2];
     const cudaLaunchConfig_t cfg = launch_config(k, stream, attrs, p.cs);
     CUDA_CHECK(cudaLaunchKernelEx(&cfg, k.fn, p));
