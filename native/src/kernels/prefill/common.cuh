@@ -86,8 +86,6 @@ __device__ __forceinline__ float2 e4m3x2_to_float2(uint16_t u) {
   return __half22float2(*reinterpret_cast<const __half2*>(&h));
 }
 
-// 2 E4M3 codes -> packed FP16 pair (exact).
-__device__ __forceinline__ uint32_t e4m3x2_to_half2(uint16_t u) { return fp8x::e4m3x2_to_f16x2(u); }
 
 // float -> E4M3 code, round to nearest even after saturating to +-448 (torch clamp + .to(float8_e4m3fn)).
 __device__ __forceinline__ uint8_t f2e4m3(float x) {

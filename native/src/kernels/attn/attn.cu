@@ -256,24 +256,6 @@ __device__ __forceinline__ float2 e4m3x2_f2(uint32_t pair) {
     return __half22float2(*reinterpret_cast<const __half2*>(&h));
 }
 
-// [Agent] 2 E4M3 codes (low 16 bits) -> BF16x2 for the width > 1 tensor-core path. Before sm_89 there is no FP8
-// convert, and going E4M3 -> FP16 -> 2 x FP32 -> BF16 costs ~9 instructions per pair. Here the code's sign, exponent
-// and mantissa bits go straight into a BF16 word (a value 2^-120 times the code's, subnormal codes included) and one
-// BF16 FMA by 2^120 (plus -0, which keeps the sign of zero) scales it back exactly: 5 instructions, same bits.
-__device__ __forceinline__ uint32_t e4m3x2_bf16x2(uint32_t pair) {
-#if __CUDA_ARCH__ >= 890
-    const float2 f = e4m3x2_f2(pair);
-    const __nv_bfloat162 b = __floats2bfloat162_rn(f.x, f.y);
-    return *reinterpret_cast<const uint32_t*>(&b);
-#else
-    const uint32_t w = __byte_perm(pair, 0u, 0x4140);  // [byte 0, 0, byte 1, 0]
-    const uint32_t b = ((w << 4) & 0x07f007f0u) | ((w << 8) & 0x80008000u);
-    uint32_t r;
-    asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(r) : "r"(b), "r"(0x7b807b80u), "r"(0x80008000u));
-    return r;
-#endif
-}
-
 // 8 E4M3 values (dims 8c..8c+7, byte 0 = lowest dim)
 __device__ __forceinline__ void unpack8(const uint2 u, float f[8]) {
     float2 a = e4m3x2_f2(u.x & 0xffffu), b = e4m3x2_f2(u.x >> 16);
@@ -959,8 +941,8 @@ __global__ void __launch_bounds__(MAXWARPS * 32, min_blocks(M, FULL)) attn_decod
                         const char* kr = kraw + key * D + ((ks ^ (key & 7)) * 16) + 4 * t4;
                         const uint32_t u0 = *reinterpret_cast<const uint32_t*>(kr);
                         const uint32_t u1 = *reinterpret_cast<const uint32_t*>(kr + 8 * D);
-                        af[0] = e4m3x2_bf16x2(u0 & 0xffffu), af[1] = e4m3x2_bf16x2(u1 & 0xffffu);
-                        af[2] = e4m3x2_bf16x2(u0 >> 16), af[3] = e4m3x2_bf16x2(u1 >> 16);
+                        af[0] = fp8x::e4m3x2_to_bf16x2(u0), af[1] = fp8x::e4m3x2_to_bf16x2(u1);
+                        af[2] = fp8x::e4m3x2_to_bf16x2(u0 >> 16), af[3] = fp8x::e4m3x2_to_bf16x2(u1 >> 16);
                     } else {
                         const int q = lane >> 3, key = km * 16 + (q & 1) * 8 + (lane & 7);
                         ldsm_x4(smem_u32(kaddr(key, ks * 2 + (q >> 1))), af);
@@ -1356,13 +1338,6 @@ int max_active_clusters(int M, int window) {
     cudaLaunchConfig_t cfg = launch_config(k, nullptr, attrs);
     cfg.numAttrs = 1;  // occupancy: the cluster shape only
     int n = 0;
-    if (!device_has_clusters()) {  // blocks resident at once, in units of CS
-        int dev = 0, sms = 0;
-        CUDA_CHECK(cudaGetDevice(&dev));
-        CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
-        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n, k.fn, NT, k.smem));
-        return n * sms / CS;
-    }
     CUDA_CHECK(cudaOccupancyMaxActiveClusters(&n, k.fn, &cfg));
     return n;
 }
@@ -1404,8 +1379,7 @@ void attn_decode(const DecodeArgs& a, cudaStream_t stream) {
     p.part = reinterpret_cast<float*>(static_cast<char*>(a.workspace) + WS_PART);
     p.out = a.out;
     const Kernel k = full ? (a.cache_fp8 ? select<true, true>(M) : select<true>(M)) : select<false>(M);
-    p.cs = device_has_clusters() || !full || M == 1 ? CS : (a.split ? a.split : k.split);
-    require(p.cs >= 1 && p.cs <= MAXCS, "split must be in 1..16");
+    p.cs = device_has_clusters() || !full || M == 1 ? CS : k.split;
     cudaLaunchAttribute attrs[2];
     const cudaLaunchConfig_t cfg = launch_config(k, stream, attrs, p.cs);
     CUDA_CHECK(cudaLaunchKernelEx(&cfg, k.fn, p));

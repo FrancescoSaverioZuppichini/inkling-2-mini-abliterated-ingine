@@ -65,9 +65,7 @@ constexpr int TOPK = 8;
 constexpr int MAXM = 8;
 constexpr int TILE = 16;                    // weight rows per block
 constexpr int UP_WARPS = H / 128;           // 18: one column group of W13 per warp
-#ifndef UP_SLOT_DIV
-#define UP_SLOT_DIV 4  // pre-sm_90: moe_up launches M*8/UP_SLOT_DIV slot blocks (at least 8); 4 by kbench (hold 8)
-#endif
+constexpr int UP_SLOT_DIV = 4;  // pre-sm_90: moe_up launches M*8/UP_SLOT_DIV slot blocks (at least 8); 4 by kbench (hold 8)
 constexpr int DOWN_GROUPS = I / 128;        // 9 column groups of W2
 constexpr int DOWN_PAR = 2;                 // experts per round
 constexpr int DOWN_WARPS = DOWN_GROUPS * DOWN_PAR;
@@ -164,10 +162,8 @@ __device__ __forceinline__ Chunk<FMT> load_chunk(const uint8_t* codes, const uin
 
 // ------------------------------------------------------------------------------------------ decode
 
-__device__ __forceinline__ uint32_t f16x2_from_e4m3x2(uint16_t v) { return fp8x::e4m3x2_to_f16x2(v); }
-
+#if __CUDA_ARCH__ >= 1000  // [Agent] the hardware E2M1 convert; below sm_100 decode() uses the lookup table
 __device__ __forceinline__ void f16x2_from_e2m1x4(uint32_t w, uint32_t (&h)[4]) {
-#if __CUDA_ARCH__ >= 1000
     asm("{\n"
         ".reg .b8 b0, b1, b2, b3;\n"
         "mov.b32 {b0, b1, b2, b3}, %4;\n"
@@ -178,11 +174,8 @@ __device__ __forceinline__ void f16x2_from_e2m1x4(uint32_t w, uint32_t (&h)[4]) 
         "}"
         : "=r"(h[0]), "=r"(h[1]), "=r"(h[2]), "=r"(h[3])
         : "r"(w));
-#else
-#pragma unroll
-    for (int b = 0; b < 4; ++b) h[b] = fp8x::e2m1x2_to_f16x2(w >> (8 * b));
-#endif
 }
+#endif
 
 __device__ __forceinline__ uint32_t pack_bf16(float lo, float hi) {
     __nv_bfloat162 v = __floats2bfloat162_rn(lo, hi);
@@ -233,7 +226,7 @@ __device__ __forceinline__ void lut_word(uint32_t w, const Lut& t, uint32_t* o) 
 
 // Decodes a chunk into 16 bf16x2 words (element pairs 0..15) holding exactly decode_experts' values.
 __device__ __forceinline__ void decode(const Chunk<0>& ch, float factor, uint32_t (&o)[16]) {
-    const uint32_t s2 = f16x2_from_e4m3x2(ch.s);
+    const uint32_t s2 = fp8x::e4m3x2_to_f16x2(ch.s);
     const __half2 sc = *reinterpret_cast<const __half2*>(&s2);
 #if __CUDA_ARCH__ >= 1000
     const __half2 slo = __low2half2(sc), shi = __high2half2(sc);
@@ -289,7 +282,7 @@ __device__ __forceinline__ void decode(const Chunk<1>& ch, float /*factor*/, uin
     for (int w = 0; w < 8; ++w) {
 #pragma unroll
         for (int hh = 0; hh < 2; ++hh) {
-            const uint32_t h2 = f16x2_from_e4m3x2(uint16_t(words[w] >> (16 * hh)));
+            const uint32_t h2 = fp8x::e4m3x2_to_f16x2(uint16_t(words[w] >> (16 * hh)));
             const float2 v = __half22float2(*reinterpret_cast<const __half2*>(&h2));
             o[2 * w + hh] = pack_bf16(v.x * sc, v.y * sc);  // exact: fp8 value times a power of two
         }

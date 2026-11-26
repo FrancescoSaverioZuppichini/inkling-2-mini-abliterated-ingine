@@ -36,13 +36,13 @@
 
 namespace ingine::kernels {
 
-__device__ __forceinline__ void pdl_trigger() { 
+__device__ __forceinline__ void pdl_trigger() {
 #if __CUDA_ARCH__ >= 900
   asm volatile("griddepcontrol.launch_dependents;");
 #endif
 }
 
-__device__ __forceinline__ void pdl_wait() { 
+__device__ __forceinline__ void pdl_wait() {
 #if __CUDA_ARCH__ >= 900
   asm volatile("griddepcontrol.wait;" ::: "memory");
 #endif

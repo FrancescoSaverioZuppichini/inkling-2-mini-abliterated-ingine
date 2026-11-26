@@ -95,11 +95,6 @@ __device__ __forceinline__ void load_tile(const AttnParams& p, int g, int j0, Kv
 
 __device__ __forceinline__ uint32_t bf16x2_to_half2(uint32_t u) { return pack_half2(bf_lo(u), bf_hi(u)); }
 
-__device__ __forceinline__ uint32_t e4m3x2_to_bf16x2(uint16_t u) {
-  const float2 f = e4m3x2_to_float2(u);
-  return pack_bf16x2(f.x, f.y);
-}
-
 template <bool FP8, bool EXPLICIT>
 __device__ __forceinline__ void store_tile(Smem& s, int buf, const KvRegs<FP8>& r) {
   const int tid = threadIdx.x;
@@ -110,14 +105,14 @@ __device__ __forceinline__ void store_tile(Smem& s, int buf, const KvRegs<FP8>& 
       const uint32_t kw[4] = {r.k[i].x, r.k[i].y, r.k[i].z, r.k[i].w};
       const uint32_t vw[4] = {r.v[i].x, r.v[i].y, r.v[i].z, r.v[i].w};
       uint4 k0, k1, v0, v1;
-      k0.x = e4m3x2_to_bf16x2(kw[0] & 0xffff); k0.y = e4m3x2_to_bf16x2(kw[0] >> 16);
-      k0.z = e4m3x2_to_bf16x2(kw[1] & 0xffff); k0.w = e4m3x2_to_bf16x2(kw[1] >> 16);
-      k1.x = e4m3x2_to_bf16x2(kw[2] & 0xffff); k1.y = e4m3x2_to_bf16x2(kw[2] >> 16);
-      k1.z = e4m3x2_to_bf16x2(kw[3] & 0xffff); k1.w = e4m3x2_to_bf16x2(kw[3] >> 16);
-      v0.x = e4m3x2_to_half2(vw[0] & 0xffff); v0.y = e4m3x2_to_half2(vw[0] >> 16);
-      v0.z = e4m3x2_to_half2(vw[1] & 0xffff); v0.w = e4m3x2_to_half2(vw[1] >> 16);
-      v1.x = e4m3x2_to_half2(vw[2] & 0xffff); v1.y = e4m3x2_to_half2(vw[2] >> 16);
-      v1.z = e4m3x2_to_half2(vw[3] & 0xffff); v1.w = e4m3x2_to_half2(vw[3] >> 16);
+      k0.x = fp8x::e4m3x2_to_bf16x2(kw[0] & 0xffff); k0.y = fp8x::e4m3x2_to_bf16x2(kw[0] >> 16);
+      k0.z = fp8x::e4m3x2_to_bf16x2(kw[1] & 0xffff); k0.w = fp8x::e4m3x2_to_bf16x2(kw[1] >> 16);
+      k1.x = fp8x::e4m3x2_to_bf16x2(kw[2] & 0xffff); k1.y = fp8x::e4m3x2_to_bf16x2(kw[2] >> 16);
+      k1.z = fp8x::e4m3x2_to_bf16x2(kw[3] & 0xffff); k1.w = fp8x::e4m3x2_to_bf16x2(kw[3] >> 16);
+      v0.x = fp8x::e4m3x2_to_f16x2(vw[0] & 0xffff); v0.y = fp8x::e4m3x2_to_f16x2(vw[0] >> 16);
+      v0.z = fp8x::e4m3x2_to_f16x2(vw[1] & 0xffff); v0.w = fp8x::e4m3x2_to_f16x2(vw[1] >> 16);
+      v1.x = fp8x::e4m3x2_to_f16x2(vw[2] & 0xffff); v1.y = fp8x::e4m3x2_to_f16x2(vw[2] >> 16);
+      v1.z = fp8x::e4m3x2_to_f16x2(vw[3] & 0xffff); v1.w = fp8x::e4m3x2_to_f16x2(vw[3] >> 16);
       *reinterpret_cast<uint4*>(&s.k[buf][swz<DCH>(row, 2 * c)]) = k0;
       *reinterpret_cast<uint4*>(&s.k[buf][swz<DCH>(row, 2 * c + 1)]) = k1;
       *reinterpret_cast<uint4*>(&s.v[buf][swz<DCH>(row, 2 * c)]) = v0;

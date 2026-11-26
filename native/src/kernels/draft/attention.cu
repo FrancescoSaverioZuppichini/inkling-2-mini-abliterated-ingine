@@ -170,10 +170,10 @@ __global__ void __launch_bounds__(ATT_THREADS) attn_partial_kernel(const __nv_bf
         uint32_t kb[8], vb[8];
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
-          kb[2 * i] = e4m3x2_to_bf16x2(kw[i]);
-          kb[2 * i + 1] = e4m3x2_to_bf16x2(kw[i] >> 16);
-          vb[2 * i] = e4m3x2_to_bf16x2(vw[i]);
-          vb[2 * i + 1] = e4m3x2_to_bf16x2(vw[i] >> 16);
+          kb[2 * i] = fp8x::e4m3x2_to_bf16x2(kw[i]);
+          kb[2 * i + 1] = fp8x::e4m3x2_to_bf16x2(kw[i] >> 16);
+          vb[2 * i] = fp8x::e4m3x2_to_bf16x2(vw[i]);
+          vb[2 * i + 1] = fp8x::e4m3x2_to_bf16x2(vw[i] >> 16);
         }
         uint4* kd = reinterpret_cast<uint4*>(&kt[buf][key][16 * piece]);
         uint4* vd = reinterpret_cast<uint4*>(&vt[buf][key][16 * piece]);

@@ -54,7 +54,9 @@ __global__ void __launch_bounds__(32 * EXPERTS / CL) router_kernel(const __nv_bf
   constexpr int CH = H / (EPC * 32);
   __shared__ __align__(16) __nv_bfloat16 xs[M][H];
   __shared__ __align__(16) float logits[EXPERTS];  // token `rank`'s logits (CTAs rank < M)
+#if __CUDA_ARCH__ >= 900
   __shared__ __align__(8) uint64_t mbar;           // completes when the 128 logits arrived
+#endif
   __shared__ __align__(16) float part[M][RPC];     // this CTA's logits
   __shared__ unsigned long long keys[EXPERTS];    // selection keys of sigmoid + bias
   __shared__ int cnt[NT];                          // partial ranks
@@ -207,7 +209,7 @@ void launch_router(int M, const __nv_bfloat16* x, const void* w, const float* bi
 
 // 16-CTA clusters need the non-portable opt-in and a GPC with 16 free SMs; fall back to 8 otherwise.
 int router_cluster_size() {
-  if (!has_clusters()) return 16;  // one cooperative grid of 16 CTAs: no GPC constraint
+  if (!device_has_clusters()) return 16;  // one cooperative grid of 16 CTAs: no GPC constraint
   static const int cl = [] {
     auto k = router_kernel<16, true, 8>;
     if (cudaFuncSetAttribute(k, cudaFuncAttributeNonPortableClusterSizeAllowed, 1) != cudaSuccess) {

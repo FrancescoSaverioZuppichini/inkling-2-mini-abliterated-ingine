@@ -103,7 +103,9 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_kernel(GateArgs a
   __shared__ __align__(16) float part[M][2][C::RPC];  // per-half partial dots
   __shared__ __align__(16) float ssall[CL][4 * MQ];   // per-CTA sums of squares of the gated output, received
   __shared__ float red[C::NW * 32], red2[C::NW * 32];
+#if __CUDA_ARCH__ >= 900
   __shared__ __align__(8) uint64_t mbar[2];  // g, sums of squares
+#endif
 
 #if __CUDA_ARCH__ >= 900
   cg::cluster_group cluster = cg::this_cluster();

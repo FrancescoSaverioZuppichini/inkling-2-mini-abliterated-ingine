@@ -30,12 +30,12 @@ __device__ __forceinline__ void cluster_wait() { asm volatile("barrier.cluster.w
 // completed and its writes are visible. pdl_trigger() lets the next kernel of the stream start its own
 // prologue (it still waits for this grid's completion before reading our outputs). Both are no-ops when
 // the kernel was not launched with the PDL attribute.
-__device__ __forceinline__ void pdl_wait() { 
+__device__ __forceinline__ void pdl_wait() {
 #if __CUDA_ARCH__ >= 900
   asm volatile("griddepcontrol.wait;" ::: "memory");
 #endif
 }
-__device__ __forceinline__ void pdl_trigger() { 
+__device__ __forceinline__ void pdl_trigger() {
 #if __CUDA_ARCH__ >= 900
   asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
 #endif
@@ -54,17 +54,13 @@ __device__ __forceinline__ void pdl_wait_fenced(uint32_t zero) {
   }
 }
 
-// [Agent] Before sm_90 the cluster kernels (router, message_gates) exchange through a global mailbox and
-// cg::this_grid().sync(), which needs a cooperative launch so every CTA is resident.
-inline bool has_clusters() { return device_has_clusters(); }
-
-// Launches `kernel` on `stream` (graph capturable): as clusters of `cl` CTAs if cl > 1 (one cooperative grid
-// before sm_90), with the programmatic-stream-serialization attribute if `pdl` (captured as a programmatic graph
+// Launches `kernel` on `stream` (graph capturable): as clusters of `cl` CTAs if cl > 1 ([Agent] before sm_90 one
+// cooperative grid: the cluster kernels then exchange through a global mailbox and cg::this_grid().sync()), with the programmatic-stream-serialization attribute if `pdl` (captured as a programmatic graph
 // edge). Cluster sizes above 8 need the non-portable opt-in; shared memory above 48 KB the dynamic-size opt-in.
 template <class... KArgs, class... Args>
 void launch_ex(void (*kernel)(KArgs...), dim3 grid, int block, int smem, int cl, bool pdl, cudaStream_t stream,
                Args&&... args) {
-  const bool clusters = has_clusters();
+  const bool clusters = device_has_clusters();
   if (cl > 8 && clusters) CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
   // static + dynamic shared memory above 48 KB needs the opt-in, whatever the split
   if (smem > 0) CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
