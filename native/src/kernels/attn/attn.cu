@@ -169,7 +169,9 @@ struct Smem {
     static constexpr int PSTRIDE = KT + 8;               // fp16 per P row (80 B: conflict-free ldmatrix)
     static constexpr int PS = RELD + NRP * DREL;         // P as fp16 hi, lo [2][NRP][PSTRIDE]
     static constexpr int ITM = PS + NRP * PSTRIDE;       // per key m-tile row (max, sum) float2 [KT/16][NRP]
-    static constexpr int END = ITM + 2 * (KT / 16) * NRP;
+    static constexpr int RF = ITM + 2 * (KT / 16) * NRP;  // per key m-tile row: exp2(item max - new max) [KT/16][NRP]
+    static constexpr int RS3 = RF + (KT / 16) * NRP;      // per row: old-state rescale, running max, running sum [3][NRP]
+    static constexpr int END = RS3 + 3 * NRP;
     static constexpr size_t BYTES = size_t(END) * 4;
 };
 
@@ -498,16 +500,24 @@ __global__ void __launch_bounds__(MAXWARPS * 32, min_blocks(M, FULL)) attn_decod
                   "E4M3 tiles and the widened V tile must fit the stage and staging regions");
     char* const raw = reinterpret_cast<char*>(sm + L::KVS);
     __half* const wv = reinterpret_cast<__half*>(sm);  // E4M3: the widened V tile [KT][D], chunks swizzled
+    // [Agent] A thread copies the same (K or V, 16-byte chunk) of keys key0 + 16 n in every tile, so its source row 0 and
+    // destination offset are fixed once here: the per-chunk index and 64-bit address arithmetic was 13 % of the width-8
+    // kernel's instructions (ncu source counters). Same copies as before.
+    constexpr int RAW_PER_THREAD = KT * 2 * (D / 16) / NT;
+    static_assert(!F8 || M == 1 || RAW_PER_THREAD * NT == KT * 2 * (D / 16), "raw tile chunks must divide over the block");
+    const int rkey0 = tid / (2 * (D / 16)), rkv = (tid / (D / 16)) % 2, rch = tid % (D / 16);
+    const CT* const rrow0 = (rkv ? vc : kc) + size_t(g) * D + rch * 16;  // this thread's chunk of cache row 0
+    const int rdst = rkv * KT * D + rkey0 * D + (rkv ? rch : rch ^ (rkey0 & 7)) * 16;
     auto issue_raw = [&](const int t) {
         const int base = rank * KT + t * cs * KT;
         if (base < L_old) {
-            for (int i = tid; i < KT * 2 * (D / 16); i += NT) {
-                const int key = i / (2 * (D / 16)), kv = (i / (D / 16)) % 2, ch = i % (D / 16), j = base + key;
+            char* const dst = raw + (t % NRAW) * RAWB + rdst;
+#pragma unroll
+            for (int n = 0; n < RAW_PER_THREAD; ++n) {
+                const int j = base + rkey0 + 16 * n;
                 const bool ok = j < L_old;
-                char* dst = raw + (t % NRAW) * RAWB + kv * KT * D + key * D + (kv ? ch : ch ^ (key & 7)) * 16;
-                cp16z(reinterpret_cast<float*>(dst),
-                      reinterpret_cast<const float*>((kv ? vc : kc) + (size_t(ok ? j : 0) * HKV + g) * D + ch * 16), ok,
-                      kvpol);
+                cp16z(reinterpret_cast<float*>(dst + 16 * n * D),
+                      reinterpret_cast<const float*>(rrow0 + size_t(ok ? j : 0) * HKV * D), ok, kvpol);
             }
         }
         asm volatile("cp.async.commit_group;" ::: "memory");
@@ -907,13 +917,14 @@ __global__ void __launch_bounds__(MAXWARPS * 32, min_blocks(M, FULL)) attn_decod
 
         // this thread's output rows n*8 + 2 t4 (+1), dims 16 warp + gid (+8): accumulators and softmax state
         // (every warp tracks the same row statistics, so no shared running max is needed)
-        float oacc[NTN][4], mrow[NTN][2], lrow[NTN][2];
+        float oacc[NTN][4];
 #pragma unroll
-        for (int n = 0; n < NTN; ++n) {
+        for (int n = 0; n < NTN; ++n)
 #pragma unroll
             for (int v = 0; v < 4; ++v) oacc[n][v] = 0.f;
-            mrow[n][0] = mrow[n][1] = NEG_INIT, lrow[n][0] = lrow[n][1] = 0.f;
-        }
+        float* const rf = sm + L::RF;                                                        // [KT/16][NRP]
+        float *const rsc = sm + L::RS3, *const rmax = rsc + NRP, *const rsum = rmax + NRP;  // [NRP] each
+        for (int r = tid; r < NRP; r += NT) rmax[r] = NEG_INIT, rsum[r] = 0.f;
         float2* itm = reinterpret_cast<float2*>(sm + L::ITM);  // per (key m-tile, row): item max, item sum
 
         // One tile: [S items (16 keys x 8 rows) over the warps, item max, P relative to it, item sums] |
@@ -1023,31 +1034,38 @@ __global__ void __launch_bounds__(MAXWARPS * 32, min_blocks(M, FULL)) attn_decod
                 if (gid == 0) itm[km * NRP + r0] = make_float2(mx0, s0), itm[km * NRP + r0 + 1] = make_float2(mx1, s1);
             }
             __syncthreads();
-            mid();
-            float f[KM][NTN][2];  // per item weight exp2(item max - new max) of each of this thread's rows
+            // [Agent] The row statistics are the same for every warp, and each of the 8 warps used to recompute them
+            // for its own rows: 24 exp2f per thread per tile, ~20 % of the width-8 kernel's instructions (ncu source
+            // counters). One thread per row now computes them once, with the same expressions in the same order
+            // (bit-identical), and the warps read the weights after one more barrier.
+            if (tid < NRP) {
+                const int r = tid;
+                float2 it[KM];
+                float mn = rmax[r];
 #pragma unroll
-            for (int n = 0; n < NTN; ++n) {
+                for (int k = 0; k < KM; ++k) {
+                    it[k] = k < nk ? itm[k * NRP + r] : make_float2(NEG_INIT, 0.f);
+                    mn = fmaxf(mn, it[k].x);
+                }
+                const float sc = exp2f(rmax[r] - mn);
+                float l = rsum[r] * sc;
+#pragma unroll
+                for (int k = 0; k < KM; ++k) {
+                    const float fk = exp2f(it[k].x - mn);
+                    rf[k * NRP + r] = fk;
+                    l += it[k].y * fk;
+                }
+                rsc[r] = sc, rmax[r] = mn, rsum[r] = l;
+            }
+            mid();
+            __syncthreads();
+#pragma unroll
+            for (int n = 0; n < NTN; ++n)
 #pragma unroll
                 for (int h = 0; h < 2; ++h) {
-                    const int r = n * 8 + 2 * t4 + h;
-                    float2 it[KM];
-                    float mn = mrow[n][h];
-#pragma unroll
-                    for (int k = 0; k < KM; ++k) {
-                        it[k] = k < nk ? itm[k * NRP + r] : make_float2(NEG_INIT, 0.f);
-                        mn = fmaxf(mn, it[k].x);
-                    }
-                    const float sc = exp2f(mrow[n][h] - mn);
-                    float l = lrow[n][h] * sc;
-#pragma unroll
-                    for (int k = 0; k < KM; ++k) {
-                        f[k][n][h] = exp2f(it[k].x - mn);
-                        l += it[k].y * f[k][n][h];
-                    }
+                    const float sc = rsc[n * 8 + 2 * t4 + h];
                     oacc[n][h] *= sc, oacc[n][h + 2] *= sc;
-                    mrow[n][h] = mn, lrow[n][h] = l;
                 }
-            }
 #pragma unroll
             for (int ks = 0; ks < KM; ++ks) {
                 if (ks >= nk) break;
@@ -1065,8 +1083,9 @@ __global__ void __launch_bounds__(MAXWARPS * 32, min_blocks(M, FULL)) attn_decod
                     mma_f16(t, af, bfr);
                     ldsm_x2(smem_u32(pr + NRP * PSTRIDE), bfr);
                     mma_f16(t, af, bfr);
+                    const float2 fw = *reinterpret_cast<const float2*>(rf + ks * NRP + n * 8 + 2 * t4);
 #pragma unroll
-                    for (int v = 0; v < 4; ++v) oacc[n][v] = fmaf(f[ks][n][v & 1], t[v], oacc[n][v]);
+                    for (int v = 0; v < 4; ++v) oacc[n][v] = fmaf((v & 1) ? fw.y : fw.x, t[v], oacc[n][v]);
                 }
             }
         };
@@ -1118,6 +1137,7 @@ __global__ void __launch_bounds__(MAXWARPS * 32, min_blocks(M, FULL)) attn_decod
             }
         }
 
+        __syncthreads();  // a block without tiles has its row statistics only from their initialisation
         // this block's partial (unnormalised o, then max and sum per row) to the workspace (L2)
         float* part = p.part + size_t(g * cs + rank) * ROWS * PSTR;
 #pragma unroll
@@ -1131,7 +1151,7 @@ __global__ void __launch_bounds__(MAXWARPS * 32, min_blocks(M, FULL)) attn_decod
 #pragma unroll
                 for (int v = 0; v < 2; ++v) {
                     const int row = n * 8 + 2 * t4 + v;
-                    if (row < ROWS) __stcg(reinterpret_cast<float2*>(part + row * PSTR + D), make_float2(mrow[n][v], lrow[n][v]));
+                    if (row < ROWS) __stcg(reinterpret_cast<float2*>(part + row * PSTR + D), make_float2(rmax[row], rsum[row]));
                 }
             }
         }
@@ -1296,16 +1316,20 @@ Kernel kernel_of() {
 // fit in one wave the ring is split 8 ways (64 blocks, 4 tiles each): -16 to -19 % per call at widths 2-8.
 template <int M>
 Kernel sliding_kernel() {
-    static const Kernel k = [] {
-        const Kernel k16 = kernel_of<M, false, false, CS>();
-        if (M == 1 || device_has_clusters()) return k16;
-        int dev = 0, sms = 0, per_sm = 0;
-        CUDA_CHECK(cudaGetDevice(&dev));
-        CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
-        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, k16.fn, NT, k16.smem));
-        return sms * per_sm >= HKV * CS ? k16 : kernel_of<M, false, false, CS / 2>();
-    }();
-    return k;
+    if constexpr (M == 1) {
+        return kernel_of<1, false, false, CS>();
+    } else {
+        static const Kernel k = [] {
+            const Kernel k16 = kernel_of<M, false, false, CS>();
+            if (device_has_clusters()) return k16;
+            int dev = 0, sms = 0, per_sm = 0;
+            CUDA_CHECK(cudaGetDevice(&dev));
+            CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
+            CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, k16.fn, NT, k16.smem));
+            return sms * per_sm >= HKV * CS ? k16 : kernel_of<M, false, false, CS / 2>();
+        }();
+        return k;
+    }
 }
 
 template <bool FULL, bool F8 = false>
