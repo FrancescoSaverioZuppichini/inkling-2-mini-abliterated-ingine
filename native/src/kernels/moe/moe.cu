@@ -51,6 +51,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -64,6 +65,9 @@ constexpr int TOPK = 8;
 constexpr int MAXM = 8;
 constexpr int TILE = 16;                    // weight rows per block
 constexpr int UP_WARPS = H / 128;           // 18: one column group of W13 per warp
+#ifndef UP_SLOT_DIV
+#define UP_SLOT_DIV 4  // pre-sm_90: moe_up launches M*8/UP_SLOT_DIV slot blocks (at least 8); 4 by kbench (hold 8)
+#endif
 constexpr int DOWN_GROUPS = I / 128;        // 9 column groups of W2
 constexpr int DOWN_PAR = 2;                 // experts per round
 constexpr int DOWN_WARPS = DOWN_GROUPS * DOWN_PAR;
@@ -373,7 +377,7 @@ __device__ __forceinline__ float bf16_round(float v) { return __bfloat162float(_
 
 // --------------------------------------------------------------------------------------- moe_up
 
-template <int FMT>
+template <int FMT, bool LOOP>
 __global__ void __launch_bounds__(UP_WARPS * 32)
 moe_up_kernel(const __nv_bfloat16* __restrict__ x, const int* __restrict__ idx, const uint8_t* __restrict__ w,
               const uint8_t* __restrict__ ws, const float* __restrict__ wfactor, int M,
@@ -385,53 +389,68 @@ moe_up_kernel(const __nv_bfloat16* __restrict__ x, const int* __restrict__ idx, 
 
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int g = lane >> 2, t = lane & 3;
-    const int tile = blockIdx.x, slot = blockIdx.y;
+    const int tile = blockIdx.x;
     const int nslots = M * TOPK;
     pdl_wait();     // x and idx come from earlier kernels
     pdl_trigger();  // moe_down may launch once every block got here (it waits for us before reading act)
     const int lo = lane < nslots ? ld_dep(idx + lane) : -1;
     const int hi = lane + 32 < nslots ? ld_dep(idx + lane + 32) : -1;
-    const int e = ld_dep(idx + slot);
-    const uint64_t mask = slot_mask(e, lo, hi);
-    if (__ffsll(static_cast<long long>(mask)) - 1 != slot) return;  // an earlier slot owns this expert
+    // [Agent] LOOP (pre-sm_90 at widths >= 2): a block owns slots y, y + gridDim.y, ... and computes the ones that first
+    // select their expert. With real routing ~half of the M*8 slots repeat an expert, and each such slot block of the
+    // one-per-slot grid still cost a launch and an idx round trip. At width 1 (one block per slot, never a repeat) the
+    // loop-free body keeps its own expert load in parallel with the idx row.
+    auto run = [&](const int slot, const int e, const uint64_t mask) {
+        const size_t row = static_cast<size_t>(e) * R + tile * TILE + g;
+        const bool on = g < M && ((mask >> (8 * g)) & 0xffu);
+        Frag<FMT> f;
+        load_w<FMT, K>(f, w + row * CB, ws + row * SB, 4 * warp + t, FMT == 0 ? wfactor[e] : 1.f,
+                       l2::policy<WEIGHT_L2>());
+        load_x(f, on ? x + static_cast<size_t>(g) * K : nullptr, 4 * warp + t);
+        float d[4] = {0.f, 0.f, 0.f, 0.f};
+        mma_frag(f, d);
 
-    const size_t row = static_cast<size_t>(e) * R + tile * TILE + g;
-    const bool on = g < M && ((mask >> (8 * g)) & 0xffu);
-    Frag<FMT> f;
-    load_w<FMT, K>(f, w + row * CB, ws + row * SB, 4 * warp + t, FMT == 0 ? wfactor[e] : 1.f,
-                   l2::policy<WEIGHT_L2>());
-    load_x(f, on ? x + static_cast<size_t>(g) * K : nullptr, 4 * warp + t);
-    float d[4] = {0.f, 0.f, 0.f, 0.f};
-    mma_frag(f, d);
-
 #pragma unroll
-    for (int v = 0; v < 4; ++v) red[warp][lane][v] = d[v];
-    __syncthreads();
-    if (threadIdx.x < 32) {
-        float s[4] = {0.f, 0.f, 0.f, 0.f};
+        for (int v = 0; v < 4; ++v) red[warp][lane][v] = d[v];
+        __syncthreads();
+        if (threadIdx.x < 32) {
+            float s[4] = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll
-        for (int ww = 0; ww < UP_WARPS; ++ww)
+            for (int ww = 0; ww < UP_WARPS; ++ww)
 #pragma unroll
-            for (int v = 0; v < 4; ++v) s[v] += red[ww][lane][v];
-        tile_out[g][2 * t] = s[0];
-        tile_out[g][2 * t + 1] = s[1];
-        tile_out[g + 8][2 * t] = s[2];
-        tile_out[g + 8][2 * t + 1] = s[3];
-    }
-    __syncthreads();
-    if (threadIdx.x < TILE / 2 * MAXM) {
-        const int p = threadIdx.x & 7, n = threadIdx.x >> 3;  // gate/up pair p, token n
-        uint32_t kmask = n < M ? uint32_t(mask >> (8 * n)) & 0xffu : 0u;
-        if (kmask) {
-            const float gate = bf16_round(tile_out[2 * p][n]);
-            const float up = bf16_round(tile_out[2 * p + 1][n]);
-            const float a = tanhf(gate / 4.f) * 4.f * (1.f / (1.f + expf(-gate))) * (tanhf(up / 25.f) * 25.f);
-            const __nv_bfloat16 ab = __float2bfloat16_rn(a);
-            while (kmask) {
-                const int k = __ffs(kmask) - 1;
-                kmask &= kmask - 1;
-                out[(static_cast<size_t>(n) * TOPK + k) * I + tile * (TILE / 2) + p] = ab;
+                for (int v = 0; v < 4; ++v) s[v] += red[ww][lane][v];
+            tile_out[g][2 * t] = s[0];
+            tile_out[g][2 * t + 1] = s[1];
+            tile_out[g + 8][2 * t] = s[2];
+            tile_out[g + 8][2 * t + 1] = s[3];
+        }
+        __syncthreads();
+        if (threadIdx.x < TILE / 2 * MAXM) {
+            const int p = threadIdx.x & 7, n = threadIdx.x >> 3;  // gate/up pair p, token n
+            uint32_t kmask = n < M ? uint32_t(mask >> (8 * n)) & 0xffu : 0u;
+            if (kmask) {
+                const float gate = bf16_round(tile_out[2 * p][n]);
+                const float up = bf16_round(tile_out[2 * p + 1][n]);
+                const float a = tanhf(gate / 4.f) * 4.f * (1.f / (1.f + expf(-gate))) * (tanhf(up / 25.f) * 25.f);
+                const __nv_bfloat16 ab = __float2bfloat16_rn(a);
+                while (kmask) {
+                    const int k = __ffs(kmask) - 1;
+                    kmask &= kmask - 1;
+                    out[(static_cast<size_t>(n) * TOPK + k) * I + tile * (TILE / 2) + p] = ab;
+                }
             }
+        }
+    };
+    if constexpr (!LOOP) {
+        const int slot = blockIdx.y, e = ld_dep(idx + slot);
+        const uint64_t mask = slot_mask(e, lo, hi);
+        if (__ffsll(static_cast<long long>(mask)) - 1 != slot) return;  // an earlier slot owns this expert
+        run(slot, e, mask);
+    } else {
+#pragma unroll 1
+        for (int slot = blockIdx.y; slot < nslots; slot += gridDim.y) {
+            const int e = __shfl_sync(0xffffffffu, slot < 32 ? lo : hi, slot & 31);
+            const uint64_t mask = slot_mask(e, lo, hi);
+            if (__ffsll(static_cast<long long>(mask)) - 1 == slot) run(slot, e, mask);
         }
     }
 }
@@ -595,8 +614,12 @@ void moe_up(const __nv_bfloat16* x, int M, const int* idx, const void* w13, cons
     require(x && idx && w13 && w13_scale && out, "moe_up: null argument");
     require(fmt == Format::MXFP8 || w13_factor, "NVFP4 experts need a factor tensor");
     const bool nv = fmt == Format::NVFP4;
-    const dim3 grid(2 * I / TILE, M * TOPK);
-    launch(nv ? moe_up_kernel<0> : moe_up_kernel<1>, grid, UP_WARPS * 32, pdl, stream, x, idx,
+    // pre-sm_90: fewer slot blocks, each looping over its slots (see moe_up_kernel); identical outputs
+    const int gy = device_has_clusters() ? M * TOPK : std::max(TOPK, M * TOPK / UP_SLOT_DIV);
+    const dim3 grid(2 * I / TILE, gy);
+    const bool loop = gy < M * TOPK;
+    launch(nv ? (loop ? moe_up_kernel<0, true> : moe_up_kernel<0, false>)
+              : (loop ? moe_up_kernel<1, true> : moe_up_kernel<1, false>), grid, UP_WARPS * 32, pdl, stream, x, idx,
            static_cast<const uint8_t*>(w13), static_cast<const uint8_t*>(w13_scale), nv ? w13_factor : nullptr, M,
            out);
 }
