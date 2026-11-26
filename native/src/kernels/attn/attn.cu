@@ -78,6 +78,7 @@
 // Ported from engine/csrc/attn/attn.cu (kernel bodies unchanged; torch launcher -> raw pointers).
 #include "kernels/attn/attn.h"
 
+#include "kernels/common/fp8x.cuh"
 #include "kernels/common/l2.cuh"
 
 #include "core/device.h"
@@ -113,7 +114,10 @@ constexpr float INV_3 = 1.f / 3.f;
 // fp32 [HKV][CS][3M][PSTR]: o (D) then (max, sum)
 constexpr size_t WS_PART = 256;
 constexpr int PSTR = D + 4;
-constexpr size_t ws_bytes(int M) { return WS_PART + size_t(HKV) * CS * GQA * M * PSTR * 4; }
+constexpr size_t ws_part_bytes(int M) { return size_t(HKV) * CS * GQA * M * PSTR * 4; }
+// [Agent] Pre-sm_90 only: counters 1..8 (one per KV head, in the reserved first 256 bytes) and the owner's new K/V
+// rows staged bf16 [HKV][2][M][D] after the partials, for the head's last block to write into the ring.
+constexpr size_t ws_bytes(int M) { return WS_PART + ws_part_bytes(M) + size_t(HKV) * 2 * M * D * 2; }
 
 constexpr int NT = 256;  // threads per block (8 warps) for every M
 
@@ -242,7 +246,8 @@ __device__ __forceinline__ void unpack8(const uint4 u, float f[8]) {
 
 // E4M3 pair (low byte = lower dim) to floats, exact (cvt.f16x2.e4m3x2, then FP16 -> FP32)
 __device__ __forceinline__ float2 e4m3x2_f2(uint32_t pair) {
-    return __half22float2(__half2(__nv_cvt_fp8x2_to_halfraw2(__nv_fp8x2_storage_t(pair), __NV_E4M3)));
+    const uint32_t h = fp8x::e4m3x2_to_f16x2(pair);
+    return __half22float2(*reinterpret_cast<const __half2*>(&h));
 }
 
 // 8 E4M3 values (dims 8c..8c+7, byte 0 = lowest dim)
@@ -501,7 +506,11 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
     }
     // a loop ptxas cannot see through: it would sink the loads above below a plain wait
 #pragma unroll 1
-    for (int i = 0; i <= p.zero; ++i) asm volatile("griddepcontrol.wait;" ::: "memory");
+    for (int i = 0; i <= p.zero; ++i) {
+#if __CUDA_ARCH__ >= 900
+        asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
+    }
     for (int i = tid; i < M * GQA * D / 4; i += NT)       // q rows of heads 3g..3g+2 are contiguous
         cp16(sm + L::Q + 4 * i, p.proj + size_t(i / (GQA * D / 4)) * R + g * GQA * D + 4 * (i % (GQA * D / 4)));
     for (int i = tid; i < M * GQA * DREL / 4; i += NT)
@@ -542,7 +551,9 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
         }
     }
     // dependents (proj_conv) may launch now: their weight stream queues behind this block's K/V requests
+#if __CUDA_ARCH__ >= 900
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+#endif
 
     // ---- q and rel post-processing, once per block. q: one warp per row (lane = 4 dims); rel: one
     // half-warp per row. Fixed trip counts and clamped rows (no branches), so the reductions of a warp's
@@ -1101,20 +1112,32 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
             }
         }
     }
-    // every partial of the head is written, and every block of the head is done reading the ring
-    asm volatile("barrier.cluster.arrive.release.aligned;\n\tbarrier.cluster.wait.acquire.aligned;" ::: "memory");
-    if (!FULL && M > 1 && owner && tid == NT - 1) {  // kpos is read by every head: the last head writes it
-        __threadfence();
-        if (atomicAdd(p.counter, 1) == HKV - 1) {
-            __threadfence();
-            for (int m = 0; m < M; ++m) p.kpos[(p0 + m) & (WIN - 1)] = p0 + m;
-            *p.counter = 0;
+    // The owner's global writes: the new K/V rows (if `rows`) and the conv states of this head's channels.
+    auto owner_writes = [&](bool rows) {
+        if (rows) {
+            for (int idx = tid; idx < 2 * M * 16; idx += NT) {  // new K/V rows
+                const int kv = idx / (M * 16), m = (idx / 16) % M, c8 = idx % 16;
+                const int row = FULL ? p0 + m : (p0 + m) & (WIN - 1);
+                const uint4 u = reinterpret_cast<const uint4*>(&s_nkv[kv][m][0])[c8];
+                CT* const dst = (kv ? vc : kc) + (size_t(row) * HKV + g) * D;
+                if constexpr (F8) {  // exact: the values are E4M3 already
+                    float f[8];
+                    unpack8(u, f);
+                    reinterpret_cast<uint2*>(dst)[c8] = make_uint2(pack_e4m3x2(f[0], f[1]) | pack_e4m3x2(f[2], f[3]) << 16,
+                                                                   pack_e4m3x2(f[4], f[5]) | pack_e4m3x2(f[6], f[7]) << 16);
+                } else {
+                    reinterpret_cast<uint4*>(dst)[c8] = u;
+                }
+            }
         }
-    }
-
-    // block `rank` outputs dims 8 rank .. 8 rank + 7 of every row: thread (row, dim) = (tid / 8, tid % 8)
-    if (tid < ROWS * OD) {
-        const int row = tid / OD, dim = rank * OD + tid % OD;
+        for (int idx = tid; idx < 3 * 2 * D; idx += NT) {  // conv states of this head's channels
+            const int i = idx / (2 * D), kv = (idx / D) % 2, ch = idx % D;
+            (kv ? p.conv_v : p.conv_k)[i * CONV_C + g * D + ch] = sm[L::NST + idx];
+        }
+        if (!FULL && M == 1 && g == 0 && tid == 0) p.kpos[p0 & (WIN - 1)] = p0;
+    };
+    // Row `row`, output dim `dim`: merge the head's CS partials with the sink logit, apply the sigmoid gate.
+    auto merge = [&](int row, int dim, float gate_logit) {
         const float* src = p.part + size_t(g * CS) * ROWS * PSTR + row * PSTR;
         float2 ml[CS];
         float o[CS];
@@ -1134,33 +1157,71 @@ __global__ void __launch_bounds__(MAXWARPS * 32, 2) attn_decode_kernel(const Par
             l += ml[q].y * f;
             a += o[q] * f;
         }
-        const float gate = 1.f / (1.f + expf(-sm[L::GATE + tid]));
+        const float gate = 1.f / (1.f + expf(-gate_logit));
         p.out[size_t(row / GQA) * HQ * D + (g * GQA + row % GQA) * D + dim] = __float2bfloat16_rn(bf16r(a / l) * gate);
+    };
+
+#if __CUDA_ARCH__ >= 900
+    // every partial of the head is written, and every block of the head is done reading the ring
+    asm volatile("barrier.cluster.arrive.release.aligned;\n\tbarrier.cluster.wait.acquire.aligned;" ::: "memory");
+    if (!FULL && M > 1 && owner && tid == NT - 1) {  // kpos is read by every head: the last head writes it
+        __threadfence();
+        if (atomicAdd(p.counter, 1) == HKV - 1) {
+            __threadfence();
+            for (int m = 0; m < M; ++m) p.kpos[(p0 + m) & (WIN - 1)] = p0 + m;
+            *p.counter = 0;
+        }
     }
+
+    // block `rank` outputs dims 8 rank .. 8 rank + 7 of every row: thread (row, dim) = (tid / 8, tid % 8)
+    if (tid < ROWS * OD) merge(tid / OD, rank * OD + tid % OD, sm[L::GATE + tid]);
 
     // owner: the global writes, at the end so they delay nothing (and, for M > 1 on a ring, because the
     // overwritten slots were still being read)
+    if (owner) owner_writes(true);
+#else
+    // [Agent] No clusters, and the 128 blocks may not all be resident (82 SMs on an RTX 3090), so no block may wait
+    // for another. Each block publishes its partials and arrives on its head's counter; the last arrival knows the
+    // head is done and merges all 128 output dims with exactly the arithmetic above. The owner's rows go out before
+    // it arrives where nothing in this call reads them (full layers write positions >= p0; a sliding M = 1 write
+    // replaces an entry at distance 1024, ignored either way). The overwritten ring slots of M > 1 are still being
+    // read, so the owner stages those rows and the head's last block writes them.
+    __nv_bfloat16* const stage = reinterpret_cast<__nv_bfloat16*>(reinterpret_cast<char*>(p.part) + ws_part_bytes(M)) +
+                                 size_t(g) * 2 * M * D;
     if (owner) {
-        for (int idx = tid; idx < 2 * M * 16; idx += NT) {  // new K/V rows
+        owner_writes(FULL || M == 1);
+        if (!FULL && M > 1)
+            for (int idx = tid; idx < 2 * M * 16; idx += NT)
+                reinterpret_cast<uint4*>(stage)[idx] = reinterpret_cast<const uint4*>(&s_nkv[0][0][0])[idx];
+    }
+    __shared__ int s_last;
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) s_last = atomicAdd(p.counter + 1 + g, 1) == CS - 1;
+    __syncthreads();
+    if (!s_last) return;
+    __threadfence();
+    if (tid == 0) p.counter[1 + g] = 0;
+    for (int i = tid; i < ROWS * D; i += NT) {
+        const int row = i / D, dim = i % D;
+        merge(row, dim, __ldcg(p.proj + size_t(row / GQA) * R + OFF_GATE + (g * GQA + row % GQA) * D + dim));
+    }
+    if constexpr (!FULL && M > 1) {
+        for (int idx = tid; idx < 2 * M * 16; idx += NT) {  // the staged rows into the ring
             const int kv = idx / (M * 16), m = (idx / 16) % M, c8 = idx % 16;
-            const int row = FULL ? p0 + m : (p0 + m) & (WIN - 1);
-            const uint4 u = reinterpret_cast<const uint4*>(&s_nkv[kv][m][0])[c8];
-            CT* const dst = (kv ? vc : kc) + (size_t(row) * HKV + g) * D;
-            if constexpr (F8) {  // exact: the values are E4M3 already
-                float f[8];
-                unpack8(u, f);
-                reinterpret_cast<uint2*>(dst)[c8] = make_uint2(pack_e4m3x2(f[0], f[1]) | pack_e4m3x2(f[2], f[3]) << 16,
-                                                               pack_e4m3x2(f[4], f[5]) | pack_e4m3x2(f[6], f[7]) << 16);
-            } else {
-                reinterpret_cast<uint4*>(dst)[c8] = u;
+            CT* const dst = (kv ? vc : kc) + (size_t((p0 + m) & (WIN - 1)) * HKV + g) * D;
+            reinterpret_cast<uint4*>(dst)[c8] = __ldcg(reinterpret_cast<const uint4*>(stage) + idx);
+        }
+        if (tid == 0) {  // kpos is read by every head: the last head writes it
+            __threadfence();
+            if (atomicAdd(p.counter, 1) == HKV - 1) {
+                __threadfence();
+                for (int m = 0; m < M; ++m) p.kpos[(p0 + m) & (WIN - 1)] = p0 + m;
+                *p.counter = 0;
             }
         }
-        for (int idx = tid; idx < 3 * 2 * D; idx += NT) {  // conv states of this head's channels
-            const int i = idx / (2 * D), kv = (idx / D) % 2, ch = idx % D;
-            (kv ? p.conv_v : p.conv_k)[i * CONV_C + g * D + ch] = sm[L::NST + idx];
-        }
-        if (!FULL && M == 1 && g == 0 && tid == 0) p.kpos[p0 & (WIN - 1)] = p0;
     }
+#endif
 }
 
 void require(bool ok, const char* what) {
@@ -1179,7 +1240,7 @@ template <int M, bool FULL, bool F8>
 Kernel kernel_of() {
     static const Kernel k = [] {
         const KernelFn f = attn_decode_kernel<M, FULL, F8>;
-        CUDA_CHECK(cudaFuncSetAttribute(f, cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
+        if (device_has_clusters()) CUDA_CHECK(cudaFuncSetAttribute(f, cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
         CUDA_CHECK(cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, int(Smem<M, F8>::BYTES)));
         return Kernel{f, M, Smem<M, F8>::BYTES};
     }();
@@ -1214,6 +1275,7 @@ cudaLaunchConfig_t launch_config(const Kernel& k, cudaStream_t stream, cudaLaunc
     attrs[1].val.programmaticStreamSerializationAllowed = 1;
     cfg.attrs = attrs;
     cfg.numAttrs = 2;
+    if (!device_has_clusters()) cfg.attrs = attrs + 1, cfg.numAttrs = 1;  // plain grid (+ the ignored PDL attribute)
     return cfg;
 }
 
@@ -1232,6 +1294,13 @@ int max_active_clusters(int M, int window) {
     cudaLaunchConfig_t cfg = launch_config(k, nullptr, attrs);
     cfg.numAttrs = 1;  // occupancy: the cluster shape only
     int n = 0;
+    if (!device_has_clusters()) {  // blocks resident at once, in units of CS
+        int dev = 0, sms = 0;
+        CUDA_CHECK(cudaGetDevice(&dev));
+        CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
+        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n, k.fn, NT, k.smem));
+        return n * sms / CS;
+    }
     CUDA_CHECK(cudaOccupancyMaxActiveClusters(&n, k.fn, &cfg));
     return n;
 }

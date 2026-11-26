@@ -17,6 +17,18 @@ void cuda_check(cudaError_t err, const char* expr, const char* file, int line);
 
 #define CUDA_CHECK(expr) ::ingine::cuda_check((expr), #expr, __FILE__, __LINE__)
 
+// [Agent] Thread-block clusters (and distributed shared memory) exist from sm_90. Kernels that use them take a
+// cluster-free path below that (RTX 3090 / 4090), and their launchers ask here which one the device runs.
+inline bool device_has_clusters() {
+    static const bool yes = [] {
+        int dev = 0, major = 0;
+        CUDA_CHECK(cudaGetDevice(&dev));
+        CUDA_CHECK(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev));
+        return major >= 9;
+    }();
+    return yes;
+}
+
 // Non-owning execution facts passed to Ops whose launch policy depends on physical device
 // capacity. DeviceContext remains the owner and authoritative source of both values.
 struct DeviceExecutionView {

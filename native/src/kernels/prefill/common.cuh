@@ -6,6 +6,8 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
+
+#include "kernels/common/fp8x.cuh"
 #include <cuda_runtime.h>
 
 #include <cstdint>
@@ -80,15 +82,12 @@ __device__ __forceinline__ uint32_t pack_half2(float lo, float hi) {
 
 // 2 E4M3 codes (low byte first) -> 2 floats (exact via FP16).
 __device__ __forceinline__ float2 e4m3x2_to_float2(uint16_t u) {
-  __half2_raw h = __nv_cvt_fp8x2_to_halfraw2(static_cast<__nv_fp8x2_storage_t>(u), __NV_E4M3);
-  return __half22float2(*reinterpret_cast<__half2*>(&h));
+  const uint32_t h = fp8x::e4m3x2_to_f16x2(u);
+  return __half22float2(*reinterpret_cast<const __half2*>(&h));
 }
 
 // 2 E4M3 codes -> packed FP16 pair (exact).
-__device__ __forceinline__ uint32_t e4m3x2_to_half2(uint16_t u) {
-  __half2_raw h = __nv_cvt_fp8x2_to_halfraw2(static_cast<__nv_fp8x2_storage_t>(u), __NV_E4M3);
-  return uint32_t(h.x) | (uint32_t(h.y) << 16);
-}
+__device__ __forceinline__ uint32_t e4m3x2_to_half2(uint16_t u) { return fp8x::e4m3x2_to_f16x2(u); }
 
 // float -> E4M3 code, round to nearest even after saturating to +-448 (torch clamp + .to(float8_e4m3fn)).
 __device__ __forceinline__ uint8_t f2e4m3(float x) {

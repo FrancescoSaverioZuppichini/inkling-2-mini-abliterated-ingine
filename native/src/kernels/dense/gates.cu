@@ -53,6 +53,12 @@ constexpr int RANK = 64;
 // left for everything else.
 constexpr l2::Evict WEIGHT_L2 = l2::Evict::none;
 
+// [Agent] Pre-sm_90 mailboxes for the two all-to-all exchanges (down outputs, then per-CTA sums of squares): every
+// CTA writes its part, the cooperative grid syncs, every CTA reads the whole. One buffer serves every call because
+// launches on the stream never overlap without PDL.
+__device__ float g_gates_down[3][8][RANK];
+__device__ float g_gates_ss[3][16][8];
+
 struct GateArgs {
   const float* h;    // [G, M, H], or [M, H] read by every gate (h_shared)
   bool h_shared;
@@ -99,13 +105,18 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_kernel(GateArgs a
   __shared__ float red[C::NW * 32], red2[C::NW * 32];
   __shared__ __align__(8) uint64_t mbar[2];  // g, sums of squares
 
+#if __CUDA_ARCH__ >= 900
   cg::cluster_group cluster = cg::this_cluster();
   const int rank = cluster.block_rank();
+#else
+  const int rank = blockIdx.x % CL;
+#endif
   const int g = blockIdx.x / CL;
   const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
   const int rl = warp >> 1, half = warp & 1;  // down projection: warp = (row_local, half)
   const float* hg = a.h + (a.h_shared ? size_t(0) : size_t(g) * M * H);
   const float* mg = a.msg + size_t(g) * M * H;
+#if __CUDA_ARCH__ >= 900
   const uint32_t mb_g = smem_u32(&mbar[0]), mb_s = smem_u32(&mbar[1]);
   if (t == 0) {
     mb_init(mb_g);
@@ -115,6 +126,7 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_kernel(GateArgs a
     mb_expect(mb_s, 16u * CL * MQ);
   }
   cluster_arrive_relaxed();  // waited for before the first remote store
+#endif
 
   // forget/gain slices (padded rows) -> shared memory, asynchronous, waited for before the forget/gain phase
   const std::uint64_t wpol = l2::policy<WEIGHT_L2>();
@@ -199,6 +211,7 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_kernel(GateArgs a
   }
   __syncthreads();
 
+#if __CUDA_ARCH__ >= 900
   cluster_wait();  // all CTAs resident, barriers initialised: remote stores may start
   if (t < M * CL) {  // thread (token m, destination d): the token's 4 rows as one 16-byte store
     const int m = t % M, d = t / M;
@@ -208,6 +221,14 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_kernel(GateArgs a
                                  round_bf16(p0.w + p1.w));
     st_async4(remote(smem_u32(&gall[m][rank * C::RPC]), d), v, remote(mb_g, d));
   }
+#else
+  if (t < M) {  // token t's 4 rows into the mailbox
+    const float4 p0 = *reinterpret_cast<const float4*>(&part[t][0][0]);
+    const float4 p1 = *reinterpret_cast<const float4*>(&part[t][1][0]);
+    *reinterpret_cast<float4*>(&g_gates_down[g][t][rank * C::RPC]) = make_float4(
+        round_bf16(p0.x + p1.x), round_bf16(p0.y + p1.y), round_bf16(p0.z + p1.z), round_bf16(p0.w + p1.w));
+  }
+#endif
   // this thread's channel inputs fly during the exchange
   const int c = rank * C::CPC + t;
   const bool own = t < C::CPC;
@@ -223,8 +244,14 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_kernel(GateArgs a
     nw = a.norm_w[size_t(g) * H + c];
   }
   asm volatile("cp.async.wait_all;" ::: "memory");
+#if __CUDA_ARCH__ >= 900
   __syncthreads();  // forget/gain slices from all threads' copies are visible
   mb_wait(mb_g);
+#else
+  cg::this_grid().sync();  // also a block barrier: the forget/gain slices are visible
+  for (int k = t; k < M * RANK; k += C::NT) gall[k / RANK][k % RANK] = __ldcg(&g_gates_down[g][k / RANK][k % RANK]);
+  __syncthreads();
+#endif
 
   // forget / gain: one thread per channel; its two weight rows are read as 16-byte chunks from the padded
   // slices (8 consecutive threads hit 8 distinct bank groups), g is a broadcast read
@@ -270,6 +297,7 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_kernel(GateArgs a
 
   // per-token sums of squares of this CTA's channels, sent to every CTA
   block_sum_bcast<M, C::NW>(sq, red);
+#if __CUDA_ARCH__ >= 900
   if (t < CL) {  // to CTA t: the M sums as 16-byte stores
     float r[4 * MQ] = {};
 #pragma unroll
@@ -280,6 +308,15 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_kernel(GateArgs a
                 remote(mb_s, t));
   }
   mb_wait(mb_s);
+#else
+  if (t == 0) {
+#pragma unroll
+    for (int m = 0; m < M; ++m) g_gates_ss[g][rank][m] = sq[m];
+  }
+  cg::this_grid().sync();
+  if (t < CL * M) ssall[t / M][t % M] = __ldcg(&g_gates_ss[g][t / M][t % M]);
+  __syncthreads();
+#endif
 
   if (own) {
 #pragma unroll

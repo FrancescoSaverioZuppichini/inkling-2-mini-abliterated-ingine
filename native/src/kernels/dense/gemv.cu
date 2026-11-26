@@ -44,6 +44,7 @@
 // L2: the weight rows are read once per step, so their lines are filled evict-first (kernels/common/l2.cuh):
 // they stop evicting the activations, KV rings and the small kernels' evict-last constants.
 // Ported from engine/csrc/dense/gemv.cu (kernel bodies unchanged; torch launchers -> raw pointers).
+#include "kernels/common/fp8x.cuh"
 #include "kernels/common/l2.cuh"
 #include "kernels/dense/cluster.cuh"
 #include "kernels/dense/dense.cuh"
@@ -214,11 +215,7 @@ __device__ __forceinline__ void mma_bf16(float (&c)[4], uint32_t a0, uint32_t a1
 
 // 2 E4M3 (low 16 bits of u) -> BF16x2, exact: one instruction (cvt.rn.bf16x2.e4m3x2; through FP16 and
 // FP32 it took four, 16 per mma)
-__device__ __forceinline__ uint32_t e4m3x2_to_bf16x2(uint32_t u) {
-  uint32_t r;
-  asm("cvt.rn.bf16x2.e4m3x2 %0, %1;" : "=r"(r) : "h"(static_cast<unsigned short>(u)));
-  return r;
-}
+__device__ __forceinline__ uint32_t e4m3x2_to_bf16x2(uint32_t u) { return fp8x::e4m3x2_to_bf16x2(u); }
 
 #ifndef MMA_U_BF16
 #define MMA_U_BF16 6
