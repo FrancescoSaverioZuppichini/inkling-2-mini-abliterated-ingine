@@ -258,9 +258,29 @@ __device__ __forceinline__ void decode(const Chunk<0>& ch, float factor, uint32_
 }
 
 __device__ __forceinline__ void decode(const Chunk<1>& ch, float /*factor*/, uint32_t (&o)[16]) {
+    const uint32_t words[8] = {ch.q0.x, ch.q0.y, ch.q0.z, ch.q0.w, ch.q1.x, ch.q1.y, ch.q1.z, ch.q1.w};
+#if __CUDA_ARCH__ < 890
+    // [Agent] sm_86 has no FP8 convert; the generic path below (bit placement into f16, x256, widen, scale, pack) costs
+    // ~12 instructions per pair. An E4M3 code's bits placed in a BF16 word (exponent field = E4M3 exponent, mantissa
+    // top 3 bits = E4M3 mantissa, sign at bit 15) read exactly as code * 2^-120, subnormal codes included; x 2^120
+    // gives the code itself (every E4M3 value is a BF16), and x 2^(s-127) (a BF16 for every s, 2^-127 subnormal) is
+    // the exact product rounded once to BF16, as the reference does through FP32. ~7 instructions per pair.
+    const __nv_bfloat162 up = __bfloat162bfloat162(__ushort_as_bfloat16(uint16_t(247u << 7)));  // 2^120
+    const __nv_bfloat162 sc2 = __bfloat162bfloat162(
+        __ushort_as_bfloat16(ch.s ? uint16_t(uint32_t(ch.s) << 7) : uint16_t(0x0040u)));  // 2^(s-127)
+#pragma unroll
+    for (int w = 0; w < 8; ++w) {
+#pragma unroll
+        for (int hh = 0; hh < 2; ++hh) {
+            const uint32_t t = prmt(words[w], 0u, hh ? 0x4342u : 0x4140u);  // 16-bit lanes = codes 2hh, 2hh + 1
+            const uint32_t b = ((t << 4) & 0x07f007f0u) | ((t << 8) & 0x80008000u);
+            const __nv_bfloat162 v = __hmul2(__hmul2(*reinterpret_cast<const __nv_bfloat162*>(&b), up), sc2);
+            o[2 * w + hh] = *reinterpret_cast<const uint32_t*>(&v);
+        }
+    }
+#else
     // E8M0 -> 2^(s-127); s = 0 is 2^-127 (fp32 subnormal), s = 255 would be NaN (never produced).
     const float sc = ch.s ? __uint_as_float(uint32_t(ch.s) << 23) : __uint_as_float(0x00400000u);
-    const uint32_t words[8] = {ch.q0.x, ch.q0.y, ch.q0.z, ch.q0.w, ch.q1.x, ch.q1.y, ch.q1.z, ch.q1.w};
 #pragma unroll
     for (int w = 0; w < 8; ++w) {
 #pragma unroll
@@ -270,6 +290,7 @@ __device__ __forceinline__ void decode(const Chunk<1>& ch, float /*factor*/, uin
             o[2 * w + hh] = pack_bf16(v.x * sc, v.y * sc);  // exact: fp8 value times a power of two
         }
     }
+#endif
 }
 
 // ------------------------------------------------------------------------------------------- mma
