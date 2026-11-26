@@ -90,12 +90,13 @@ cd native
 cmake --preset ampere            # sm_86 and sm_89 in one binary
 cmake --build --preset ampere
 build-ampere/apps/serve/ingine-serve --engine --model-dir <Inkling-2-Mini folder> --port 8003 \
-  --max-ctx 245760 --kv-fp8 --spec --spec-threshold 0.8 --no-vision --embed-host --prefill-chunk 1024
+  --max-ctx 245760 --kv-fp8 --spec --spec-threshold 0.8 --no-vision --embed-host --prefill-chunk 2048
 ```
 
-That serves the original checkpoint in BF16 with 245,760 tokens of context in about 23.6 GB. `--embed-host` keeps the
-embedding table (0.86 GiB) in host memory that the GPU reads over PCIe, and `--prefill-chunk 1024` shrinks the prefill
-workspace; both make room for the context on 24 GB. Without clusters, PDL or FP4/FP8 converts these GPUs take their own
+That serves the original checkpoint in BF16 with 245,760 tokens of context in about 23.7 GB (RTX 3090) or 23.9 GB
+(RTX 4090). `--embed-host` keeps the embedding table (0.86 GiB) in host memory that the GPU reads over PCIe, which makes
+room for the context on 24 GB. `--prefill-chunk 2048` reads prompts 9-15 % faster than 1024; 3072 does not fit with
+this context. Other programs holding GPU memory (a desktop, another server) can push 2048 over the edge: then use 1024. Without clusters, PDL or FP4/FP8 converts these GPUs take their own
 kernel paths (exact decoders, a cooperative exchange for the router and message gates, one-wave attention); the
 `ampere-dev` preset adds the tests.
 

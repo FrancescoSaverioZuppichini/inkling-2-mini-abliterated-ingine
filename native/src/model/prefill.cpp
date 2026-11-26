@@ -26,6 +26,12 @@ namespace {
 
 constexpr int H = HIDDEN;
 
+// [Agent] Sliding visits run bias + attention per kSlideRows tokens where one part's bias fits in L2 (see the
+// constructor). 3 x 1024 query rows is a whole number of attention blocks, so every block keeps its rows and key
+// tiles and the bits do not change.
+constexpr int kSlideRows = 1024;
+static_assert(HEADS / KV_HEADS * kSlideRows % pk::kAttnBlockRows == 0);
+
 const float* f32p(const Tensor& t) { return static_cast<const float*>(t.data); }
 const __nv_bfloat16* bf16p(const Tensor& t) { return static_cast<const __nv_bfloat16*>(t.data); }
 const __nv_bfloat16* bf16p(const void* p) { return static_cast<const __nv_bfloat16*>(p); }
@@ -83,6 +89,15 @@ Prefiller::Prefiller(const Weights& w, const Ablation& abl, int max_chunk, cudaS
   wscratch_ = w.dense_fp8 ? bf16(std::max(std::size_t(PROJ_ROWS_FULL) * H, std::size_t(H) * HEADS * HEAD_DIM)) : nullptr;
   ids_ = static_cast<std::int64_t*>(alloc(C * 8));
   for (auto& b : storage_) b.fill(0);  // e.g. gathered sliding rows past ring + chunk: never keys, kept finite
+
+  // [Agent] Sliding attention reads a relative bias for every score, scattered over rel_ (48 KB per token). On the
+  // RTX 4090 a 1024-token part (48 MB) stays in its 72 MB L2 while a 2048-token chunk spills to DRAM (L2 hit 66 %,
+  // 46 instead of 66 TFLOPS), so the split pays there. A 6 MB L2 (RTX 3090) holds neither, and the split only adds
+  // launches (prefill -1.1 to -1.5 % at chunk 2048).
+  int dev = 0, l2 = 0;
+  CUDA_CHECK(cudaGetDevice(&dev));
+  CUDA_CHECK(cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, dev));
+  split_sliding_ = std::size_t(kSlideRows) * HEADS * REL_EXTENT * sizeof(__nv_bfloat16) <= std::size_t(l2);
 }
 
 Prefiller::~Prefiller() = default;
@@ -278,8 +293,21 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
     }
     pk::conv_state_update(st.conv_k_at(v), proj_ + SEG_BEGIN[SEG_K], R, T, KV_DIM, s);
     pk::conv_state_update(st.conv_v_at(v), proj_ + SEG_BEGIN[SEG_V], R, T, KV_DIM, s);
-    pk::rel_logits(rel16_, f32p(layer.rel_proj), T, rel_, s);
-    pk::attention(at, s);
+    // [Agent] Full visits stay one launch: their bias covers only the last 1024 keys, and splitting them would leave
+    // a half-empty wave per part.
+    if (layer.full || !split_sliding_) {
+      pk::rel_logits(rel16_, f32p(layer.rel_proj), T, rel_, s);
+      pk::attention(at, s);
+    } else {
+      for (int t0 = 0; t0 < T; t0 += kSlideRows) {
+        const int n = std::min(kSlideRows, T - t0);
+        pk::rel_logits(rel16_ + std::size_t(t0) * HEADS * D_REL, f32p(layer.rel_proj), n, rel_, s);
+        pk::AttnParams part = at;
+        part.q = q_ + std::size_t(t0) * HEADS * HEAD_DIM, part.T = n, part.pos0 = pos0 + t0;
+        part.proj = proj_ + std::size_t(t0) * R, part.out = attn_out_ + std::size_t(t0) * HEADS * HEAD_DIM;
+        pk::attention(part, s);
+      }
+    }
 
     // ---- output projection + post-attention conv
     const __nv_bfloat16* wo = bf16_rows(layer.wo);

@@ -224,8 +224,17 @@ __device__ __forceinline__ void mma_bf16(float (&c)[4], uint32_t a0, uint32_t a1
 // (xor of all the batch's loads) & zero, so ptxas cannot interleave the mma with the batch's loads and
 // all U steps' loads of a warp are in flight together (otherwise it issues one step's loads at a time,
 // ~1 KB per warp, and scattered 64-byte requests from 16 rows run at ~40% of DRAM bandwidth).
+// [Agent] An SM schedules warps in four quarters of 16K registers each. On sm_89 ptxas gives the M >= 2 kernel up to
+// 108 registers, so a quarter fits only 4 warps of 6-warp blocks: 2 blocks per SM, and proj's 538 blocks run in 2.1
+// waves at 80 % of DRAM. Capped at 96, a quarter holds 5 warps, 3 blocks fit, and the M = 8 calls on the RTX 4090 drop
+// 3.6 % (proj), 7.6 % (proj_conv), 12.8 % (head); register allocation does not change any result bit.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 890
+#define GEMV_MMA_BOUNDS(threads) __maxnreg__(96)
+#else
+#define GEMV_MMA_BOUNDS(threads) __launch_bounds__(threads)
+#endif
 template <bool FP8, int K, int M, int SPLITK, int U, class Epi>
-__global__ void __launch_bounds__(32 * SPLITK) gemv_mma_kernel(const uint8_t* __restrict__ w,
+__global__ void GEMV_MMA_BOUNDS(32 * SPLITK) gemv_mma_kernel(const uint8_t* __restrict__ w,
                                                               const float* __restrict__ w_scale, int rows,
                                                               uint32_t zero, Epi epi) {
   constexpr int CPL = FP8 ? 16 : 8;  // columns per lane per 16-byte weight load

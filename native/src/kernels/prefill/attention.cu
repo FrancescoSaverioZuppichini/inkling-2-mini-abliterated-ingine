@@ -30,6 +30,7 @@ constexpr int D = kHeadDim;   // 128
 constexpr int DCH = D / 8;    // 16-byte chunks per 16-bit row
 constexpr int BK = kAttnKeyTile;
 constexpr int NWARPS = 8, NT = NWARPS * 32, BR = NWARPS * 16;  // 128 query rows per CTA
+static_assert(BR == kAttnBlockRows);
 constexpr int GQA = kHeads / kKvHeads;
 constexpr int GATE_COL = kHeads * kHeadDim;                       // 3072
 constexpr int SINK_COL = 2 * kHeads * kHeadDim + kHeads * kRel;   // 6528
