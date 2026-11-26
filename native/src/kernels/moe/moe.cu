@@ -185,10 +185,53 @@ __device__ __forceinline__ uint32_t pack_bf16(float lo, float hi) {
     return *reinterpret_cast<uint32_t*>(&v);
 }
 
+__device__ __forceinline__ uint32_t prmt(uint32_t a, uint32_t b, uint32_t sel) {
+    uint32_t r;
+    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(r) : "r"(a), "r"(b), "r"(sel));
+    return r;
+}
+
+// [Agent] Below sm_100 there is no E2M1 convert, and the per-element path (bit placement, f16 multiply by the scale,
+// widen, multiply by the factor, pack) cost ~20 instructions per element pair: on the RTX 3090 that made moe_up
+// issue-bound (~25 of its 37 us at width 1). A 16-element block has one scale, so its elements can only take 8
+// magnitudes: the table holds their final BF16 values, low bytes in (l0, l1) and high bytes in (h0, h1), and each
+// element is then a byte select by its 3 magnitude bits plus a sign flip, ~7 instructions per pair in all.
+// Table entries are exactly decode_experts' values: code * scale is exact (it is exact even in f16), so the value
+// is round_fp32(mag * s * f), then BF16. Only two such products are rounded: a = s f and b = (1.5 s) f (1.5 s is
+// exact); every other magnitude is a or b times a power of two, which is exact in fp32 for any scale and factor
+// whose product stays far from the subnormal range (|s f| > 2^-120). A negative code is the negated value, which
+// rounds to the negated BF16 (round to nearest even is symmetric), so the sign is an XOR of bit 15.
+struct Lut {
+    uint32_t l0, l1, h0, h1;  // byte k of l0|l1 (h0|h1) = low (high) byte of the BF16 value of magnitude code k
+};
+__device__ __forceinline__ Lut make_lut(float s, float f) {
+    const float a = s * f, b = (1.5f * s) * f;
+    // magnitude codes 0..7 = 0, 0.5, 1, 1.5, 2, 3, 4, 6
+    const uint32_t w0 = pack_bf16(0.f * a, 0.5f * a), w1 = pack_bf16(a, b);
+    const uint32_t w2 = pack_bf16(2.f * a, 2.f * b), w3 = pack_bf16(4.f * a, 4.f * b);
+    return Lut{prmt(w0, w1, 0x6420), prmt(w2, w3, 0x6420), prmt(w0, w1, 0x7531), prmt(w2, w3, 0x7531)};
+}
+// 8 E2M1 codes (element k in nibble k) -> 4 bf16x2 words (elements 2i, 2i + 1 in word i, low half first).
+__device__ __forceinline__ void lut_word(uint32_t w, const Lut& t, uint32_t* o) {
+    const uint32_t sel = w & 0x77777777u;  // magnitude bits; prmt treats a selector's bit 3 as sign-replicate
+    const uint32_t lo03 = prmt(t.l0, t.l1, sel), lo47 = prmt(t.l0, t.l1, sel >> 16);
+    uint32_t hi03 = prmt(t.h0, t.h1, sel), hi47 = prmt(t.h0, t.h1, sel >> 16);
+    // sign of element n (nibble bit 3) to bit 7 of byte n: bytes [c0, c0, c1, c1] of the codes, the even elements'
+    // sign bits shifted up by 4
+    const uint32_t x03 = prmt(w, 0u, 0x1100), x47 = prmt(w, 0u, 0x3322);
+    hi03 ^= ((x03 << 4) & 0x00800080u) | (x03 & 0x80008000u);
+    hi47 ^= ((x47 << 4) & 0x00800080u) | (x47 & 0x80008000u);
+    o[0] = prmt(lo03, hi03, 0x5140);
+    o[1] = prmt(lo03, hi03, 0x7362);
+    o[2] = prmt(lo47, hi47, 0x5140);
+    o[3] = prmt(lo47, hi47, 0x7362);
+}
+
 // Decodes a chunk into 16 bf16x2 words (element pairs 0..15) holding exactly decode_experts' values.
 __device__ __forceinline__ void decode(const Chunk<0>& ch, float factor, uint32_t (&o)[16]) {
     const uint32_t s2 = f16x2_from_e4m3x2(ch.s);
     const __half2 sc = *reinterpret_cast<const __half2*>(&s2);
+#if __CUDA_ARCH__ >= 1000
     const __half2 slo = __low2half2(sc), shi = __high2half2(sc);
     const uint32_t words[4] = {ch.q.x, ch.q.y, ch.q.z, ch.q.w};
 #pragma unroll
@@ -204,6 +247,14 @@ __device__ __forceinline__ void decode(const Chunk<0>& ch, float factor, uint32_
             o[4 * w + b] = pack_bf16(v.x * factor, v.y * factor);
         }
     }
+#else
+    const float2 sf = __half22float2(sc);
+    const Lut tlo = make_lut(sf.x, factor), thi = make_lut(sf.y, factor);
+    lut_word(ch.q.x, tlo, o);
+    lut_word(ch.q.y, tlo, o + 4);
+    lut_word(ch.q.z, thi, o + 8);
+    lut_word(ch.q.w, thi, o + 12);
+#endif
 }
 
 __device__ __forceinline__ void decode(const Chunk<1>& ch, float /*factor*/, uint32_t (&o)[16]) {
@@ -297,6 +348,7 @@ __device__ __forceinline__ uint64_t slot_mask(int e, int lo, int hi) {
 }
 
 __device__ __forceinline__ float bf16_round(float v) { return __bfloat162float(__float2bfloat16_rn(v)); }
+
 
 // --------------------------------------------------------------------------------------- moe_up
 
@@ -512,6 +564,7 @@ void launch(void (*kernel)(Params...), dim3 grid, int threads, bool pdl, cudaStr
     cfg.numAttrs = pdl ? 1 : 0;
     CUDA_CHECK(cudaLaunchKernelEx(&cfg, kernel, static_cast<Params>(args)...));
 }
+
 
 }  // namespace
 
