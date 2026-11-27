@@ -92,7 +92,18 @@ cd native && cmake --preset ampere && cmake --build --preset ampere && cd ..   #
 
 `start.sh` reads the GPU and starts the profile for agentic coding with 512,000 tokens of context. Both 24 GB cards hold 524,288 (`MAX_CTX=524288`); the default leaves ~150 MiB of headroom, so the GPU must not drive a desktop or run other programs. Flags given after the folder win over it. On start-up the server prints what it loaded:
 
-STARTUP_BLOCK
+```
+ingine-serve · inkling-2-mini · ready in 8.3 s
+  gpu       NVIDIA GeForce RTX 4090 (sm_89, 25.3 GB)
+  weights   int8 dense
+  context   512,000 tokens · KV k8v4 6.4 GB · prefill chunk 2048
+  drafter   DSpark, threshold 0.8
+  parking   16.3 GB host RAM · 2 conversations at full context
+  memory    25.0 GB of 25.3 GB in use
+  sampling  temperature 1 · top-p 1 · top-k 0
+  images    off
+  serving   http://127.0.0.1:8093/v1
+```
 
 ### Profiles per GPU
 
@@ -135,7 +146,37 @@ STARTUP_BLOCK
 
 ### Speed and context on 24 GB
 
-AMPERE_TABLES
+Measured with `cachebench` (in the lab) on the round-5 code, one window at a time.
+- **Setup:** power caps 300 W (3090) and 400 W (4090), greedy decoding.
+- **Prefill:** prompt tokens ÷ time to first token.
+- **Decode:** 127 tokens after the first, with the prompt already cached.
+- **Windows:** 4K / 32K / 224K / 512K.
+- **Needle:** a code at 50 % depth, found in every cell.
+
+**Drafter on, the speed you get when serving (tokens/s):**
+
+| GPU · profile | max context | prefill 32K / 224K / 512K | decode 4K / 32K / 224K / 512K |
+|---|---:|---|---|
+| RTX 3090 · `start.sh` (INT8 + k8v4) | 524,288 | 4,972 / 3,063 / 1,959 | 209.3 / 223.3 / 177.1 / 124.2 |
+| RTX 3090 · BF16 + int8 KV (its default KV) | 311,296 | 5,001 / 3,031 / — | 209.6 / 174.1 / 124.7 / — |
+| RTX 4090 · `start.sh` (INT8 + k8v4) | 524,288 | 10,556 / 7,179 / 4,851 | 318.6 / 236.7 / 220.3 / 151.2 |
+| RTX 4090 · BF16 + fp8 KV (its default KV) | 311,296 | 10,942 / 7,590 / — | 227.0 / 221.1 / 207.5 / — |
+
+**Drafter off, bare-metal decode (tokens/s, 4K / 32K / 224K / 512K):**
+
+| GPU · profile | decode |
+|---|---|
+| RTX 3090 · `start.sh` | 136.1 / 127.8 / 92.0 / 65.3 |
+| RTX 3090 · BF16 + int8 KV | 108.8 / 102.0 / 73.0 / — |
+| RTX 4090 · `start.sh` | 175.0 / 164.1 / 115.0 / 79.7 |
+| RTX 4090 · BF16 + fp8 KV | 133.6 / 125.5 / 88.5 / — |
+
+**What the tables show:**
+- **Low-bit caches are faster at depth, not only smaller:** they read fewer bytes per token. At 224K, `start.sh` decodes 26 % (3090) and 30 % (4090) faster than BF16 weights with the default cache, drafter off.
+- **More context:** `--kv-cache int4` (4.06 bits) holds 786,432 tokens (3090) / 770,048 (4090) with INT8 weights. At 512K it decodes 160 / 202 tokens/s with the drafter on.
+- **Switching conversations:** coming back to a parked 229K-token conversation takes **0.86 s** to the first token (4090), against 31.4 s to read it again.
+
+LLM_SERVING_BENCH
 
 These GPUs have no thread-block clusters and no FP4 convert, and the 3090 has no FP8 convert either, so they take their own kernel paths:
 - exact decoders;
