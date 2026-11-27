@@ -19,7 +19,7 @@
 
 namespace ingine::kernels::attn::kvf {
 
-inline constexpr int BLK = 16, D = 128, HKV = 8;
+inline constexpr int BLK = 16, D = 128;
 
 // ---- rotation: x -> H D x, D a fixed +-1 diagonal, H the unnormalised 128-point Walsh-Hadamard matrix (H H = 128 I).
 // [Agent] One fixed sign pattern for every visit and head (splitmix64 of a constant), so writer, reader and oracle

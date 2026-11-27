@@ -649,7 +649,6 @@ __global__ void __launch_bounds__(NT) pack_kernel(const __nv_bfloat16* k, const 
 // is decoded once per warp and feeds 2 tiles of rows; at 64 instruction slots per mma on GA102 (half-rate FP32
 // accumulation) the decode is not what bounds it.
 constexpr int PF_ROWS = NW * 16, PF_STAGE = 4, PF_PWS = 24, PF_BLK = Int4::KB + Int4::VB;
-constexpr int PF_GATE = HQ * D, PF_SINK = 2 * HQ * D + HQ * DREL;  // proj columns (prefill layout)
 
 struct PfSmem {
     static constexpr int QHS = D + 8;
@@ -757,7 +756,7 @@ __global__ void __launch_bounds__(NT, 1) lb_prefill_kernel(const PrefillArgs p) 
 #pragma unroll
             for (int o = 4; o < 32; o <<= 1) l += __shfl_xor_sync(0xffffffffu, l, o);
             const int row = 8 * nn + 2 * t4 + h, R = RW + row;
-            const float den = l + (R < rows ? exp2f(bf(proj[size_t(R / GQA) * p.ld + PF_SINK + g * GQA + R % GQA]) * LOG2E - st.m[nn][h]) : 0.f);
+            const float den = l + (R < rows ? exp2f(bf(proj[size_t(R / GQA) * p.ld + OFF_SINK + g * GQA + R % GQA]) * LOG2E - st.m[nn][h]) : 0.f);
             const float inv = 1.f / den, off = Int4::VOFF * l;
 #pragma unroll
             for (int dt = 0; dt < 8; ++dt) {
@@ -771,7 +770,7 @@ __global__ void __launch_bounds__(NT, 1) lb_prefill_kernel(const PrefillArgs p) 
         float x[4];
 #pragma unroll
         for (int e = 0; e < 4; ++e) x[e] = ob[r * D + 4 * lane + e];
-        write_row(x, p.out + (size_t(t) * HQ + hq) * D, [&](int dim) { return bf(proj[size_t(t) * p.ld + PF_GATE + hq * D + dim]); },
+        write_row(x, p.out + (size_t(t) * HQ + hq) * D, [&](int dim) { return bf(proj[size_t(t) * p.ld + OFF_GATE + hq * D + dim]); },
                   lane);
     }
 }
@@ -820,8 +819,7 @@ std::size_t cache_bytes(KvFormat f, std::int64_t rows, bool values) {
 }
 
 void attn_decode_lb(const DecodeArgs& a, cudaStream_t stream) {
-    require(a.log_scaling, "int4 caches are full layers only");
-    require(a.workspace_size >= ws_bytes(a.M), "workspace too small: need workspace_bytes(M)");
+    require(a.log_scaling, "the int4 reader always applies the log-length temperature");
     Params p{};
     p.proj = a.proj;
     p.cap = a.cache_rows;

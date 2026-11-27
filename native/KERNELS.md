@@ -99,7 +99,7 @@ log_scaling, workspace, out)`
     `x.clamp(-448, 448).to(torch.float8_e4m3fn)`; real keys have norm ≤ 22.627 and values are RMS-normed,
     so saturation does not occur in practice). Every read of a cached entry, the call's own new keys/values
     included, uses that E4M3 value. Sliding rings are BF16 only (any other ring is rejected).
-  * int4 (full layers, `attn_lb.cu`; lossy, 4.06 bits per value, 1,040 bytes per position for all 8 visits):
+  * int4 (full layers, `attn_lb.cu`; lossy, 4.06 bits per value, 1,040 bytes per position and visit, 8,320 for all 8 visits):
     - Rotation: `x'' = H D x` for keys, values and q, with `H` the unnormalised 128-point Walsh-Hadamard matrix
       (`H H = 128 I`) and `D` a fixed ±1 diagonal (`kv_format.h::sign_of`).
     - Codes: n in 0..15 stands for the level `(n - 7.5) * 0.3352` on a unit-RMS row, n = clamp(floor(x / 0.3352)

@@ -1246,7 +1246,6 @@ int max_active_clusters(int M, int window) {
 }
 
 void attn_decode(const DecodeArgs& a, cudaStream_t stream) {
-    if (a.window == 0 && low_bit(a.kv)) return attn_decode_lb(a, stream);
     require(a.window == 0 || a.window == WIN, "window must be 0 (full layer) or 1024 (sliding layer)");
     const bool full = a.window == 0;
     const int M = a.M;
@@ -1262,6 +1261,7 @@ void attn_decode(const DecodeArgs& a, cudaStream_t stream) {
         require(a.kpos != nullptr, "sliding layers need kpos");
     }
     require(a.workspace_size >= ws_bytes(M), "workspace too small: need workspace_bytes(M)");
+    if (full && low_bit(a.kv)) return attn_decode_lb(a, stream);
 
     Params p{};
     p.proj = a.proj;
