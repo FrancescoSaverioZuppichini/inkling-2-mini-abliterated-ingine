@@ -157,18 +157,26 @@ __global__ void __launch_bounds__(256) rel_logits_kernel(const uint16_t* __restr
     const float4 v = *reinterpret_cast<const float4*>(rel_proj + j * kRelExtent + d);
     rp[j][0] = round_bf16(v.x), rp[j][1] = round_bf16(v.y), rp[j][2] = round_bf16(v.z), rp[j][3] = round_bf16(v.w);
   }
+  // [Agent] The 8 heads' 16 rel values of a token are 8 x 32 contiguous bytes: load them all as 16-byte vectors before
+  // the first FMA, so the CTA waits on memory once per token instead of on 16 scalar loads per head. Same FMA order.
   const int t1 = min(T, (blockIdx.x + 1) * tpb);
   for (int t = blockIdx.x * tpb; t < t1; ++t) {
-    for (int h = blockIdx.y * 8; h < blockIdx.y * 8 + 8; ++h) {
-      const uint16_t* r = rel + (size_t(t) * kHeads + h) * kRel;
+    const uint4* r4 = reinterpret_cast<const uint4*>(rel + (size_t(t) * kHeads + blockIdx.y * 8) * kRel);
+    uint4 rv[16];
+#pragma unroll
+    for (int i = 0; i < 16; ++i) rv[i] = __ldg(r4 + i);
+#pragma unroll
+    for (int hh = 0; hh < 8; ++hh) {
+      const uint32_t w[8] = {rv[2 * hh].x, rv[2 * hh].y, rv[2 * hh].z, rv[2 * hh].w,
+                             rv[2 * hh + 1].x, rv[2 * hh + 1].y, rv[2 * hh + 1].z, rv[2 * hh + 1].w};
       float acc[4] = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll
       for (int j = 0; j < kRel; ++j) {
-        const float x = bf2f(__ldg(r + j));
+        const float x = j & 1 ? bf_hi(w[j >> 1]) : bf_lo(w[j >> 1]);
 #pragma unroll
         for (int q = 0; q < 4; ++q) acc[q] = fmaf(x, rp[j][q], acc[q]);
       }
-      store_bf16x4(out + (size_t(t) * kHeads + h) * kRelExtent + d, acc);
+      store_bf16x4(out + (size_t(t) * kHeads + blockIdx.y * 8 + hh) * kRelExtent + d, acc);
     }
   }
 }
@@ -231,16 +239,36 @@ __device__ __forceinline__ void block_sum(float (&v)[N]) {
 
 __device__ __forceinline__ float dot4(float4 a, float4 b) { return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w; }
 
-__global__ void __launch_bounds__(ROW_T) gate_inputs_kernel(const GateRows rows, int T, uint16_t* __restrict__ gin) {
-  const int t = blockIdx.x, g = blockIdx.y, c = threadIdx.x * 4;
-  const float4 h = *reinterpret_cast<const float4*>(rows.h[g] + size_t(t) * H + c);
-  const float4 m = *reinterpret_cast<const float4*>(rows.msg[g] + size_t(t) * H + c);
-  float ss[2] = {dot4(h, h), dot4(m, m)};
-  block_sum(ss);
-  const float rh = rsqrtf(ss[0] * (1.f / H) + kEps), rm = rsqrtf(ss[1] * (1.f / H) + kEps);
-  uint16_t* o = gin + (size_t(g) * T + t) * 2 * H;
-  store_bf16x4(o + c, {h.x * rh, h.y * rh, h.z * rh, h.w * rh});
-  store_bf16x4(o + H + c, {m.x * rm, m.y * rm, m.z * rm, m.w * rm});
+// [Agent] One warp per (gate, token) row. Lane l takes the float4s that thread 32 w + l of a 576-thread row block
+// would take (w = 0..17), reduces each w with the same butterfly and adds the 18 warp sums in w order from 0, so
+// every sum, and so every output bit, is the row block's. The block version kept only 2 loads per thread in flight
+// and waited on a barrier per row (44 % of DRAM bandwidth); here a lane has 36 loads in flight.
+constexpr int GI_WARPS = 4;
+
+__global__ void __launch_bounds__(GI_WARPS * 32) gate_inputs_kernel(const GateRows rows, int G, int T,
+                                                                     uint16_t* __restrict__ gin) {
+  const int lane = threadIdx.x & 31, row = blockIdx.x * GI_WARPS + (threadIdx.x >> 5);
+  if (row >= G * T) return;
+  const int g = row / T, t = row - g * T;
+  // selects instead of rows.h[g]: a runtime index into a kernel parameter array goes through local memory
+  const float* hg = g == 0 ? rows.h[0] : g == 1 ? rows.h[1] : rows.h[2];
+  const float* mg = g == 0 ? rows.msg[0] : g == 1 ? rows.msg[1] : rows.msg[2];
+  const float4* hp = reinterpret_cast<const float4*>(hg + size_t(t) * H);
+  const float4* mp = reinterpret_cast<const float4*>(mg + size_t(t) * H);
+  float4 h[ROW_W], m[ROW_W];
+#pragma unroll
+  for (int w = 0; w < ROW_W; ++w) h[w] = hp[w * 32 + lane], m[w] = mp[w * 32 + lane];
+  float sh = 0.f, sm = 0.f;
+#pragma unroll
+  for (int w = 0; w < ROW_W; ++w) sh += warp_sum(dot4(h[w], h[w])), sm += warp_sum(dot4(m[w], m[w]));
+  const float rh = rsqrtf(sh * (1.f / H) + kEps), rm = rsqrtf(sm * (1.f / H) + kEps);
+  uint16_t* o = gin + size_t(row) * 2 * H;
+#pragma unroll
+  for (int w = 0; w < ROW_W; ++w) {
+    const int c = (w * 32 + lane) * 4;
+    store_bf16x4(o + c, {h[w].x * rh, h[w].y * rh, h[w].z * rh, h[w].w * rh});
+    store_bf16x4(o + H + c, {m[w].x * rm, m[w].y * rm, m[w].z * rm, m[w].w * rm});
+  }
 }
 
 __global__ void __launch_bounds__(ROW_T) gate_apply_kernel(const float* __restrict__ h, const float* __restrict__ msg,
@@ -350,7 +378,8 @@ void conv_state_update(float* state, const __nv_bfloat16* x, int ld, int T, int 
 }
 
 void gate_inputs(const GateRows& rows, int G, int T, __nv_bfloat16* gin, cudaStream_t stream) {
-  gate_inputs_kernel<<<dim3(T, G), ROW_T, 0, stream>>>(rows, T, reinterpret_cast<uint16_t*>(gin));
+  gate_inputs_kernel<<<(G * T + GI_WARPS - 1) / GI_WARPS, GI_WARPS * 32, 0, stream>>>(
+      rows, G, T, reinterpret_cast<uint16_t*>(gin));
 }
 
 void gate_apply(const float* h, const float* msg, const float* f, const float* g, const float* norm_w, int T,

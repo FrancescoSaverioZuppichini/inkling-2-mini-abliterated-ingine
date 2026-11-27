@@ -39,14 +39,38 @@ constexpr float kLog2e = 1.4426950408889634f;
 constexpr float kLn2 = 0.6931471805599453f;
 constexpr float kPScale = 32768.f, kPUnscale = 1.f / 32768.f;
 
+// [Agent] Relative bias of one key tile, staged per warp: for each of its 16 query rows a 72-entry window of
+// rel_logits that starts 16-byte aligned at or below the row's smallest distance in the tile. 64 contiguous key
+// positions span 64 distances, so the window always holds them. On a 6 MB L2 the bias (48 KB per token) comes from
+// DRAM; loading it a tile ahead with cp.async takes that latency out of the score loop.
+constexpr int BIAS_W = BK + 8;
+constexpr int BIAS_CH = BIAS_W / 8;  // 16-byte pieces per row window
+
 struct Smem {
   uint16_t k[2][BK * D];  // BF16 keys, swizzled [64][16 chunks]
   uint16_t v[2][BK * D];  // FP16 values
+  uint16_t bias[NWARPS][16][BIAS_W];
   int kpos[2][BK];
   int4 bounds[kAttnMaxTiles];
   int list[kAttnMaxTiles];
   int nlist;
 };
+
+// [Agent] First distance of a row's bias window: 8-aligned (16 bytes), inside [0, kRelExtent - BIAS_W].
+__device__ __forceinline__ int bias_window(int qpos, int kmax) {
+  return min(max((qpos - kmax) & ~7, 0), kRelExtent - BIAS_W);
+}
+
+// [Agent] exp2 without the compiler's denormal wrapper (it halves inputs below -126 and squares the result). Equal
+// to exp2f for every input >= -126; below that exp2f gives a denormal and this gives 0. Used only for the
+// probabilities: a value under 2^-126 becomes 0 in FP16(p * 2^15) either way, and added to the row sum it is below
+// half an ulp once the row maximum's 1.0 is in (the sum of the values before it is either >= 2^-102, where the
+// denormal rounds away, or < 2^-102, where adding 1.0 rounds it away), so the bits do not change.
+__device__ __forceinline__ float ex2_ftz(float x) {
+  float y;
+  asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+  return y;
+}
 
 template <bool FP8>
 struct KvRegs {
@@ -204,6 +228,35 @@ __global__ void __launch_bounds__(NT, 1) attn_kernel(const AttnParams p) {
   __syncthreads();  // Q staging is overwritten by the first key tile
 
   auto tile_at = [&](int i) { return EXPLICIT ? s.list[i] : first + i; };
+  // key position range of tile kt (valid keys only) and whether every key is valid
+  auto tile_span = [&](int kt, int& kmin, int& kmax, bool& allv) {
+    if constexpr (EXPLICIT) {
+      const int4 b = s.bounds[kt];
+      kmin = b.x, kmax = b.y, allv = b.z != 0;
+    } else {
+      kmin = kt * BK;
+      kmax = min(kt * BK + BK - 1, p.L - 1);
+      allv = kt * BK + BK <= p.L;
+    }
+  };
+  // [Agent] A tile reads staged bias when some of its distances are under kRelExtent and its valid keys span at most
+  // BK positions (always for the cache prefix and a filled ring; otherwise the scores read rel_logits directly).
+  auto bias_staged = [&](int kmin, int kmax) { return qmin - kmax < kRelExtent && kmax - kmin < BK; };
+  const uint16_t* rel = reinterpret_cast<const uint16_t*>(p.rel);
+  auto stage_bias = [&](int kt) {
+    int kmin, kmax;
+    bool allv;
+    tile_span(kt, kmin, kmax, allv);
+    if (!bias_staged(kmin, kmax)) return;
+    for (int j = lane; j < 16 * BIAS_CH; j += 32) {
+      const int rr = j / BIAS_CH, c = j - rr * BIAS_CH;
+      const int R = min(R0 + warp * 16 + rr, rows - 1);
+      const int t = R / GQA, h = g * GQA + R % GQA;
+      cp_async16(&s.bias[warp][rr][c * 8],
+                 rel + (size_t(t) * kHeads + h) * kRelExtent + bias_window(p.pos0 + t, kmax) + c * 8);
+    }
+    cp_commit();
+  };
 
   float o[D / 8][4];
 #pragma unroll
@@ -215,6 +268,7 @@ __global__ void __launch_bounds__(NT, 1) attn_kernel(const AttnParams p) {
     load_tile<FP8, EXPLICIT>(p, g, tile_at(0) * BK, regs);
     store_tile<FP8, EXPLICIT>(s, 0, regs);
   }
+  if (ntiles > 0) stage_bias(tile_at(0));
   __syncthreads();
 
 #pragma unroll 1
@@ -225,14 +279,7 @@ __global__ void __launch_bounds__(NT, 1) attn_kernel(const AttnParams p) {
     // tile class (uniform over the CTA)
     int kmin, kmax;
     bool allv;
-    if constexpr (EXPLICIT) {
-      const int4 b = s.bounds[kt];
-      kmin = b.x, kmax = b.y, allv = b.z != 0;
-    } else {
-      kmin = kt * BK;
-      kmax = min(kt * BK + BK - 1, p.L - 1);
-      allv = kt * BK + BK <= p.L;
-    }
+    tile_span(kt, kmin, kmax, allv);
     const int dmin = qmin - kmax, dmax = qmax - kmin;
     const bool need_mask = !(allv && dmin >= 0 && (p.window == 0 || dmax < p.window));
     const bool need_bias = dmin < kRelExtent;
@@ -262,6 +309,14 @@ __global__ void __launch_bounds__(NT, 1) attn_kernel(const AttnParams p) {
     if (i + 1 < ntiles) store_tile<FP8, EXPLICIT>(s, buf ^ 1, regs);
 
     // ---- scores (log2 units), bias, mask
+    const bool staged = need_bias && bias_staged(kmin, kmax);
+    int ws[2] = {0, 0};
+    if (staged) {
+      ws[0] = bias_window(qpos[0], kmax), ws[1] = bias_window(qpos[1], kmax);
+      cp_wait<0>();
+      __syncwarp();
+    }
+    const uint16_t* sb[2] = {&s.bias[warp][lane >> 2][0], &s.bias[warp][(lane >> 2) + 8][0]};
     float rmax[2] = {m[0], m[1]};
 #pragma unroll
     for (int nt = 0; nt < BK / 8; ++nt) {
@@ -273,7 +328,7 @@ __global__ void __launch_bounds__(NT, 1) attn_kernel(const AttnParams p) {
           const int kp = EXPLICIT ? s.kpos[buf][jl] : kt * BK + jl;
           const int d = qpos[r] - kp;
           const bool ok = kp >= 0 && d >= 0 && (p.window == 0 || d < p.window) && (EXPLICIT || kp < p.L);
-          if (need_bias && ok && d < kRelExtent) x += bf2f(__ldg(relp[r] + d));
+          if (need_bias && ok && d < kRelExtent) x += bf2f(staged ? sb[r][d - ws[r]] : __ldg(relp[r] + d));
           x = ok ? x * kLog2e : -INFINITY;
         } else {
           x *= kLog2e;
@@ -282,26 +337,36 @@ __global__ void __launch_bounds__(NT, 1) attn_kernel(const AttnParams p) {
         rmax[r] = fmaxf(rmax[r], x);
       }
     }
-    float mref[2];
+    // this warp's bias windows are read: the next tile's can land in the same place during the P.V MMAs and the
+    // next Q.K^T
+    if (i + 1 < ntiles) {
+      __syncwarp();
+      stage_bias(tile_at(i + 1));
+    }
+    float mref[2], alpha[2];
 #pragma unroll
     for (int r = 0; r < 2; ++r) {
       rmax[r] = fmaxf(rmax[r], __shfl_xor_sync(0xffffffffu, rmax[r], 1));
       rmax[r] = fmaxf(rmax[r], __shfl_xor_sync(0xffffffffu, rmax[r], 2));
       mref[r] = rmax[r] == -INFINITY ? 0.f : rmax[r];
-      const float alpha = exp2f(m[r] - mref[r]);
+      alpha[r] = exp2f(m[r] - mref[r]);
       m[r] = rmax[r];
-      l[r] *= alpha;
+      l[r] *= alpha[r];
+    }
+    // [Agent] alpha is exactly 1 when a row's maximum did not move (most tiles at long context), and x * 1 = x, so a
+    // warp whose 16 rows all kept their maximum skips the 64 multiplies.
+    if (__any_sync(0xffffffffu, alpha[0] != 1.f || alpha[1] != 1.f)) {
 #pragma unroll
       for (int dt = 0; dt < D / 8; ++dt) {
-        o[dt][2 * r] *= alpha;
-        o[dt][2 * r + 1] *= alpha;
+        o[dt][0] *= alpha[0], o[dt][1] *= alpha[0];
+        o[dt][2] *= alpha[1], o[dt][3] *= alpha[1];
       }
     }
 #pragma unroll
     for (int nt = 0; nt < BK / 8; ++nt) {
 #pragma unroll
       for (int e = 0; e < 4; ++e) {
-        const float pv = exp2f(sc[nt][e] - mref[e >> 1]);
+        const float pv = ex2_ftz(sc[nt][e] - mref[e >> 1]);
         l[e >> 1] += pv;
         sc[nt][e] = pv * kPScale;
       }
