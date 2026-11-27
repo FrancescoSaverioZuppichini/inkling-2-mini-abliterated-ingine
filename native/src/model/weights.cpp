@@ -224,7 +224,6 @@ Layer load_layer_into(Loader& ld, int l, ExpertFormat fmt, bool dense_fp8) {
   }
   layer.attn_conv = ld.f32(p + "attn_sconv.weight", {H, CONV_K});
   layer.mlp_conv = ld.f32(p + "mlp_sconv.weight", {H, CONV_K});
-  layer.router = ld.f32(p + "mlp.gate.weight", {EXPERTS, H});
   layer.router_bias = ld.f32(p + "mlp.gate.bias", {EXPERTS});
   layer.router_bf16 = ld.upload_bf16(host_f32(m, p + "mlp.gate.weight"), {EXPERTS, H});  // exact
   if (l > 0) {
@@ -269,13 +268,9 @@ Layer load_layer_into(Loader& ld, int l, ExpertFormat fmt, bool dense_fp8) {
     };
     const int D2 = 2 * H;
     layer.qkv_gate_down = ld.upload_bf16(stack(down, 3), {3, GATE_RANK, D2});  // exact (BF16 checkpoint)
-    layer.qkv_gate_forget = ld.upload_f32(stack(forget, 3), {3, H, GATE_RANK});
-    layer.qkv_gate_gain = ld.upload_f32(stack(gain, 3), {3, H, GATE_RANK});
     layer.qkv_gate_forget16 = ld.upload_bf16(stack(forget, 3), {3, H, GATE_RANK});
     layer.qkv_gate_gain16 = ld.upload_bf16(stack(gain, 3), {3, H, GATE_RANK});
     layer.mlp1_gate_down = ld.upload_bf16(down[3], {1, GATE_RANK, D2});
-    layer.mlp1_gate_forget = ld.upload_f32(forget[3], {1, H, GATE_RANK});
-    layer.mlp1_gate_gain = ld.upload_f32(gain[3], {1, H, GATE_RANK});
     layer.mlp1_gate_forget16 = ld.upload_bf16(forget[3], {1, H, GATE_RANK});
     layer.mlp1_gate_gain16 = ld.upload_bf16(gain[3], {1, H, GATE_RANK});
     auto at = [](const Tensor& stack, int g, DType dt, std::int32_t a, std::int32_t b) {
@@ -283,16 +278,8 @@ Layer load_layer_into(Loader& ld, int l, ExpertFormat fmt, bool dense_fp8) {
       return rm(static_cast<char*>(stack.data) + std::size_t(g) * a * b * es, dt, {a, b});
     };
     Tensor* downs[3] = {&layer.q_gate_down, &layer.k_gate_down, &layer.v_gate_down};
-    Tensor* forgets[3] = {&layer.q_gate_forget, &layer.k_gate_forget, &layer.v_gate_forget};
-    Tensor* gains[3] = {&layer.q_gate_gain, &layer.k_gate_gain, &layer.v_gate_gain};
-    for (int g = 0; g < 3; ++g) {
-      *downs[g] = at(layer.qkv_gate_down, g, DType::BF16, GATE_RANK, D2);
-      *forgets[g] = at(layer.qkv_gate_forget, g, DType::FP32, H, GATE_RANK);
-      *gains[g] = at(layer.qkv_gate_gain, g, DType::FP32, H, GATE_RANK);
-    }
+    for (int g = 0; g < 3; ++g) *downs[g] = at(layer.qkv_gate_down, g, DType::BF16, GATE_RANK, D2);
     layer.mlp_gate_down = at(layer.mlp1_gate_down, 0, DType::BF16, GATE_RANK, D2);
-    layer.mlp_gate_forget = at(layer.mlp1_gate_forget, 0, DType::FP32, H, GATE_RANK);
-    layer.mlp_gate_gain = at(layer.mlp1_gate_gain, 0, DType::FP32, H, GATE_RANK);
   }
 
   // routed experts in checkpoint encoding

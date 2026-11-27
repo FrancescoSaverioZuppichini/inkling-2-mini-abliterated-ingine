@@ -167,22 +167,17 @@ struct Layer {
   Tensor k_static, v_static;  // full: fp32 [4, 1024] by lag (row 0 = current token)
   Tensor k_conv, v_conv;      // sliding: fp32 [1024, 4] conv1d order (tap 3 = current token)
   Tensor attn_conv, mlp_conv;  // fp32 [H, 4]
-  Tensor router;       // fp32 [128, H]
   Tensor router_bias;  // fp32 [128]
-  Tensor router_bf16;  // bf16 [128, H] (exact copy of the checkpoint values)
+  Tensor router_bf16;  // bf16 [128, H] (the checkpoint values)
   Tensor attn_query;   // fp32 [Q, H] (Q = 3 full, 1 sliding), layers > 0
   Tensor mlp_query;    // fp32 [1, H]
 
   // loop layers: message gates. Stacks the kernels take, with per-gate views into them.
   Tensor qkv_gate_down;                      // bf16 [3, 64, 2H]
-  Tensor qkv_gate_forget, qkv_gate_gain;     // fp32 [3, H, 64]
   Tensor qkv_gate_forget16, qkv_gate_gain16; // bf16 [3, H, 64]
   Tensor mlp1_gate_down;                     // bf16 [1, 64, 2H] (= mlp_gate_down)
-  Tensor mlp1_gate_forget, mlp1_gate_gain;   // fp32 [1, H, 64]
-  Tensor mlp1_gate_forget16, mlp1_gate_gain16;
+  Tensor mlp1_gate_forget16, mlp1_gate_gain16; // bf16 [1, H, 64]
   Tensor q_gate_down, k_gate_down, v_gate_down, mlp_gate_down;          // bf16 [64, 2H] views
-  Tensor q_gate_forget, k_gate_forget, v_gate_forget, mlp_gate_forget;  // fp32 [H, 64] views
-  Tensor q_gate_gain, k_gate_gain, v_gate_gain, mlp_gate_gain;          // fp32 [H, 64] views
 
   // stacked norm weights (fast._stack_layer_params)
   Tensor attn_norm3;     // fp32 [3, H]: (q, k, v) norms, or attn_norm three times
