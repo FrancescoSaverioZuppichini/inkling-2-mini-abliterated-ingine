@@ -74,15 +74,18 @@ class EngineGenerator final : public Generator {
     // checkpoint layout: target state | drafter context | last prompt logits
     checkpoint_drafter_ = carved(rt_.checkpoint_bytes());
     checkpoint_logits_ = checkpoint_drafter_ + (drafter_ ? carved(drafter_->checkpoint_bytes()) : 0);
-    // [Agent] The checkpoint holds data only between the end of one prefill and the restore at the start of the next;
-    // while the prompt's chunks run it is dead (the restore was queued before them, the save after them). The chunk
-    // taps and the drafter's large-commit scratch live exactly then, so they share its memory.
-    const std::size_t taps_bytes = drafter_ ? carved(std::size_t(options.prefill_chunk) * NUM_TAPS * HIDDEN * 2) : 0;
-    const std::size_t chunk_bytes = drafter_ ? taps_bytes + drafter_->commit_scratch_bytes() : 0;
-    checkpoint_ = DeviceBuffer(std::max(checkpoint_logits_ + logits_.bytes, chunk_bytes));
+    // [Agent] The checkpoint holds data only between the end of one prefill and the restore at the start of the next
+    // (the restore is queued before the prompt's chunks, the save after them); the Prefiller's front scratch holds data
+    // only inside a chunk. So the checkpoint lives in that scratch (301 MiB with the drafter, 164 without), and so does
+    // the drafter's large-commit scratch, which runs between chunks. The chunk taps are written inside a chunk and read
+    // after it, so they keep memory of their own. A chunk too small to hold the checkpoint gets a buffer of its own.
+    const DeviceSpan idle = prefiller_.idle();
+    const std::size_t bytes = std::max(checkpoint_logits_ + logits_.bytes, drafter_ ? drafter_->commit_scratch_bytes() : 0);
+    if (bytes > idle.bytes) own_checkpoint_ = DeviceBuffer(bytes);
+    checkpoint_ = static_cast<char*>(own_checkpoint_.p ? own_checkpoint_.p : idle.data);
     if (drafter_) {
-      taps_ = checkpoint_.p;
-      drafter_->lend_commit_scratch(static_cast<char*>(checkpoint_.p) + taps_bytes);
+      taps_ = DeviceBuffer(std::size_t(options.prefill_chunk) * NUM_TAPS * HIDDEN * 2);
+      drafter_->lend_commit_scratch(checkpoint_);
     }
     // the vision tower's weights are resident: loaded before the park budget below is measured
     if (options.vision) vision_ = std::make_unique<VisionEncoder>(options.model_dir, rt_.stream());
@@ -339,7 +342,7 @@ class EngineGenerator final : public Generator {
       CUDA_CHECK(cudaMemcpyAsync(chunk_tokens_.p, ids.data() + s, std::size_t(T) * sizeof(std::int32_t),
                                  cudaMemcpyHostToDevice, stream));
       Tensor taps;
-      if (drafter_) taps = rm(taps_, DType::BF16, {T, NUM_TAPS, HIDDEN});
+      if (drafter_) taps = rm(taps_.p, DType::BF16, {T, NUM_TAPS, HIDDEN});
       prefiller_.run(st, static_cast<const std::int32_t*>(chunk_tokens_.p), T, int(s), static_cast<float*>(logits_.p),
                      drafter_ ? &taps : nullptr, rows);
       if (drafter_) {
@@ -443,7 +446,7 @@ class EngineGenerator final : public Generator {
       return;
     }
     char* d = static_cast<char*>(p.data.p);
-    const char* c = static_cast<const char*>(checkpoint_.p);
+    const char* c = checkpoint_;
     const cudaStream_t s = rt_.stream();
     CUDA_CHECK(cudaMemcpyAsync(d, c, checkpoint_drafter_, cudaMemcpyDeviceToDevice, s));
     for (int i = 0; i < 3 && drafter_; ++i)
@@ -463,7 +466,7 @@ class EngineGenerator final : public Generator {
     const int n = int(p.ids.size());
     const ParkLayout l = park_layout(n);
     const char* d = static_cast<const char*>(p.data.p);
-    char* c = static_cast<char*>(checkpoint_.p);
+    char* c = checkpoint_;
     const cudaStream_t s = rt_.stream();
     CUDA_CHECK(cudaMemcpyAsync(c, d, checkpoint_drafter_, cudaMemcpyDeviceToDevice, s));
     for (int i = 0; i < 3 && drafter_; ++i)
@@ -479,7 +482,7 @@ class EngineGenerator final : public Generator {
   // The checkpoint (on the device): target state (Runtime::save_checkpoint) | drafter context
   // (Drafter::save_checkpoint) | logits of the last prompt token.
   void save_checkpoint() {
-    char* p = static_cast<char*>(checkpoint_.p);
+    char* p = checkpoint_;
     rt_.save_checkpoint(p);
     if (drafter_) drafter_->save_checkpoint(p + checkpoint_drafter_);
     CUDA_CHECK(cudaMemcpyAsync(p + checkpoint_logits_, logits_.p, logits_.bytes, cudaMemcpyDeviceToDevice,
@@ -488,7 +491,7 @@ class EngineGenerator final : public Generator {
   }
 
   void restore_checkpoint() {
-    const char* p = static_cast<const char*>(checkpoint_.p);
+    const char* p = checkpoint_;
     rt_.restore_checkpoint(p);
     if (drafter_) drafter_->restore_checkpoint(p + checkpoint_drafter_);
     CUDA_CHECK(cudaMemcpyAsync(logits_.p, p + checkpoint_logits_, logits_.bytes, cudaMemcpyDeviceToDevice,
@@ -520,11 +523,11 @@ class EngineGenerator final : public Generator {
   std::unique_ptr<Drafter> drafter_;
   std::unique_ptr<SpecLoop> spec_;
   std::unique_ptr<VisionEncoder> vision_;  // image input (RuntimeOptions::vision)
-  DeviceBuffer chunk_tokens_, logits_, token_;
-  void* taps_ = nullptr;  // chunk taps, inside checkpoint_ (see the constructor)
+  DeviceBuffer chunk_tokens_, logits_, token_, taps_;
   PinnedHostBuffer host_token_;
-  // prompt checkpoint (save_checkpoint) and the prompt it holds (empty: none)
-  DeviceBuffer checkpoint_;
+  // prompt checkpoint (save_checkpoint), in prefiller_.idle() or own_checkpoint_, and the prompt it holds (empty: none)
+  char* checkpoint_ = nullptr;
+  DeviceBuffer own_checkpoint_;
   std::size_t checkpoint_drafter_ = 0, checkpoint_logits_ = 0;  // byte offsets in checkpoint_
   std::vector<std::int32_t> checkpoint_ids_;
   std::vector<std::int32_t> tokens_in_state_;

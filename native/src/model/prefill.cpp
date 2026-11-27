@@ -57,10 +57,8 @@ Prefiller::Prefiller(const Weights& w, const Ablation& abl, int max_chunk, cudaS
     throw std::invalid_argument("Prefiller: max_chunk above " +
                                 std::to_string(pk::kAttnMaxTiles * pk::kAttnKeyTile - WINDOW));
   const std::size_t C = std::size_t(max_chunk);
-  auto alloc = [&](std::size_t bytes) {
-    storage_.emplace_back(bytes);
-    return storage_.back().p;
-  };
+  // [Agent] One heap, so the activations at the front form one range that idle() can lend out between runs.
+  auto alloc = [&](std::size_t bytes) { return heap_.alloc(bytes); };
   auto f32 = [&](std::size_t n) { return static_cast<float*>(alloc(n * 4)); };
   auto bf16 = [&](std::size_t n) { return static_cast<__nv_bfloat16*>(alloc(n * 2)); };
   auto i32 = [&](std::size_t n) { return static_cast<int*>(alloc(n * 4)); };
@@ -71,6 +69,9 @@ Prefiller::Prefiller(const Weights& w, const Ablation& abl, int max_chunk, cudaS
   mixf_ = f32(3 * C * H), msgs_ = f32(4 * C * H), mixm_ = f32(C * H);
   proj_ = bf16(C * PROJ_ROWS_FULL);
   q_ = bf16(C * HEADS * HEAD_DIM), rel16_ = bf16(C * HEADS * D_REL), rel_ = bf16(C * HEADS * REL_EXTENT);
+  // [Agent] idle() ends here: the gathered sliding rows past ring + chunk are read (masked) without being written in
+  // a run, so they must keep the zeros below; nothing allocated before this line is read before it is written.
+  idle_bytes_ = heap_.used();
   krows_ = bf16(std::size_t(kpos_rows_) * KV_DIM), vrows_ = bf16(std::size_t(kpos_rows_) * KV_DIM);
   kpos_ = i32(kpos_rows_);
   bounds_ = static_cast<int4*>(alloc(std::size_t(kpos_rows_ / pk::kAttnKeyTile) * sizeof(int4)));
@@ -91,7 +92,7 @@ Prefiller::Prefiller(const Weights& w, const Ablation& abl, int max_chunk, cudaS
                   ? bf16(std::max(std::size_t(PROJ_ROWS_FULL) * H, std::size_t(H) * HEADS * HEAD_DIM))
                   : nullptr;
   ids_ = static_cast<std::int64_t*>(alloc(C * 8));
-  for (auto& b : storage_) b.fill(0);  // e.g. gathered sliding rows past ring + chunk: never keys, kept finite
+  CUDA_CHECK(cudaMemset(B0_, 0, heap_.used()));  // e.g. gathered sliding rows past ring + chunk: never keys, kept finite
 
   // [Agent] Sliding attention reads a relative bias for every score, scattered over rel_ (48 KB per token). On the
   // RTX 4090 a 1024-token part (48 MB) stays in its 72 MB L2 while a 2048-token chunk spills to DRAM (L2 hit 66 %,
@@ -106,9 +107,7 @@ Prefiller::Prefiller(const Weights& w, const Ablation& abl, int max_chunk, cudaS
 Prefiller::~Prefiller() = default;
 
 std::size_t Prefiller::device_bytes() const {
-  std::size_t n = 0;
-  for (const auto& b : storage_) n += b.bytes;
-  return n;
+  return heap_.mapped();
 }
 
 const float* const* Prefiller::block_table(const std::vector<const float*>& blocks) {
