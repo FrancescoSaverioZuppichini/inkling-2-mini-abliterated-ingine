@@ -51,10 +51,7 @@ cudaGraphExec_t capture_end(cudaStream_t s) {
 
 }  // namespace
 
-void* Drafter::alloc(std::size_t bytes) {
-  storage_.emplace_back(bytes);
-  return storage_.back().p;
-}
+void* Drafter::alloc(std::size_t bytes) { return heap_.alloc(bytes); }
 
 Drafter::Drafter(const std::filesystem::path& model_dir, const Weights& w, int max_ctx, cudaStream_t stream,
                  int shortlist_rows)

@@ -2,6 +2,7 @@
 // Modified for fngine from cinference:src/core/arena.cu @ 383e5db. See NOTICE.
 #include "core/arena.h"
 
+#include <cuda.h>
 #include <cuda_runtime.h>
 
 #include <atomic>
@@ -29,6 +30,10 @@ void log_cuda_error(const char* op, cudaError_t err) noexcept {
 }
 
 bool is_power_of_two(std::size_t value) { return value != 0 && (value & (value - 1)) == 0; }
+
+void cuda_throw_if(cudaError_t err) {
+    if (err != cudaSuccess) throw std::runtime_error(cuda_error_message("DeviceHeap", err));
+}
 
 std::uintptr_t checked_add_uintptr(std::uintptr_t a, std::size_t b) {
     if (b > std::numeric_limits<std::uintptr_t>::max() - a) {
@@ -180,6 +185,90 @@ void DeviceBuffer::require_range(std::size_t byte_offset, std::size_t count,
     if (byte_offset > bytes || count > bytes - byte_offset) {
         throw std::out_of_range(std::string(operation) + " exceeds device buffer");
     }
+}
+
+namespace {
+void cu_check(CUresult r, const char* what) {
+    if (r != CUDA_SUCCESS) {
+        const char* name = nullptr;
+        cuGetErrorName(r, &name);
+        throw std::runtime_error(std::string("DeviceHeap: ") + what + " failed: " + (name ? name : "?"));
+    }
+}
+}  // namespace
+
+DeviceHeap::~DeviceHeap() { release(); }
+
+DeviceHeap::DeviceHeap(DeviceHeap&& o) noexcept
+    : base_(o.base_), reserved_(o.reserved_), mapped_(o.mapped_), off_(o.off_), gran_(o.gran_), device_(o.device_),
+      handles_(std::move(o.handles_)), sizes_(std::move(o.sizes_)) {
+    o.base_ = 0, o.reserved_ = o.mapped_ = o.off_ = 0;
+}
+
+DeviceHeap& DeviceHeap::operator=(DeviceHeap&& o) noexcept {
+    if (this == &o) return *this;
+    release();
+    base_ = o.base_, reserved_ = o.reserved_, mapped_ = o.mapped_, off_ = o.off_, gran_ = o.gran_, device_ = o.device_;
+    handles_ = std::move(o.handles_), sizes_ = std::move(o.sizes_);
+    o.base_ = 0, o.reserved_ = o.mapped_ = o.off_ = 0;
+    return *this;
+}
+
+void DeviceHeap::release() noexcept {
+    if (base_ == 0) return;
+    cudaDeviceSynchronize();  // no kernel may still read what is unmapped below
+    std::size_t at = 0;
+    for (std::size_t i = 0; i < handles_.size(); ++i) {
+        cuMemUnmap(CUdeviceptr(base_ + at), sizes_[i]);
+        cuMemRelease(CUmemGenericAllocationHandle(handles_[i]));
+        at += sizes_[i];
+    }
+    cuMemAddressFree(CUdeviceptr(base_), reserved_);
+    handles_.clear(), sizes_.clear();
+    base_ = 0, reserved_ = mapped_ = off_ = 0;
+}
+
+void* DeviceHeap::alloc(std::size_t bytes, std::size_t align) {
+    if (bytes == 0) throw std::invalid_argument("DeviceHeap allocation must be nonzero");
+    if (!is_power_of_two(align)) throw std::invalid_argument("DeviceHeap alignment must be a power of two");
+    if (base_ == 0) {
+        cuda_throw_if(cudaFree(nullptr));  // the runtime's primary context is the current one
+        cuda_throw_if(cudaGetDevice(&device_));
+        CUmemAllocationProp prop{};
+        prop.type          = CU_MEM_ALLOCATION_TYPE_PINNED;
+        prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        prop.location.id   = device_;
+        cu_check(cuMemGetAllocationGranularity(&gran_, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM), "granularity");
+        std::size_t free = 0, total = 0;
+        cuda_throw_if(cudaMemGetInfo(&free, &total));
+        reserved_ = (total + gran_ - 1) / gran_ * gran_;  // address space only: never more than the card holds
+        CUdeviceptr p = 0;
+        cu_check(cuMemAddressReserve(&p, reserved_, gran_, 0, 0), "address reserve");
+        base_ = std::uintptr_t(p);
+    }
+    const std::size_t off = (off_ + align - 1) & ~(align - 1), end = off + bytes;
+    if (end > reserved_) throw std::bad_alloc();
+    if (end > mapped_) {
+        const std::size_t size = (end - mapped_ + gran_ - 1) / gran_ * gran_;
+        CUmemAllocationProp prop{};
+        prop.type          = CU_MEM_ALLOCATION_TYPE_PINNED;
+        prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        prop.location.id   = device_;
+        CUmemGenericAllocationHandle h = 0;
+        cu_check(cuMemCreate(&h, size, &prop, 0), "physical allocation");
+        if (CUresult r = cuMemMap(CUdeviceptr(base_ + mapped_), size, 0, h, 0); r != CUDA_SUCCESS) {
+            cuMemRelease(h);
+            cu_check(r, "map");
+        }
+        CUmemAccessDesc access{};
+        access.location = prop.location;
+        access.flags    = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        handles_.push_back(h), sizes_.push_back(size);
+        mapped_ += size;
+        cu_check(cuMemSetAccess(CUdeviceptr(base_ + mapped_ - size), size, &access, 1), "access");
+    }
+    off_ = end;
+    return reinterpret_cast<void*>(base_ + off);
 }
 
 DeviceArena::Scope::Scope(DeviceArena& arena) noexcept

@@ -62,10 +62,12 @@ std::vector<float> host_f32(const SafetensorsModel& m, const std::string& name) 
 
 class Loader {
  public:
-  Loader(const SafetensorsModel& m, DeviceUploader& up, cudaStream_t stream, std::vector<DeviceBuffer>& storage)
-      : m_(m), up_(up), stream_(stream), storage_(storage) {}
+  Loader(const SafetensorsModel& m, DeviceUploader& up, cudaStream_t stream, std::vector<DeviceBuffer>& storage,
+         DeviceHeap* heap = nullptr)
+      : m_(m), up_(up), stream_(stream), storage_(storage), heap_(heap) {}
 
   void* alloc(std::size_t bytes) {
+    if (heap_) return heap_->alloc(bytes);
     storage_.emplace_back(bytes);
     return storage_.back().p;
   }
@@ -118,6 +120,7 @@ class Loader {
   DeviceUploader& up_;
   cudaStream_t stream_;
   std::vector<DeviceBuffer>& storage_;
+  DeviceHeap* heap_;
   std::vector<UploadRequest> pending_;
 };
 
@@ -338,8 +341,7 @@ Weights load_weights(const fs::path& model_dir, bool dense_fp8, bool embed_host,
   Weights w;
   w.dense_fp8 = dense_fp8;
   w.expert_formats = expert_formats(model_dir);
-  w.storage.reserve(4096);
-  Loader ld(m, up, stream, w.storage);
+  Loader ld(m, up, stream, w.storage, &w.heap);
   const int H = HIDDEN;
   for (int l = 0; l < LAYERS; ++l) w.layers.push_back(load_layer_into(ld, l, w.expert_formats[l], dense_fp8));
 

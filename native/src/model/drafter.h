@@ -167,7 +167,7 @@ class Drafter {
   int checkpoint_length_ = 0;
   bool checkpoint_clobbered_ = false;
   void global_written(int begin, int end);  // positions [begin, end) written into the global ring
-  std::vector<DeviceBuffer> storage_;
+  DeviceHeap heap_;  // every buffer of the drafter, packed (core/arena.h)
   kernels::draft::Bf16Gemm gemm_;
 
   std::array<DraftLayer, 3> layers_{};

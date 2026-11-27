@@ -204,7 +204,8 @@ struct Weights {
   std::array<ExpertFormat, LAYERS> expert_formats{};
   bool dense_fp8 = false;     // wproj (+ views), wo and unembed are FP8 rows
 
-  std::vector<DeviceBuffer> storage;  // device allocations behind the views
+  DeviceHeap heap;                    // device memory behind the views (one packed range)
+  std::vector<DeviceBuffer> storage;  // device allocations behind the views made outside the heap
   MappedHostBuffer embed_host;        // the embedding table when it is kept in host memory
 };
 
