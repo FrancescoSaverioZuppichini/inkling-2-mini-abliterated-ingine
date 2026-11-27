@@ -15,12 +15,16 @@
 #include "model/spec.h"
 #include "model/vision.h"
 
+#include <unistd.h>
+
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <deque>
 #include <mutex>
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -84,18 +88,16 @@ class EngineGenerator final : public Generator {
       taps_ = DeviceBuffer(std::size_t(options.prefill_chunk) * NUM_TAPS * HIDDEN * 2);
       drafter_->lend_commit_scratch(checkpoint_);
     }
-    // the vision tower's weights are resident: loaded before the park budget below is measured
     if (options.vision) vision_ = std::make_unique<VisionEncoder>(options.model_dir, rt_.stream());
     CUDA_CHECK(cudaStreamSynchronize(rt_.stream()));
-    if (options.park_mb < 0) {  // leave room for the workspaces a long prefill adds later
-      std::size_t free = 0, total = 0;
-      CUDA_CHECK(cudaMemGetInfo(&free, &total));
-      park_budget_ = std::min<std::size_t>(3072, std::max<std::size_t>(free >> 20, 4096) - 4096) << 20;
-    } else {
-      park_budget_ = std::size_t(options.park_mb) << 20;
+    const std::size_t ram = std::size_t(sysconf(_SC_PHYS_PAGES)) * std::size_t(sysconf(_SC_PAGE_SIZE));
+    const std::size_t park = options.park_host_mb < 0 ? std::min<std::size_t>(ram / 4, std::size_t(32) << 30)
+                                                      : std::size_t(options.park_host_mb) << 20;
+    try {  // parking is best-effort: without the pinned memory the server runs without it
+      if (park > 0) park_arena_.emplace(park);
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "conversation parking disabled: %s\n", e.what());
     }
-    // parked conversations are best-effort: a device allocation that fails releases them and retries
-    release_hook_ = add_release_hook([this] { return release_parked(); });
   }
 
  public:
@@ -153,7 +155,6 @@ class EngineGenerator final : public Generator {
   }
 
   ~EngineGenerator() override {
-    remove_release_hook(release_hook_);
     // nothing queued may outlive the graphs and buffers of the members destroyed below
     if (rt_.stream()) cudaStreamSynchronize(rt_.stream());
   }
@@ -355,13 +356,16 @@ class EngineGenerator final : public Generator {
 
   // Conversation parking. A parked conversation is a packed copy of a prompt checkpoint (target state |
   // drafter checkpoint regions | last logits) plus the target's full-attention rows [0, n) of its n prompt
-  // tokens, in device memory within park_budget_ (least recently used evicted), and the drafter's context
-  // tokens of the checkpoint (its shortlist rows).
+  // tokens, at [off, off + bytes) of the pinned host arena (least recently used evicted), and the drafter's
+  // context tokens of the checkpoint (its shortlist rows). [Agent] Every copy into or out of the arena is queued on
+  // the runtime stream, so a park lands before the next prompt overwrites the caches, and a reused arena range is
+  // written only after the copies that read it; the host never touches the arena.
   struct Parked {
     std::vector<std::int32_t> ids, context;
-    DeviceBuffer data;
+    std::size_t off = 0, bytes = 0;
     std::uint64_t used = 0;
   };
+  static constexpr std::size_t kNoGap = SIZE_MAX;
   static constexpr std::size_t kMinParked = 256;  // shorter prompts are cheaper to prefill than to keep
 
   // the layout of a parked copy of n tokens: {offset, bytes} of each drafter region, logits, full rows
@@ -382,6 +386,19 @@ class EngineGenerator final : public Generator {
     return l;
   }
 
+  // the lowest arena offset with `bytes` free between the parked copies, or kNoGap
+  std::size_t park_gap(std::size_t bytes) const {
+    std::vector<std::pair<std::size_t, std::size_t>> taken;
+    for (const Parked& p : parked_) taken.emplace_back(p.off, p.bytes);
+    std::sort(taken.begin(), taken.end());
+    std::size_t at = 0;
+    for (const auto& [off, len] : taken) {
+      if (off - at >= bytes) return at;
+      at = off + len;
+    }
+    return park_arena_->size() - at >= bytes ? at : kNoGap;
+  }
+
   // the parked conversation whose prompt is the longest prefix of `ids`, if longer than `live` (and kMinParked)
   Parked* find_parked(std::span<const std::int32_t> ids, std::size_t live) {
     Parked* best = nullptr;
@@ -392,22 +409,12 @@ class EngineGenerator final : public Generator {
     return best;
   }
 
-  // The release hook (core/arena.h): a device allocation failed; drop every parked conversation so that it can
-  // be retried. Runs on the allocating thread, i.e. inside a request (the Generator allocates nothing else).
-  bool release_parked() {
-    if (parking_ || parked_.empty()) return false;
-    cudaStreamSynchronize(rt_.stream());  // copies from or into parked buffers may be queued
-    std::fprintf(stderr, "device memory low: released %zu parked conversation(s)\n", parked_.size());
-    parked_.clear();
-    return true;
-  }
-
   // Parks the live conversation's checkpoint (the state after its last prompt; the full rows [0, n) are still
-  // in the caches) unless it is short, already parked or larger than the budget; the parked conversation with
-  // prompt `keep` (if given) stays. Never fails the request: a failed allocation disables parking.
+  // in the caches) unless it is short, already parked or has no room in the arena beside the parked conversation
+  // with prompt `keep` (if given), which stays.
   void park_live(const std::vector<std::int32_t>* keep = nullptr) {
     const std::size_t n = checkpoint_ids_.size();
-    if (park_budget_ == 0 || n < kMinParked) return;
+    if (!park_arena_ || n < kMinParked) return;
     for (Parked& p : parked_)
       if (p.ids == checkpoint_ids_) {
         p.used = ++clock_;
@@ -419,37 +426,25 @@ class EngineGenerator final : public Generator {
       return !kept(p) && p.ids.size() < n && std::equal(p.ids.begin(), p.ids.end(), checkpoint_ids_.begin());
     });
     const ParkLayout l = park_layout(int(n));
-    std::size_t used = 0, kept_bytes = 0;
-    for (const Parked& p : parked_) used += p.data.bytes, kept_bytes += kept(p) ? p.data.bytes : 0;
-    if (kept_bytes + l.bytes > park_budget_) return;
-    while (used + l.bytes > park_budget_) {  // least recently used first
+    std::size_t at = park_gap(l.bytes);
+    while (at == kNoGap) {  // least recently used first
       auto lru = parked_.end();
       for (auto it = parked_.begin(); it != parked_.end(); ++it)
         if (!kept(*it) && (lru == parked_.end() || it->used < lru->used)) lru = it;
-      used -= lru->data.bytes;
+      if (lru == parked_.end()) return;
       parked_.erase(lru);
+      at = park_gap(l.bytes);
     }
     Parked p;
-    try {
-      parking_ = true;  // a failure here must not release the parked conversations through the hook
-      p.data = DeviceBuffer(l.bytes);
-      parking_ = false;
-    } catch (const std::exception& e) {
-      parking_ = false;
-      std::fprintf(stderr, "conversation parking disabled: %s\n", e.what());
-      cudaGetLastError();  // the failed allocation is not a sticky error
-      park_budget_ = 0;
-      std::erase_if(parked_, [&](const Parked& q) { return !kept(q); });
-      return;
-    }
-    char* d = static_cast<char*>(p.data.p);
+    p.off = at, p.bytes = l.bytes;
+    char* d = static_cast<char*>(park_arena_->data()) + at;
     const char* c = checkpoint_;
     const cudaStream_t s = rt_.stream();
-    CUDA_CHECK(cudaMemcpyAsync(d, c, checkpoint_drafter_, cudaMemcpyDeviceToDevice, s));
+    CUDA_CHECK(cudaMemcpyAsync(d, c, checkpoint_drafter_, cudaMemcpyDefault, s));
     for (int i = 0; i < 3 && drafter_; ++i)
       CUDA_CHECK(cudaMemcpyAsync(d + l.drafter_off[i], c + checkpoint_drafter_ + l.drafter[i].offset,
-                                 l.drafter[i].bytes, cudaMemcpyDeviceToDevice, s));
-    CUDA_CHECK(cudaMemcpyAsync(d + l.logits, c + checkpoint_logits_, logits_.bytes, cudaMemcpyDeviceToDevice, s));
+                                 l.drafter[i].bytes, cudaMemcpyDefault, s));
+    CUDA_CHECK(cudaMemcpyAsync(d + l.logits, c + checkpoint_logits_, logits_.bytes, cudaMemcpyDefault, s));
     rt_.save_full_rows(d + l.rows, int(n));
     p.ids = checkpoint_ids_;
     if (drafter_) p.context = drafter_->checkpoint_context();
@@ -462,14 +457,14 @@ class EngineGenerator final : public Generator {
   void unpark(Parked& p) {
     const int n = int(p.ids.size());
     const ParkLayout l = park_layout(n);
-    const char* d = static_cast<const char*>(p.data.p);
+    const char* d = static_cast<const char*>(park_arena_->data()) + p.off;
     char* c = checkpoint_;
     const cudaStream_t s = rt_.stream();
-    CUDA_CHECK(cudaMemcpyAsync(c, d, checkpoint_drafter_, cudaMemcpyDeviceToDevice, s));
+    CUDA_CHECK(cudaMemcpyAsync(c, d, checkpoint_drafter_, cudaMemcpyDefault, s));
     for (int i = 0; i < 3 && drafter_; ++i)
       CUDA_CHECK(cudaMemcpyAsync(c + checkpoint_drafter_ + l.drafter[i].offset, d + l.drafter_off[i],
-                                 l.drafter[i].bytes, cudaMemcpyDeviceToDevice, s));
-    CUDA_CHECK(cudaMemcpyAsync(c + checkpoint_logits_, d + l.logits, logits_.bytes, cudaMemcpyDeviceToDevice, s));
+                                 l.drafter[i].bytes, cudaMemcpyDefault, s));
+    CUDA_CHECK(cudaMemcpyAsync(c + checkpoint_logits_, d + l.logits, logits_.bytes, cudaMemcpyDefault, s));
     rt_.restore_full_rows(d + l.rows, n);
     if (drafter_) drafter_->adopt_checkpoint(c + checkpoint_drafter_, n, p.context);
     checkpoint_ids_ = p.ids;
@@ -529,10 +524,8 @@ class EngineGenerator final : public Generator {
   std::vector<std::int32_t> checkpoint_ids_;
   std::vector<std::int32_t> tokens_in_state_;
   std::vector<Parked> parked_;
-  std::size_t park_budget_ = 0;  // bytes
-  std::uint64_t clock_ = 0;      // last use of a parked conversation
-  bool parking_ = false;         // park_live is allocating
-  int release_hook_ = -1;
+  std::optional<PinnedHostBuffer> park_arena_;  // pinned host memory of the parked conversations (none: off)
+  std::uint64_t clock_ = 0;                     // last use of a parked conversation
   std::mutex mutex_;
 };
 

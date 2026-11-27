@@ -72,7 +72,7 @@ enum class Reuse {
   None,        // empty state, the whole prompt prefilled
   Extend,      // the prompt extends the tokens in the state (previous prompt + processed generated tokens)
   Checkpoint,  // restored the checkpoint taken after the previous prompt's prefill (a prefix of this prompt)
-  Parked,      // restored a parked conversation's checkpoint (a prefix of this prompt; RuntimeOptions::park_mb)
+  Parked,      // restored a parked conversation's checkpoint (a prefix of this prompt; RuntimeOptions::park_host_mb)
 };
 inline const char* to_string(Reuse reuse) {
   switch (reuse) {
@@ -127,10 +127,10 @@ struct RuntimeOptions {
   // only its 1-8 token rows (4.6 KB each), so it costs about a microsecond and frees the memory for context on 24 GB.
   bool embed_host = false;
   float spec_threshold = 0.8f;
-  // Conversation parking: device memory (MiB) for the checkpoints of conversations displaced by another
-  // one, least recently used evicted, all released when a device allocation fails; 0 disables; negative:
-  // min(3072, free memory after start-up - 4096), at least 0.
-  int park_mb = -1;
+  // Conversation parking: pinned host memory (MiB) for the checkpoints and full-attention rows of conversations
+  // displaced by another one, least recently used evicted; 0 disables; negative: a quarter of system RAM, at most
+  // 32 GiB (pinned memory cannot be swapped or used as page cache, so it is not sized to all of RAM).
+  int park_host_mb = -1;
   // Image input: load the vision tower (636 MB of the checkpoint, resident) and accept prompts with images.
   bool vision = false;
 };

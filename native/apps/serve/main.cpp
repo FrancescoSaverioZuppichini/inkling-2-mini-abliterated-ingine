@@ -66,7 +66,7 @@ ingine::model::Sampling generation_defaults(const std::filesystem::path& model_d
 
 int main(int argc, char** argv) {
   std::string model_dir, host = "127.0.0.1", ablation, backend = "fast", model_id, log_level = "INFO";
-  int port = 8003, max_ctx = 65536, max_queue = 4, max_model_len = 0, park_mb = -1, prefill_chunk = 3072;
+  int port = 8003, max_ctx = 65536, max_queue = 4, max_model_len = 0, park_host_mb = -1, prefill_chunk = 3072;
   bool engine = false, fake = false, dense_fp8 = false, kv_fp8 = false, spec = false, no_vision = false;
   bool embed_host = false;
   std::string dense = "bf16";
@@ -102,10 +102,10 @@ int main(int argc, char** argv) {
   ap.exclusive({"--kv-fp8", "--kv-cache"}, false);
   ap.option("--spec-threshold", "", "verify the leading drafts whose draft probability exceeds this (0 = always all 7)",
             &spec_threshold);
-  ap.option("--park-mb", "",
-            "device memory (MiB) for conversations displaced by another one, released when memory runs short, "
-            "0 = off (default: min(3072, free memory after start-up - 4096))",
-            &park_mb);
+  ap.option("--park-host-mb", "",
+            "pinned host memory (MiB) for conversations displaced by another one, least recently used evicted; "
+            "0 = off (default: a quarter of system RAM, at most 32 GiB)",
+            &park_host_mb);
   ap.option("--prefill-chunk", "",
             "prompt tokens per prefill step; its workspace is ~0.37 GB per 1024 tokens, so 1024 frees ~0.75 GB of "
             "context on a 24 GB card (default 3072)",
@@ -165,7 +165,7 @@ int main(int argc, char** argv) {
                  : kv_cache.empty() ? ingine::model::default_kv_format() : ingine::model::kv_format_of(kv_cache);
       options.spec = spec;
       options.spec_threshold = float(spec_threshold);
-      options.park_mb = park_mb;
+      options.park_host_mb = park_host_mb;
       options.vision = !no_vision;
       options.prefill_chunk = prefill_chunk;
       options.embed_host = embed_host;
