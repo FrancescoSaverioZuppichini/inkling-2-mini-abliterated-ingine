@@ -49,6 +49,10 @@ class Prefiller {
 
   int max_chunk() const { return max_chunk_; }
   std::size_t device_bytes() const;  // scratch held by this object
+  // [Agent] The front of the scratch holds activations only: inside a run() every byte of it is written before it is
+  // read, so between two run() calls it holds no data. A caller may keep its own data there between runs, as long as
+  // that data is dead from the first run() it queues until the data is written again.
+  DeviceSpan idle() const { return {B0_, idle_bytes_}; }
 
  private:
   const float* const* block_table(const std::vector<const float*>& blocks);
@@ -58,7 +62,8 @@ class Prefiller {
   int max_chunk_;
   cudaStream_t stream_;
   std::unique_ptr<kernels::prefill::Gemm> gemm_;
-  std::vector<DeviceBuffer> storage_;
+  DeviceHeap heap_;  // all scratch, back to back from B0_
+  std::size_t idle_bytes_ = 0;
   std::map<std::vector<const float*>, DeviceBuffer> tables_;
 
   // activations (rows = max_chunk), see prefill.cpp
@@ -75,7 +80,7 @@ class Prefiller {
   int *counts_, *tiles_n_, *pair_token_, *pair_dst_;
   int4* tiles_;
   __nv_bfloat16 *act_, *down_, *moe_sum_;
-  __nv_bfloat16* wscratch_;  // dequantized FP8 rows of wproj / wo (dense_fp8)
+  __nv_bfloat16* wscratch_ = nullptr;  // dequantized FP8 / INT8 rows of wproj / wo (quantized dense formats), in rel_ if it fits
   std::int64_t* ids_;
   int kpos_rows_;
   bool split_sliding_;

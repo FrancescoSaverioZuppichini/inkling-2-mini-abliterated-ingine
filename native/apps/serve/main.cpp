@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <csignal>
 #include <exception>
 #include <filesystem>
@@ -66,10 +67,11 @@ ingine::model::Sampling generation_defaults(const std::filesystem::path& model_d
 
 int main(int argc, char** argv) {
   std::string model_dir, host = "127.0.0.1", ablation, backend = "fast", model_id, log_level = "INFO";
-  int port = 8003, max_ctx = 65536, max_queue = 4, max_model_len = 0, park_mb = -1, prefill_chunk = 3072;
+  int port = 8003, max_ctx = 65536, max_queue = 4, max_model_len = 0, park_host_mb = -1, prefill_chunk = 3072;
   bool engine = false, fake = false, dense_fp8 = false, kv_fp8 = false, spec = false, no_vision = false;
   bool embed_host = false;
-  std::string kv_cache = "bf16";
+  std::string dense = "bf16";
+  std::string kv_cache;
   int image_max_tokens = 4096, max_images = 16, max_image_tokens = 32768;
   double spec_threshold = 0.8, fake_delay = 0.02;
   // sampling defaults; negative: from generation_config.json
@@ -78,28 +80,31 @@ int main(int argc, char** argv) {
 
   ingine::serve::ArgParser ap("ingine-serve", "OpenAI-compatible chat completions server for ingine.");
   ap.option("--model-dir", "", "checkpoint dir (tokenizer + chat template)", &model_dir, {}, true);
-  ap.option("--host", "", "", &host);
-  ap.option("--port", "", "", &port);
+  ap.option("--host", "", "address to listen on (default 127.0.0.1: this machine only)", &host);
+  ap.option("--port", "", "port to listen on (default 8003)", &port);
   ap.flag("--engine", "serve the model with ingine", &engine);
   ap.flag("--fake", "serve canned outputs (FakeGenerator)", &fake);
   ap.exclusive({"--engine", "--fake"}, true);
   ap.option("--ablation", "", "ablation file (safetensors) applied at every visit", &ablation);
   ap.option("--max-ctx", "", "positions held by the full-attention caches", &max_ctx);
   ap.option("--backend", "{fast}", "decode step implementation", &backend, {"fast"});
-  ap.flag("--dense-fp8", "FP8 E4M3 dense projections and head (row scales)", &dense_fp8);
+  ap.option("--dense", "{bf16,fp8,int8}",
+            "dense projections, wo and head: bf16 (default, the checkpoint), fp8 (E4M3 rows) or int8 (INT8 rows), both "
+            "with a scale per row (about 1 GB less memory, lossy)",
+            &dense, {"bf16", "fp8", "int8"});
+  ap.flag("--dense-fp8", "same as --dense fp8", &dense_fp8);
+  ap.exclusive({"--dense", "--dense-fp8"}, false);
   ap.flag("--spec", "DSpark speculative decoding (mtp.safetensors drafter)", &spec);
   ap.flag("--kv-fp8", "same as --kv-cache fp8", &kv_fp8);
-  ap.option("--kv-cache", "{bf16,fp8,int4}",
-            "full-attention KV caches: bf16 (default), fp8 (half the memory), int4 (4.06 bits, rotated, lossy: 500K "
-            "positions on 24 GB)",
-            &kv_cache, {"bf16", "fp8", "int4"});
+  ap.option("--kv-cache", "{bf16,fp8,int8,k8v4,int4,fp4}", ingine::model::KV_CACHE_HELP,
+            &kv_cache, {"bf16", "fp8", "int8", "k8v4", "int4", "fp4"});
   ap.exclusive({"--kv-fp8", "--kv-cache"}, false);
   ap.option("--spec-threshold", "", "verify the leading drafts whose draft probability exceeds this (0 = always all 7)",
             &spec_threshold);
-  ap.option("--park-mb", "",
-            "device memory (MiB) for conversations displaced by another one, released when memory runs short, "
-            "0 = off (default: min(3072, free memory after start-up - 4096))",
-            &park_mb);
+  ap.option("--park-host-mb", "",
+            "pinned host memory (MiB) for conversations displaced by another one, least recently used evicted; "
+            "0 = off (default: max(two conversations at --max-ctx, min(RAM / 4, 32 GiB)), at most RAM / 2)",
+            &park_host_mb);
   ap.option("--prefill-chunk", "",
             "prompt tokens per prefill step; its workspace is ~0.37 GB per 1024 tokens, so 1024 frees ~0.75 GB of "
             "context on a 24 GB card (default 3072)",
@@ -117,7 +122,7 @@ int main(int argc, char** argv) {
   ap.option("--max-queue", "", "requests allowed to wait behind the running one", &max_queue);
   ap.option("--max-model-len", "",
             "context limit (default: generator.max_model_len or tokenizer model_max_length)", &max_model_len);
-  ap.option("--log-level", "", "", &log_level);
+  ap.option("--log-level", "", "DEBUG, INFO (default), WARNING or ERROR", &log_level);
   ap.option("--temperature", "", "temperature of requests that omit it (default: generation_config.json, else 1)",
             &temperature);
   ap.option("--top-p", "", "top_p of requests that omit it (default: generation_config.json, else 1)", &top_p);
@@ -142,6 +147,7 @@ int main(int argc, char** argv) {
   std::signal(SIGPIPE, SIG_IGN);
 
   try {
+    const auto t_start = std::chrono::steady_clock::now();
     const ingine::text::ChatFormat fmt = ingine::text::ChatFormat::load(model_dir);
     std::unique_ptr<ingine::model::Generator> generator;
     if (fake) {
@@ -154,11 +160,11 @@ int main(int argc, char** argv) {
       options.model_dir = model_dir;
       options.ablation = ablation;
       options.max_ctx = max_ctx;
-      options.dense_fp8 = dense_fp8;
-      options.kv = ingine::model::kv_format_of(kv_fp8 ? "fp8" : kv_cache);
+      options.dense = ingine::model::dense_format_of(dense_fp8 ? "fp8" : dense);
+      options.kv = ingine::model::kv_cache_option(kv_fp8 ? "fp8" : kv_cache);
       options.spec = spec;
       options.spec_threshold = float(spec_threshold);
-      options.park_mb = park_mb;
+      options.park_host_mb = park_host_mb;
       options.vision = !no_vision;
       options.prefill_chunk = prefill_chunk;
       options.embed_host = embed_host;
@@ -181,8 +187,6 @@ int main(int argc, char** argv) {
     server_options.images.limits.max_tokens = image_max_tokens;
     server_options.images.max_images = max_images;
     server_options.images.max_total_tokens = max_image_tokens;
-    log.info("default sampling: temperature {} top_p {} top_k {}", server_options.sampling.temperature,
-             server_options.sampling.top_p, server_options.sampling.top_k);
     ingine::serve::ChatServer server(*generator, fmt, server_options);
     if (!server.bind(host, port)) {
       log.critical("cannot bind {}:{}", host, port);
@@ -192,11 +196,18 @@ int main(int argc, char** argv) {
     if (::pipe(g_stop_pipe) != 0) throw std::runtime_error("pipe() failed");
     std::signal(SIGINT, handle_signal);
     std::signal(SIGTERM, handle_signal);
-    log.info("image input: {}", !no_vision && generator->supports_images()
-                                    ? fmt::format("on (at most {} tokens per image, {} images and {} image tokens per request)",
+    // [Agent] One aligned block once the server is ready: what was loaded and how it serves, nothing per kernel.
+    const double ready = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
+    auto rows = generator->summary();
+    rows.emplace_back("sampling", fmt::format("temperature {} · top-p {} · top-k {}", server_options.sampling.temperature,
+                                              server_options.sampling.top_p, server_options.sampling.top_k));
+    rows.emplace_back("images", !no_vision && generator->supports_images()
+                                    ? fmt::format("up to {} tokens per image, {} images and {} image tokens per request",
                                                   image_max_tokens, max_images, max_image_tokens)
                                     : std::string("off"));
-    log.info("serving {} on http://{}:{}/v1", server.model_id(), host, server.port());
+    rows.emplace_back("serving", fmt::format("http://{}:{}/v1", host, server.port()));
+    log.info("ingine-serve · {} · ready in {:.1f} s", server.model_id(), ready);
+    for (const auto& [name, value] : rows) log.info("  {:<9} {}", name, value);
     bool listened = true;
     std::thread listener([&] {
       listened = server.listen();

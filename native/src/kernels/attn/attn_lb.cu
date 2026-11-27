@@ -1,4 +1,5 @@
-// Full-attention decode (M = 1..8 tokens) and prefill over int4 KV caches. Contract: native/KERNELS.md, area `attn`.
+// Full-attention decode (M = 1..8 tokens) and row packing over low-bit KV caches (int4, int8, k8v4, fp4); prefill in
+// attn_lb_prefill.cu, the shared formats and block step in attn_lb.cuh. Contract: native/KERNELS.md, area `attn`.
 //
 // Design
 // ------
@@ -6,9 +7,11 @@
 //   value norm; relative bias over the last 1024 positions, sink logit, sigmoid gate; the call's own keys attended
 //   exactly as the cache will hold them), with the cache in 16-position blocks per KV head written in mma operand
 //   order (kv_format.h).
+// * A format is a key code and a value code (K4 / K8 / KF, V4 / V8 / VF in attn_lb.cuh). Every format codes rotated rows, so
+//   the kernels are one template over the format: q is rotated once per row, the output unrotated once per row.
 // * Grid (cs, 8): cs blocks per KV head, 8 warps each. Warp w of block r owns cache blocks r * 8 + w + n * 8 cs: each
-//   lane loads its 32 B of K codes + 4 B of key scales and its 32 B of V codes (two 16-byte loads each, one warp reads
-//   1 KB contiguous), the next block's loads in flight while this one is consumed. No barrier inside the loop.
+//   lane loads its share of the block's codes and scales with 16-byte loads (one warp reads the block contiguously),
+//   the next block's loads in flight while this one is consumed. No barrier inside the loop.
 // * Per block: S^T (16 keys x 8-row tiles) = K Q^T with mma m16n8k16 f16 (keys decoded to FP16 in registers, the
 //   rotated query in FP16), scaled per key, bias / mask, the warp's online softmax (row statistics live in the lanes
 //   that hold the rows' accumulators), P to a 16 x 8 tile per warp in shared memory (FP16), then O^T += V^T P^T with
@@ -17,284 +20,10 @@
 //   workspace layout), then the merging block undoes the rotation per row, scales, rounds to BF16 and gates.
 // * Launched like attn.cu (programmatic dependent launch): pos and the weights are read before griddepcontrol.wait,
 //   everything the previous kernel writes after it.
-#include "kernels/attn/attn.h"
-#include "kernels/attn/attn_common.cuh"
-#include "kernels/attn/kv_format.h"
-#include "kernels/prefill/common.cuh"
-
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
-
-#include <algorithm>
-#include <cstdint>
+#include "kernels/attn/attn_lb.cuh"
 
 namespace ingine::kernels::attn {
 namespace {
-
-using prefill::cp_async16;
-using prefill::cp_commit;
-using prefill::cp_wait;
-using prefill::mma_f16;
-
-constexpr int BLK = kvf::BLK, NW = NT / 32;
-
-// x <- H D x (rotate) or D H x (unrotate) for a 128-row held 4 per lane (lane l: dims 4l .. 4l + 3); H is the
-// unnormalised Walsh-Hadamard matrix (H H = 128 I). Every lane of the warp must call it.
-__device__ __forceinline__ void fwht128(float (&x)[4], int lane) {
-    float a = x[0] + x[1], b = x[0] - x[1], c = x[2] + x[3], d = x[2] - x[3];
-    x[0] = a + c, x[1] = b + d, x[2] = a - c, x[3] = b - d;
-#pragma unroll
-    for (int m = 1; m < 32; m <<= 1) {
-        const bool up = lane & m;
-#pragma unroll
-        for (int e = 0; e < 4; ++e) {
-            const float o = __shfl_xor_sync(0xffffffffu, x[e], m);
-            x[e] = up ? o - x[e] : x[e] + o;
-        }
-    }
-}
-__device__ __forceinline__ void rotate(float (&x)[4], int lane) {
-#pragma unroll
-    for (int e = 0; e < 4; ++e) x[e] *= kvf::sign_of(4 * lane + e);
-    fwht128(x, lane);
-}
-__device__ __forceinline__ void unrotate(float (&x)[4], int lane) {
-    fwht128(x, lane);
-#pragma unroll
-    for (int e = 0; e < 4; ++e) x[e] *= kvf::sign_of(4 * lane + e);
-}
-
-// One rotated row rounded to FP16 into a shared row (4 dims per lane); returns the sum of the rounded values.
-__device__ __forceinline__ float store_f16_row(const float (&x)[4], __half* row, int lane) {
-    float qs = 0.f;
-#pragma unroll
-    for (int e = 0; e < 4; ++e) {
-        const __half h = __float2half_rn(x[e]);
-        row[4 * lane + e] = h;
-        qs += __half2float(h);
-    }
-    return wsum(qs);
-}
-
-// (a & b) | c as one lop3 (written in C, ptxas emits two instructions).
-__device__ __forceinline__ uint32_t lop3_and_or(uint32_t a, uint32_t b, uint32_t c) {
-    uint32_t d;
-    asm("lop3.b32 %0, %1, %2, %3, 0xea;" : "=r"(d) : "r"(a), "r"(b), "r"(c));
-    return d;
-}
-
-// 8 int4 codes (nibble i = code n_i) -> 4 FP16 pairs (n0, n4), (n1, n5), (n2, n6), (n3, n7) holding n - 8.
-// [Agent] The magic-number decode: OR a nibble into the mantissa of 1024 (0x6400) gives 1024 + n exactly; one
-// subtraction (low nibbles) or one FMA by 1/16 (high nibbles, 4 bits up) leaves n - 8. 9 instructions per 8 codes.
-// The levels are n - 7.5; the +0.5 is added once per score / output (Qsum, l) instead of per code.
-__device__ __forceinline__ void dq4(uint32_t w, uint32_t (&h)[4]) {
-    const uint32_t EX = 0x64006400u;
-    const __half2 SUB = __halves2half2(__ushort_as_half(0x6408), __ushort_as_half(0x6408));  // 1032
-    const __half2 MUL = __halves2half2(__ushort_as_half(0x2c00), __ushort_as_half(0x2c00));  // 1/16
-    const __half2 ADD = __halves2half2(__ushort_as_half(0xd480), __ushort_as_half(0xd480));  // -72
-    uint32_t lo = lop3_and_or(w, 0x000f000fu, EX), hi = lop3_and_or(w, 0x00f000f0u, EX);
-    __half2 r0 = __hsub2(*reinterpret_cast<__half2*>(&lo), SUB);
-    __half2 r1 = __hfma2(*reinterpret_cast<__half2*>(&hi), MUL, ADD);
-    w >>= 8;
-    lo = lop3_and_or(w, 0x000f000fu, EX), hi = lop3_and_or(w, 0x00f000f0u, EX);
-    __half2 r2 = __hsub2(*reinterpret_cast<__half2*>(&lo), SUB);
-    __half2 r3 = __hfma2(*reinterpret_cast<__half2*>(&hi), MUL, ADD);
-    h[0] = *reinterpret_cast<uint32_t*>(&r0), h[1] = *reinterpret_cast<uint32_t*>(&r1);
-    h[2] = *reinterpret_cast<uint32_t*>(&r2), h[3] = *reinterpret_cast<uint32_t*>(&r3);
-}
-
-// The int4 block as one lane sees it. load: its K words (keys gid, gid + 8 of the 4 32-dim chunks), the two keys'
-// FP16 scales and its V words (one per 16-dim tile). k_frags: A operands of k-steps 2 kk and 2 kk + 1 (rows = keys gid,
-// gid + 8). v_frag: A operand of dim tile dt (rows = dims 16 dt + gid, + 8; k = keys).
-struct Int4 {
-    static constexpr int KB = kvf::int4::K_BYTES, VB = kvf::int4::V_BYTES;
-    static constexpr float KOFF = 0.5f, VOFF = 0.5f;          // decoded n - 8 + 0.5 = the level n - 7.5
-    static constexpr float OUT = kvf::int4::STEP * RSQRT_D;   // value level -> unit-RMS value (/ sqrt(128))
-    static constexpr float SCORE = QSCALE / 128.f;            // q'' . k'' = 128 q . k
-    uint32_t k[8], s, v[8];
-
-    template <bool G>
-    __device__ __forceinline__ void load(const char* kb, const char* vb, int lane, std::uint64_t pol) {
-        auto ld = [&](const char* q) {
-            if constexpr (G) return ld_kv(q, pol);
-            else return *reinterpret_cast<const uint4*>(q);
-        };
-        const uint4 a = ld(kb + 32 * lane), b = ld(kb + 32 * lane + 16), c = ld(vb + 32 * lane), d = ld(vb + 32 * lane + 16);
-        k[0] = a.x, k[1] = a.y, k[2] = a.z, k[3] = a.w, k[4] = b.x, k[5] = b.y, k[6] = b.z, k[7] = b.w;
-        v[0] = c.x, v[1] = c.y, v[2] = c.z, v[3] = c.w, v[4] = d.x, v[5] = d.y, v[6] = d.z, v[7] = d.w;
-        s = *reinterpret_cast<const uint32_t*>(kb + BLK * D / 2 + 4 * (lane >> 2));
-    }
-    __device__ __forceinline__ void k_frags(int kk, uint32_t (&a0)[4], uint32_t (&a1)[4]) const {
-        uint32_t g[4], h[4];
-        dq4(k[2 * kk], g);      // key gid
-        dq4(k[2 * kk + 1], h);  // key gid + 8
-        a0[0] = g[0], a0[1] = h[0], a0[2] = g[1], a0[3] = h[1];
-        a1[0] = g[2], a1[1] = h[2], a1[2] = g[3], a1[3] = h[3];
-    }
-    __device__ __forceinline__ float2 k_scale() const { return __half22float2(*reinterpret_cast<const __half2*>(&s)); }
-
-    // One rotated row x = H D row (lane: dims 4 lane .. + 3) into slot j of a block image. Keys: codes of x / |k|
-    // (RMS 1, since |H D k| = sqrt(128) |k|) and a least-squares FP16 scale; values: codes of x / sqrt(128), no scale.
-    __device__ static void encode(bool key, const float (&x)[4], float norm, char* kimg, char* vimg, int j,
-                                  unsigned char* codes, int lane) {
-        const float inv = key ? (norm > 0.f ? 1.f / norm : 0.f) : RSQRT_D;
-        float num = 0.f, den = 0.f;
-#pragma unroll
-        for (int e = 0; e < 4; ++e) {
-            const int n = kvf::int4::code_of(x[e] * inv);
-            codes[4 * lane + e] = static_cast<unsigned char>(n);
-            const float c = float(n) - 7.5f;
-            num = fmaf(x[e], c, num), den = fmaf(c, c, den);
-        }
-        __syncwarp();
-        if (key) {
-            num = wsum(num), den = wsum(den);
-            if (lane < 16) {
-                const int kk = lane >> 2, t4 = lane & 3;
-                uint32_t w = 0;
-#pragma unroll
-                for (int nib = 0; nib < 8; ++nib) w |= uint32_t(codes[kvf::int4::k_dim(kk, t4, nib)]) << (4 * nib);
-                reinterpret_cast<uint32_t*>(kimg)[kvf::int4::k_word(j, kk, t4)] = w;
-            } else if (lane == 16) {
-                *reinterpret_cast<__half*>(kimg + kvf::int4::k_scale_off(j)) = __float2half_rn(num / den);
-            }
-        } else {
-#pragma unroll
-            for (int i = 0; i < 2; ++i) {
-                const int pr = lane + 32 * i, d = 16 * (pr >> 3) + (pr & 7);
-                vimg[kvf::int4::v_byte(j, d)] = static_cast<char>(codes[d] | (codes[d + 8] << 4));
-            }
-        }
-        __syncwarp();
-    }
-    // Copy key slot js of an image to slot jd of a cache block: whole words / bytes per key, so a concurrent reader of
-    // the block's other keys never sees a torn value.
-    __device__ static void copy_slot(const char* kimg, const char* vimg, int js, char* kc, char* vc, int jd, int lane) {
-        if (lane < 16) {
-            const int kk = lane >> 2, t4 = lane & 3;
-            reinterpret_cast<uint32_t*>(kc)[kvf::int4::k_word(jd, kk, t4)] =
-                reinterpret_cast<const uint32_t*>(kimg)[kvf::int4::k_word(js, kk, t4)];
-        } else if (lane == 16) {
-            *reinterpret_cast<__half*>(kc + kvf::int4::k_scale_off(jd)) =
-                *reinterpret_cast<const __half*>(kimg + kvf::int4::k_scale_off(js));
-        }
-#pragma unroll
-        for (int i = 0; i < 2; ++i) {
-            const int pr = lane + 32 * i, d = 16 * (pr >> 3) + (pr & 7);
-            vc[kvf::int4::v_byte(jd, d)] = vimg[kvf::int4::v_byte(js, d)];
-        }
-    }
-};
-
-// Online-softmax state of one warp's NTN 8-row tiles: lane (gid, t4) holds rows 8 nn + 2 t4 (+1) of every tile and, for
-// them, all 128 dims (dim tile dt: dims 16 dt + gid, + 8) of the unnormalised output.
-template <int NTN>
-struct Soft {
-    float qsum[NTN][2], m[NTN][2], l[NTN][2], acc[8][NTN][4];
-    template <class QS>
-    __device__ __forceinline__ void init(QS&& qsum_of, int lane) {
-#pragma unroll
-        for (int nn = 0; nn < NTN; ++nn) {
-#pragma unroll
-            for (int h = 0; h < 2; ++h) {
-                qsum[nn][h] = qsum_of(8 * nn + 2 * (lane & 3) + h) * Int4::KOFF;
-                m[nn][h] = NEG_INIT, l[nn][h] = 0.f;
-            }
-#pragma unroll
-            for (int dt = 0; dt < 8; ++dt)
-#pragma unroll
-                for (int v = 0; v < 4; ++v) acc[dt][nn][v] = 0.f;
-        }
-    }
-};
-
-// One cache block of 16 keys against this warp's rows. qfrag(nn, ks, h): the rotated query's B fragments. fix(key,
-// row, s): the scaled log2 score of (key 0..15, local row) with bias added, or -inf where masked. P goes through the
-// warp's own 8-row x 16-key FP16 tiles (pw, row stride pws): no block barrier.
-template <int NTN, class QF, class FIX>
-__device__ __forceinline__ void attend_block(const Int4& r, QF&& qfrag, FIX&& fix, Soft<NTN>& st, __half* pw, int pws,
-                                             int lane) {
-    const int gid = lane >> 2, t4 = lane & 3;
-    float s[NTN][4];
-#pragma unroll
-    for (int nn = 0; nn < NTN; ++nn) s[nn][0] = s[nn][1] = s[nn][2] = s[nn][3] = 0.f;
-#pragma unroll
-    for (int kk = 0; kk < 4; ++kk) {
-        uint32_t a0[4], a1[4];
-        r.k_frags(kk, a0, a1);
-#pragma unroll
-        for (int nn = 0; nn < NTN; ++nn) {
-            mma_f16(s[nn], a0, qfrag(nn, 2 * kk, 0), qfrag(nn, 2 * kk, 1));
-            mma_f16(s[nn], a1, qfrag(nn, 2 * kk + 1, 0), qfrag(nn, 2 * kk + 1, 1));
-        }
-    }
-    const float2 ks = r.k_scale();
-#pragma unroll
-    for (int nn = 0; nn < NTN; ++nn)
-#pragma unroll
-        for (int v = 0; v < 4; ++v) {
-            const int key = gid + (v >> 1) * 8, row = 8 * nn + 2 * t4 + (v & 1);
-            s[nn][v] = fix(key, row, (s[nn][v] + st.qsum[nn][v & 1]) * ((v >> 1) ? ks.y : ks.x) * Int4::SCORE);
-        }
-    bool grow = false;
-    float fac[NTN][2];
-#pragma unroll
-    for (int nn = 0; nn < NTN; ++nn)
-#pragma unroll
-        for (int h = 0; h < 2; ++h) {
-            float mx = fmaxf(s[nn][h], s[nn][h + 2]);
-#pragma unroll
-            for (int o = 4; o < 32; o <<= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
-            const float mn = fmaxf(st.m[nn][h], mx);
-            fac[nn][h] = exp2f(st.m[nn][h] - mn);
-            grow |= mn > st.m[nn][h];
-            st.m[nn][h] = mn;
-            st.l[nn][h] *= fac[nn][h];
-        }
-    if (__any_sync(0xffffffffu, grow)) {
-#pragma unroll
-        for (int dt = 0; dt < 8; ++dt)
-#pragma unroll
-            for (int nn = 0; nn < NTN; ++nn)
-#pragma unroll
-                for (int v = 0; v < 4; ++v) st.acc[dt][nn][v] *= fac[nn][v & 1];
-    }
-#pragma unroll
-    for (int nn = 0; nn < NTN; ++nn)
-#pragma unroll
-        for (int v = 0; v < 4; ++v) {
-            const int key = gid + (v >> 1) * 8, row = 8 * nn + 2 * t4 + (v & 1);
-            const __half h = __float2half_rn(exp2f(s[nn][v] - st.m[nn][v & 1]));
-            st.l[nn][v & 1] += __half2float(h);
-            pw[row * pws + key] = h;
-        }
-    __syncwarp();
-    uint32_t pb[NTN][2];
-#pragma unroll
-    for (int nn = 0; nn < NTN; ++nn) {
-        pb[nn][0] = *reinterpret_cast<const uint32_t*>(pw + (8 * nn + gid) * pws + 2 * t4);
-        pb[nn][1] = *reinterpret_cast<const uint32_t*>(pw + (8 * nn + gid) * pws + 2 * t4 + 8);
-    }
-    __syncwarp();
-#pragma unroll
-    for (int dt = 0; dt < 8; ++dt) {
-        uint32_t a[4];
-        dq4(r.v[dt], a);
-#pragma unroll
-        for (int nn = 0; nn < NTN; ++nn) mma_f16(st.acc[dt][nn], a, pb[nn][0], pb[nn][1]);
-    }
-}
-
-// The output of one row (4 dims per lane, rotated, normalised): unrotate, scale, BF16, times the sigmoid gate.
-template <class Gate>
-__device__ __forceinline__ void write_row(float (&x)[4], __nv_bfloat16* out, Gate&& gate_logit, int lane) {
-    unrotate(x, lane);
-#pragma unroll
-    for (int e = 0; e < 4; ++e) {
-        const int dim = 4 * lane + e;
-        out[dim] = __float2bfloat16_rn(bf16r(x[e] * Int4::OUT) * (1.f / (1.f + expf(-gate_logit(dim)))));
-    }
-}
 
 struct Params {
     const float* proj;
@@ -315,7 +44,7 @@ struct Params {
 };
 
 // shared memory (bytes)
-template <int M>
+template <int M, class F>
 struct Smem {
     static constexpr int ROWS = GQA * M, NRP = (ROWS + 7) / 8 * 8, NTN = NRP / 8;
     // staged inputs, dead after the prologue; aliased by the warp merge buffers
@@ -340,17 +69,23 @@ struct Smem {
     static constexpr int ML = (SINK + 4 * ROWS + 15) / 16 * 16;  // f32x2 [NW][NRP]
     static constexpr int NST = ML + 8 * NW * NRP;            // f32 [3][2][D] advanced conv state
     static constexpr int KIMG = NST + 4 * 3 * 2 * D;         // the call's keys as one block image
-    static constexpr int VIMG = (KIMG + Int4::KB + 15) / 16 * 16;
-    static constexpr int CODES = VIMG + Int4::VB;            // u8 [NW][D] encode scratch
+    static constexpr int VIMG = KIMG + F::KB;
+    static constexpr int CODES = VIMG + F::VB;               // u8 [NW][D] encode scratch
     static constexpr int PW = CODES + NW * D;                // f16 [NW][NRP][24] P tiles
     static constexpr int PWS = 24;
     static constexpr int END = PW + 2 * NW * NRP * PWS;
     static constexpr size_t BYTES = size_t(END);
 };
 
-template <int M>
-__global__ void __launch_bounds__(NT, M > 2 ? 1 : 2) lb_kernel(const Params p) {
-    using L = Smem<M>;
+// [Agent] Two blocks per SM cap a thread at 128 registers. At M <= 2 that holds two blocks' codes of up to 100 bytes per
+// lane (int4, k8v4); int8 (140) and fp4 (112) spilled inside the block loop (cuobjdump: 56 / 8 bytes of stack), so they
+// run one block per SM, which keeps the same bytes in flight per SM as int4 does with two.
+template <int M, class F>
+constexpr int min_blocks() { return M > 2 || sizeof(F) > 100 ? 1 : 2; }
+
+template <int M, class F>
+__global__ void __launch_bounds__(NT, min_blocks<M, F>()) lb_kernel(const Params p) {
+    using L = Smem<M, F>;
     constexpr int ROWS = L::ROWS, NRP = L::NRP, NTN = L::NTN;
     extern __shared__ __align__(16) char smc[];
     auto F32 = [&](int off) { return reinterpret_cast<float*>(smc + off); };
@@ -397,10 +132,10 @@ __global__ void __launch_bounds__(NT, M > 2 ? 1 : 2) lb_kernel(const Params p) {
     // first cache block of this warp in flight while the prologue runs
     const int nb = (p0 + BLK - 1) / BLK, stride = cs * NW;
     int b = rank * NW + warp;
-    Int4 cur, nxt;
-    auto blk_k = [&](int bi) { return p.k_cache + (size_t(bi) * HKV + g) * Int4::KB; };
-    auto blk_v = [&](int bi) { return p.v_cache + (size_t(bi) * HKV + g) * Int4::VB; };
-    if (b < nb) cur.load<true>(blk_k(b), blk_v(b), lane, pol);
+    F cur, nxt;
+    auto blk_k = [&](int bi) { return p.k_cache + (size_t(bi) * HKV + g) * F::KB; };
+    auto blk_v = [&](int bi) { return p.v_cache + (size_t(bi) * HKV + g) * F::VB; };
+    if (b < nb) cur.template load<true>(blk_k(b), blk_v(b), lane, pol);
 
     // ---- q (attn_common's post-processing, then rotated: H D q in FP16) and rel, one warp per row
     auto tau_of = [&](int t) { return 1.f + 0.1f * logf(fmaxf(float(p0 + t + 1) * (1.f / 8192.f), 1.f)); };
@@ -435,7 +170,8 @@ __global__ void __launch_bounds__(NT, M > 2 ? 1 : 2) lb_kernel(const Params p) {
             float y[4] = {bf16r(xv.x * f), bf16r(xv.y * f), bf16r(xv.z * f), bf16r(xv.w * f)};
             const float norm = sqrtf(wsum(y[0] * y[0] + y[1] * y[1] + y[2] * y[2] + y[3] * y[3]));
             rotate(y, lane);
-            Int4::encode(kv == 0, y, norm, kimg, vimg, m, codes, lane);
+            if (kv == 0) F::encode_k(y, norm, kimg, m, codes, lane);
+            else F::encode_v(y, vimg, m, codes, lane);
         }
     }
     __syncthreads();
@@ -454,14 +190,14 @@ __global__ void __launch_bounds__(NT, M > 2 ? 1 : 2) lb_kernel(const Params p) {
         return *reinterpret_cast<const uint32_t*>(qh + (8 * nn + gid) * L::QHS + 16 * ks + 2 * t4 + 8 * h);
     };
     Soft<NTN> st;
-    st.init([&](int row) { return F32(L::QSUM)[row]; }, lane);
+    st.init([&](int row) { return koff_of<F>(F32(L::QSUM)[row]); }, lane);
     __half* const pw = reinterpret_cast<__half*>(smc + L::PW) + warp * NRP * L::PWS;
 
     // One block of 16 keys (slot j at position kbase + j; own: the call's keys, slot j = token j).
-    auto consume = [&](const Int4& r, const int kbase, const bool own) {
+    auto consume = [&](const F& r, const int kbase, const bool own) {
         // the newest key of the block is at distance >= p0 - kbase - 15 from token 0
         const bool near = own || p0 - kbase - (BLK - 1) < EXT;
-        attend_block<NTN>(r, qfrag, [&](int key, int row, float sc) {
+        attend_block<F, NTN>(r, qfrag, [&](int key, int row, float sc) {
             const int t = row / GQA, d = own ? t - key : p0 + t - (kbase + key);
             const bool ok = row < ROWS && (own ? key <= t : kbase + key < p0);
             if (near && ok && d < EXT) {
@@ -476,13 +212,13 @@ __global__ void __launch_bounds__(NT, M > 2 ? 1 : 2) lb_kernel(const Params p) {
     };
 
     if (owner && warp == NW - 1) {  // the call's keys (warp 7 has the fewest cache blocks when nb % stride is small)
-        Int4 own;
-        own.load<false>(kimg, vimg, lane, pol);
+        F own;
+        own.template load<false>(kimg, vimg, lane, pol);
         consume(own, 0, true);
     }
 #pragma unroll 1
     for (; b < nb; b += stride) {
-        if (b + stride < nb) nxt.load<true>(blk_k(b + stride), blk_v(b + stride), lane, pol);
+        if (b + stride < nb) nxt.template load<true>(blk_k(b + stride), blk_v(b + stride), lane, pol);
         consume(cur, b * BLK, false);
         cur = nxt;
     }
@@ -518,11 +254,10 @@ __global__ void __launch_bounds__(NT, M > 2 ? 1 : 2) lb_kernel(const Params p) {
             for (int w = 0; w < NW; ++w) l += ml[w * NRP + row].y * exp2f(ml[w * NRP + row].x - mx);
             bm[nn][h] = mx, bl[nn][h] = l;
             const float f = exp2f(st.m[nn][h] - mx);
-            const float off = Int4::VOFF * st.l[nn][h];  // the +0.5 of every value level, once
 #pragma unroll
-            for (int dt = 0; dt < 8; ++dt) {
-                st.acc[dt][nn][h] = (st.acc[dt][nn][h] + off) * f;
-                st.acc[dt][nn][h + 2] = (st.acc[dt][nn][h + 2] + off) * f;
+            for (int dt = 0; dt < 8; ++dt) {  // the value level offset once per row: + VOFF l
+                st.acc[dt][nn][h] = voff_add<F>(st.acc[dt][nn][h], st.l[nn][h]) * f;
+                st.acc[dt][nn][h + 2] = voff_add<F>(st.acc[dt][nn][h + 2], st.l[nn][h]) * f;
             }
         }
     float* const red = F32(L::RED);
@@ -574,7 +309,8 @@ __global__ void __launch_bounds__(NT, M > 2 ? 1 : 2) lb_kernel(const Params p) {
     if (owner) {
         for (int m = warp; m < M; m += NW) {
             const int pos = p0 + m;
-            Int4::copy_slot(kimg, vimg, m, blk_k(pos / BLK), blk_v(pos / BLK), pos % BLK, lane);
+            F::copy_k(kimg, m, blk_k(pos / BLK), pos % BLK, lane);
+            F::copy_v(vimg, m, blk_v(pos / BLK), pos % BLK, lane);
         }
         for (int idx = tid; idx < 3 * 2 * D; idx += NT) {
             const int i = idx / (2 * D), kv = (idx / D) % 2, ch = idx % D;
@@ -612,16 +348,17 @@ __global__ void __launch_bounds__(NT, M > 2 ? 1 : 2) lb_kernel(const Params p) {
 #pragma unroll
         for (int e = 0; e < 4; ++e) x[e] = red[row * D + 4 * lane + e];
         const size_t h = size_t(row / GQA) * HQ + g * GQA + row % GQA;
-        write_row(x, p.out + h * D, [&](int dim) {
+        write_row<F>(x, p.out + h * D, [&](int dim) {
             return __ldcg(p.proj + size_t(row / GQA) * R_FULL + OFF_GATE + (g * GQA + row % GQA) * D + dim);
         }, lane);
     }
 }
 
 // ---- pack: T rows per visit, one warp per (token, head)
+template <class F>
 __global__ void __launch_bounds__(NT) pack_kernel(const __nv_bfloat16* k, const __nv_bfloat16* v, int T, long long pos0,
                                                    char* kc, char* vc) {
-    __shared__ __align__(16) char img[NW][Int4::KB + Int4::VB];  // per-warp block image of one key (slot 0)
+    __shared__ __align__(16) char img[NW][F::KB + F::VB];  // per-warp block image of one key (slot 0), K then V
     __shared__ unsigned char codes[NW][D];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int item = blockIdx.x * NW + warp;
@@ -635,144 +372,13 @@ __global__ void __launch_bounds__(NT) pack_kernel(const __nv_bfloat16* k, const 
         for (int e = 0; e < 4; ++e) y[e] = __bfloat162float(src[e]);
         const float norm = sqrtf(wsum(y[0] * y[0] + y[1] * y[1] + y[2] * y[2] + y[3] * y[3]));
         rotate(y, lane);
-        Int4::encode(kv == 0, y, norm, img[warp], img[warp] + Int4::KB, 0, codes[warp], lane);
+        if (kv == 0) F::encode_k(y, norm, img[warp], 0, codes[warp], lane);
+        else F::encode_v(y, img[warp] + F::KB, 0, codes[warp], lane);
     }
+    __syncwarp();
     const long long bi = pos / BLK;
-    Int4::copy_slot(img[warp], img[warp] + Int4::KB, 0, kc + (size_t(bi) * HKV + g) * Int4::KB,
-                    vc + (size_t(bi) * HKV + g) * Int4::VB, int(pos % BLK), lane);
-}
-
-// ---- prefill: a chunk's T tokens against every cached key up to each token (the chunk's own rows packed first)
-// [Agent] Same block step as decode, organised like the prefill FP8 kernel: a CTA owns one KV head and 128 query rows
-// (token, head of the GQA group), each warp 16 of them (two 8-row tiles, accumulators for all 128 dims), and all 8
-// warps walk the same key blocks, staged once per CTA with cp.async (4 blocks per stage, double-buffered). Each code
-// is decoded once per warp and feeds 2 tiles of rows; at 64 instruction slots per mma on GA102 (half-rate FP32
-// accumulation) the decode is not what bounds it.
-constexpr int PF_ROWS = NW * 16, PF_STAGE = 4, PF_PWS = 24, PF_BLK = Int4::KB + Int4::VB;
-
-struct PfSmem {
-    static constexpr int QHS = D + 8;
-    static constexpr int QH = 0;   // f16 [NW][16][QHS] (prologue)
-    static constexpr int STG = 0;  // [2][PF_STAGE][PF_BLK] (main loop)
-    static constexpr int OB = 0;   // f32 [NW][16][D] (epilogue)
-    static constexpr int U = std::max({2 * NW * 16 * QHS, 2 * PF_STAGE * PF_BLK, 4 * NW * 16 * D});
-    static constexpr int PW = (U + 15) / 16 * 16;          // f16 [NW][16][PF_PWS]
-    static constexpr int QSUM = PW + 2 * NW * 16 * PF_PWS;  // f32 [NW][16]
-    static constexpr size_t BYTES = size_t(QSUM + 4 * NW * 16);
-};
-
-__global__ void __launch_bounds__(NT, 1) lb_prefill_kernel(const PrefillArgs p) {
-    using L = PfSmem;
-    extern __shared__ __align__(16) char smc[];
-    const int g = blockIdx.y, tile = gridDim.x - 1 - blockIdx.x;  // heaviest row tiles (latest tokens) first
-    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, gid = lane >> 2, t4 = lane & 3;
-    const int rows = GQA * p.T, R0 = tile * PF_ROWS, RW = R0 + 16 * warp;
-    const char* const kc = static_cast<const char*>(p.k_cache);
-    const char* const vc = static_cast<const char*>(p.v_cache);
-
-    // ---- this warp's 16 query rows, rotated, FP16
-    __half* const qh = reinterpret_cast<__half*>(smc + L::QH) + warp * 16 * L::QHS;
-    float* const qsm = reinterpret_cast<float*>(smc + L::QSUM) + warp * 16;
-    for (int r = 0; r < 16; ++r) {
-        const int R = RW + r;
-        float x[4] = {0.f, 0.f, 0.f, 0.f};
-        if (R < rows) {
-            const uint2 u = *reinterpret_cast<const uint2*>(p.q + (size_t(R / GQA) * HQ + g * GQA + R % GQA) * D + 4 * lane);
-            x[0] = __uint_as_float(u.x << 16), x[1] = __uint_as_float(u.x & 0xffff0000u);
-            x[2] = __uint_as_float(u.y << 16), x[3] = __uint_as_float(u.y & 0xffff0000u);
-        }
-        rotate(x, lane);
-        const float qs = store_f16_row(x, qh + r * L::QHS, lane);
-        if (lane == 0) qsm[r] = qs;
-    }
-    __syncwarp();
-    uint32_t qb[2][8][2];
-#pragma unroll
-    for (int nn = 0; nn < 2; ++nn)
-#pragma unroll
-        for (int ks = 0; ks < 8; ++ks)
-#pragma unroll
-            for (int h = 0; h < 2; ++h)
-                qb[nn][ks][h] = *reinterpret_cast<const uint32_t*>(qh + (8 * nn + gid) * L::QHS + 16 * ks + 2 * t4 + 8 * h);
-    Soft<2> st;
-    st.init([&](int row) { return qsm[row]; }, lane);
-    __syncthreads();  // the query staging is reused by the key stages
-
-    // ---- key blocks [0, nb): every key up to the CTA's last token
-    const int t_hi = min(p.T - 1, (R0 + PF_ROWS - 1) / GQA);
-    const int nb = (p.pos0 + t_hi + 1 + BLK - 1) / BLK, ng = (nb + PF_STAGE - 1) / PF_STAGE;
-    auto issue = [&](int stage, int grp) {
-        char* dst = smc + L::STG + size_t(stage) * PF_STAGE * PF_BLK;
-        for (int i = tid; i < PF_STAGE * PF_BLK / 16; i += NT) {
-            const int bb = i / (PF_BLK / 16), c = i % (PF_BLK / 16), b = grp * PF_STAGE + bb;
-            if (b >= nb) continue;
-            const char* src = c < Int4::KB / 16 ? kc + (size_t(b) * HKV + g) * Int4::KB + 16 * c
-                                                : vc + (size_t(b) * HKV + g) * Int4::VB + 16 * (c - Int4::KB / 16);
-            cp_async16(dst + bb * PF_BLK + 16 * c, src);
-        }
-        cp_commit();
-    };
-    __half* const pw = reinterpret_cast<__half*>(smc + L::PW) + warp * 16 * PF_PWS;
-    auto qfrag = [&](int nn, int ks, int h) { return qb[nn][ks][h]; };
-    const uint16_t* const rel = reinterpret_cast<const uint16_t*>(p.rel);
-    issue(0, 0);
-#pragma unroll 1
-    for (int grp = 0; grp < ng; ++grp) {
-        if (grp + 1 < ng) {
-            issue((grp + 1) & 1, grp + 1);
-            cp_wait<1>();
-        } else {
-            cp_wait<0>();
-        }
-        __syncthreads();
-        const char* stg = smc + L::STG + size_t(grp & 1) * PF_STAGE * PF_BLK;
-#pragma unroll 1
-        for (int bb = 0; bb < PF_STAGE; ++bb) {
-            const int b = grp * PF_STAGE + bb;
-            if (b >= nb) break;
-            Int4 r;
-            r.load<false>(stg + bb * PF_BLK, stg + bb * PF_BLK + Int4::KB, lane, 0);
-            const int kbase = b * BLK;
-            attend_block<2>(r, qfrag, [&](int key, int row, float sc) {
-                const int R = RW + row, t = R / GQA, d = p.pos0 + t - (kbase + key);
-                const bool ok = R < rows && d >= 0;
-                if (ok && d < EXT)
-                    sc = fmaf(__uint_as_float(uint32_t(rel[(size_t(t) * HQ + g * GQA + R % GQA) * EXT + d]) << 16), LOG2E, sc);
-                return ok ? sc : -INFINITY;
-            }, st, pw, PF_PWS, lane);
-        }
-        __syncthreads();  // the stage is free for the next issue
-    }
-
-    // ---- epilogue: sink, value offset, normalise; then per row the inverse rotation, BF16, gate
-    float* const ob = reinterpret_cast<float*>(smc + L::OB) + warp * 16 * D;
-    const uint16_t* const proj = reinterpret_cast<const uint16_t*>(p.proj);
-    auto bf = [](uint16_t u) { return __uint_as_float(uint32_t(u) << 16); };
-#pragma unroll
-    for (int nn = 0; nn < 2; ++nn)
-#pragma unroll
-        for (int h = 0; h < 2; ++h) {
-            float l = st.l[nn][h];
-#pragma unroll
-            for (int o = 4; o < 32; o <<= 1) l += __shfl_xor_sync(0xffffffffu, l, o);
-            const int row = 8 * nn + 2 * t4 + h, R = RW + row;
-            const float den = l + (R < rows ? exp2f(bf(proj[size_t(R / GQA) * p.ld + OFF_SINK + g * GQA + R % GQA]) * LOG2E - st.m[nn][h]) : 0.f);
-            const float inv = 1.f / den, off = Int4::VOFF * l;
-#pragma unroll
-            for (int dt = 0; dt < 8; ++dt) {
-                ob[row * D + 16 * dt + gid] = (st.acc[dt][nn][h] + off) * inv;
-                ob[row * D + 16 * dt + gid + 8] = (st.acc[dt][nn][h + 2] + off) * inv;
-            }
-        }
-    __syncwarp();
-    for (int r = 0; r < 16 && RW + r < rows; ++r) {
-        const int R = RW + r, t = R / GQA, hq = g * GQA + R % GQA;
-        float x[4];
-#pragma unroll
-        for (int e = 0; e < 4; ++e) x[e] = ob[r * D + 4 * lane + e];
-        write_row(x, p.out + (size_t(t) * HQ + hq) * D, [&](int dim) { return bf(proj[size_t(t) * p.ld + OFF_GATE + hq * D + dim]); },
-                  lane);
-    }
+    F::copy_k(img[warp], 0, kc + (size_t(bi) * HKV + g) * F::KB, int(pos % BLK), lane);
+    F::copy_v(img[warp] + F::KB, 0, vc + (size_t(bi) * HKV + g) * F::VB, int(pos % BLK), lane);
 }
 
 struct Kernel {
@@ -781,11 +387,11 @@ struct Kernel {
     int cs;
 };
 
-template <int M>
+template <int M, class F>
 Kernel kernel_of() {
     static const Kernel k = [] {
-        const auto f = lb_kernel<M>;
-        const size_t smem = Smem<M>::BYTES;
+        const auto f = lb_kernel<M, F>;
+        const size_t smem = Smem<M, F>::BYTES;
         CUDA_CHECK(cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, int(smem)));
         // [Agent] As many blocks per KV head as fill the GPU in one wave (device facts, never the architecture), at
         // most the MAXCS partials the workspace holds.
@@ -798,28 +404,34 @@ Kernel kernel_of() {
     return k;
 }
 
+template <class F>
 Kernel select(int M) {
     switch (M) {
-        case 1: return kernel_of<1>();
-        case 2: return kernel_of<2>();
-        case 3: return kernel_of<3>();
-        case 4: return kernel_of<4>();
-        case 5: return kernel_of<5>();
-        case 6: return kernel_of<6>();
-        case 7: return kernel_of<7>();
-        default: return kernel_of<8>();
+        case 1: return kernel_of<1, F>();
+        case 2: return kernel_of<2, F>();
+        case 3: return kernel_of<3, F>();
+        case 4: return kernel_of<4, F>();
+        case 5: return kernel_of<5, F>();
+        case 6: return kernel_of<6, F>();
+        case 7: return kernel_of<7, F>();
+        default: return kernel_of<8, F>();
     }
 }
 
 }  // namespace
 
 std::size_t cache_bytes(KvFormat f, std::int64_t rows, bool values) {
-    if (f == KvFormat::int4) return std::size_t((rows + BLK - 1) / BLK) * HKV * (values ? Int4::VB : Int4::KB);
-    return std::size_t(rows) * CONV_C * (f == KvFormat::fp8 ? 1 : 2);
+    if (!low_bit(f)) return std::size_t(rows) * CONV_C * (f == KvFormat::fp8 ? 1 : 2);
+    std::size_t per = 0;
+    with_format(f, [&](auto t) {
+        using F = typename decltype(t)::type;
+        per = values ? F::VB : F::KB;
+    });
+    return std::size_t((rows + BLK - 1) / BLK) * HKV * per;
 }
 
 void attn_decode_lb(const DecodeArgs& a, cudaStream_t stream) {
-    require(a.log_scaling, "the int4 reader always applies the log-length temperature");
+    require(a.log_scaling, "the low-bit reader always applies the log-length temperature");
     Params p{};
     p.proj = a.proj;
     p.cap = a.cache_rows;
@@ -836,28 +448,21 @@ void attn_decode_lb(const DecodeArgs& a, cudaStream_t stream) {
     p.counter = static_cast<int*>(a.workspace);
     p.part = reinterpret_cast<float*>(static_cast<char*>(a.workspace) + WS_PART);
     p.out = a.out;
-    const Kernel k = select(a.M);
+    Kernel k{};
+    with_format(a.kv, [&](auto t) { k = select<typename decltype(t)::type>(a.M); });
     cudaLaunchAttribute attrs[2];
     const cudaLaunchConfig_t cfg = launch_config(k.smem, stream, attrs, k.cs, false);
     CUDA_CHECK(cudaLaunchKernelEx(&cfg, k.fn, p));
 }
 
-void prefill_attend(const PrefillArgs& a, cudaStream_t stream) {
-    require(a.T > 0 && a.q && a.rel && a.proj && a.k_cache && a.v_cache && a.out, "prefill_attend: null argument");
-    static const bool attr = [] {
-        CUDA_CHECK(cudaFuncSetAttribute(lb_prefill_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, int(PfSmem::BYTES)));
-        return true;
-    }();
-    (void)attr;
-    lb_prefill_kernel<<<dim3((GQA * a.T + PF_ROWS - 1) / PF_ROWS, HKV), NT, PfSmem::BYTES, stream>>>(a);
-    CUDA_CHECK(cudaGetLastError());
-}
-
-void pack_rows(const __nv_bfloat16* k, const __nv_bfloat16* v, int T, std::int64_t pos0, void* k_cache, void* v_cache,
-               cudaStream_t stream) {
+void pack_rows(KvFormat kv, const __nv_bfloat16* k, const __nv_bfloat16* v, int T, std::int64_t pos0, void* k_cache,
+               void* v_cache, cudaStream_t stream) {
     if (T <= 0) return;
-    pack_kernel<<<(T * HKV + NW - 1) / NW, NT, 0, stream>>>(k, v, T, pos0, static_cast<char*>(k_cache),
-                                                          static_cast<char*>(v_cache));
+    with_format(kv, [&](auto t) {
+        using F = typename decltype(t)::type;
+        pack_kernel<F><<<(T * HKV + NW - 1) / NW, NT, 0, stream>>>(k, v, T, pos0, static_cast<char*>(k_cache),
+                                                                    static_cast<char*>(v_cache));
+    });
     CUDA_CHECK(cudaGetLastError());
 }
 

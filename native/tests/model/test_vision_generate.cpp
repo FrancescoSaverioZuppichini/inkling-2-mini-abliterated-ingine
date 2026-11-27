@@ -93,10 +93,11 @@ void with_spec_and_small_chunks(const ingine::text::ChatFormat& fmt, const fs::p
   RuntimeOptions opt;
   opt.model_dir = dir;
   opt.max_ctx = 16384;
-  opt.dense_fp8 = opt.spec = true;
+  opt.dense = DenseFormat::fp8;
+  opt.spec = true;
   opt.kv = KvFormat::fp8;
   opt.prefill_chunk = 512;
-  opt.park_mb = 2048;
+  opt.park_host_mb = 2048;
   opt.vision = true;
   auto gen = make_generator(opt);
   expect(gen->supports_images(), "the generator takes images");
@@ -169,11 +170,11 @@ void plain_with_large_chunks(const ingine::text::ChatFormat& fmt, const fs::path
   RuntimeOptions opt;
   opt.model_dir = dir;
   opt.max_ctx = 16384;
-  opt.dense_fp8 = true;
+  opt.dense = DenseFormat::fp8;
   opt.kv = KvFormat::fp8;
   opt.spec = false;
   opt.prefill_chunk = 3072;
-  opt.park_mb = 0;
+  opt.park_host_mb = 0;
   opt.vision = true;
   auto gen = make_generator(opt);
   const Session s{fmt, *gen, opt.max_ctx};

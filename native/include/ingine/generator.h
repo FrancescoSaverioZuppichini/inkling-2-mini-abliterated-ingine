@@ -10,20 +10,38 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace ingine::model {
 
 // Format of the full-attention KV caches. bf16: [rows, 8, 128] BF16; fp8: the same in E4M3 without scale (half the
-// bytes); int4: 4.06 bits per value in 16-position blocks (rotated, lossy; native/KERNELS.md, area `attn`).
-enum class KvFormat : std::uint8_t { bf16, fp8, int4 };
-// "bf16" | "fp8" | "int4"; throws std::invalid_argument on anything else.
+// bytes). The low-bit formats are 16-position blocks of rotated rows (native/KERNELS.md, area `attn`): int8 8.13 bits
+// per value (FP16 scale per row), k8v4 6.06 (int8 keys, scale-free 4-bit values), int4 4.06 and fp4 4.5 (lossy).
+enum class KvFormat : std::uint8_t { bf16, fp8, int4, int8, k8v4, fp4 };
+// "bf16" | "fp8" | "int8" | "k8v4" | "int4" | "fp4"; throws std::invalid_argument on anything else.
 inline KvFormat kv_format_of(const std::string& name) {
   if (name == "bf16") return KvFormat::bf16;
   if (name == "fp8") return KvFormat::fp8;
+  if (name == "int8") return KvFormat::int8;
+  if (name == "k8v4") return KvFormat::k8v4;
   if (name == "int4") return KvFormat::int4;
+  if (name == "fp4") return KvFormat::fp4;
   throw std::invalid_argument("unknown KV cache format: " + name);
 }
+inline const char* to_string(KvFormat f) {
+  static constexpr const char* names[] = {"bf16", "fp8", "int4", "int8", "k8v4", "fp4"};  // KvFormat order
+  return names[int(f)];
+}
+// The default full-attention KV cache of the current GPU: fp8 where the GPU converts FP8 in hardware (compute
+// capability 8.9+, e.g. RTX 4090 and 5090), int8 below (e.g. RTX 3090).
+KvFormat default_kv_format();
+// The --kv-cache value of the apps: a format name, or empty for default_kv_format().
+inline KvFormat kv_cache_option(const std::string& name) { return name.empty() ? default_kv_format() : kv_format_of(name); }
+inline constexpr const char* KV_CACHE_HELP =
+    "full-attention KV caches (default: fp8 on GPUs with hardware FP8, compute capability 8.9+; int8 below): int8 (8.13 "
+    "bits, rotated), bf16 (exact), fp8 (8 bits), k8v4 (6.06 bits: int8 keys, 4-bit values), int4 (4.06 bits, lossy), "
+    "fp4 (4.5 bits, lossy)";
 
 struct Sampling {
   float temperature = 1.0f;  // 0 => greedy
@@ -64,7 +82,7 @@ enum class Reuse {
   None,        // empty state, the whole prompt prefilled
   Extend,      // the prompt extends the tokens in the state (previous prompt + processed generated tokens)
   Checkpoint,  // restored the checkpoint taken after the previous prompt's prefill (a prefix of this prompt)
-  Parked,      // restored a parked conversation's checkpoint (a prefix of this prompt; RuntimeOptions::park_mb)
+  Parked,      // restored a parked conversation's checkpoint (a prefix of this prompt; RuntimeOptions::park_host_mb)
 };
 inline const char* to_string(Reuse reuse) {
   switch (reuse) {
@@ -94,22 +112,39 @@ struct GenerateStats {
   double vision_seconds = 0;
 };
 
+// Storage of the dense matrices (attention projections, wo, unembedding). bf16: as in the checkpoint; fp8: E4M3
+// rows, int8: INT8 rows (native/KERNELS.md, area `dense`), both with an FP32 scale per row, quantized at load (half
+// the bytes, lossy).
+enum class DenseFormat : std::uint8_t { bf16, fp8, int8 };
+// "bf16" | "fp8" | "int8"; throws std::invalid_argument on anything else.
+inline DenseFormat dense_format_of(const std::string& name) {
+  if (name == "bf16") return DenseFormat::bf16;
+  if (name == "fp8") return DenseFormat::fp8;
+  if (name == "int8") return DenseFormat::int8;
+  throw std::invalid_argument("unknown dense format: " + name);
+}
+inline const char* to_string(DenseFormat f) {
+  static constexpr const char* names[] = {"bf16", "fp8", "int8"};  // DenseFormat order
+  return names[int(f)];
+}
+
 struct RuntimeOptions {
   std::filesystem::path model_dir, ablation;  // empty ablation: original model
   int max_ctx = 65536;
   // Tokens per prefill chunk. 3072 (the largest the sliding attention takes) reads a long prompt 6-10% faster
   // than 2048 for 0.38 GB more scratch; results differ between chunk sizes only by rounding.
   int prefill_chunk = 3072;
-  bool dense_fp8 = true, spec = false;
-  KvFormat kv = KvFormat::bf16;
+  bool spec = false;
+  DenseFormat dense = DenseFormat::bf16;
+  KvFormat kv = KvFormat::int8;  // the apps default to default_kv_format() instead
   // [Agent] Keep the BF16 embedding table (0.86 GiB) in pinned host memory that the GPU reads over PCIe. A step reads
   // only its 1-8 token rows (4.6 KB each), so it costs about a microsecond and frees the memory for context on 24 GB.
   bool embed_host = false;
   float spec_threshold = 0.8f;
-  // Conversation parking: device memory (MiB) for the checkpoints of conversations displaced by another
-  // one, least recently used evicted, all released when a device allocation fails; 0 disables; negative:
-  // min(3072, free memory after start-up - 4096), at least 0.
-  int park_mb = -1;
+  // Conversation parking: pinned host memory (MiB) for the checkpoints and full-attention rows of conversations
+  // displaced by another one, least recently used evicted; 0 disables; negative: max(two conversations at max_ctx,
+  // min(RAM / 4, 32 GiB)), at most RAM / 2 (pinned memory cannot be swapped).
+  int park_host_mb = -1;
   // Image input: load the vision tower (636 MB of the checkpoint, resident) and accept prompts with images.
   bool vision = false;
 };
@@ -133,6 +168,9 @@ class Generator {
     return generate(prompt.ids, max_new_tokens, sampling, stop_ids, on_tokens);
   }
   virtual bool supports_images() const { return false; }
+  // What was loaded, one "name value" row per line (GPU, weights, context, drafter, parking, memory), for the
+  // start-up log; empty for generators without a model.
+  virtual std::vector<std::pair<std::string, std::string>> summary() const { return {}; }
 };
 
 std::unique_ptr<Generator> make_generator(const RuntimeOptions& options);  // the model (ingine_model)

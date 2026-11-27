@@ -1,7 +1,7 @@
 // Weights in the decoder's device layouts, read from the Hugging Face checkpoint: weights.load / load_layer,
 // plus fast.FastDecoder._concat_projections (one [R, H] projection matrix per layer, the per-projection
 // matrices are row views of it), _stack_layer_params (stacked norms and gate weights) and _fp8_dense
-// (wproj, wo and the unembedding as FP8 rows + FP32 row scales, the BF16 copies freed), and
+// (wproj, wo and the unembedding as FP8 or INT8 rows + FP32 row scales, the BF16 copies freed), and
 // model.Ablation.load / none.
 //
 // Large tensors are uploaded straight from the file with the core DeviceUploader; small per-channel
@@ -14,6 +14,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <fstream>
@@ -86,11 +87,13 @@ class Loader {
     return upload_f32(host_f32(m_, name), shape);
   }
 
-  // Queues the raw bytes of `name` (rows [0, rows) if rows >= 0) for upload to `dst`.
-  void queue(const std::string& name, void* dst, std::int64_t rows = -1) {
+  // Queues the raw bytes of `name` (rows [first, first + rows) if rows >= 0) for upload to `dst`.
+  void queue(const std::string& name, void* dst, std::int64_t rows = -1, std::int64_t first = 0) {
     const SafetensorsRef ref = m_.at(name);
     UploadRequest r = upload_request(ref, dst);
-    if (rows >= 0) r.bytes = ref->bytes / std::uint64_t(ref->shape[0]) * std::uint64_t(rows);
+    const std::uint64_t row_bytes = ref->bytes / std::uint64_t(ref->shape[0]);
+    r.offset += row_bytes * std::uint64_t(first);
+    if (rows >= 0) r.bytes = row_bytes * std::uint64_t(rows);
     pending_.push_back(r);
   }
 
@@ -145,24 +148,33 @@ std::array<ExpertFormat, LAYERS> expert_formats(const fs::path& model_dir) {
   return fmt;
 }
 
-// FP8 rows + scales of a BF16 matrix (dense fp8_rows), into new storage.
-Dense to_fp8(Loader& ld, const Tensor& bf16, int rows, int cols) {
+// Storage for the FP8 or INT8 rows + FP32 row scales of a [rows, cols] matrix, filled by quantize().
+Dense create_quantized(Loader& ld, DenseFormat f, int rows, int cols) {
   void* q = ld.heap.alloc(std::size_t(rows) * cols);
-  float* s = static_cast<float*>(ld.heap.alloc(std::size_t(rows) * 4));
-  kernels::dense::fp8_rows(static_cast<const __nv_bfloat16*>(bf16.data), rows, cols, q, s, ld.stream());
-  return Dense{rm(q, DType::FP8_E4M3FN, {rows, cols}), rm(s, DType::FP32, {rows})};
+  void* s = ld.heap.alloc(std::size_t(rows) * 4);
+  return Dense{rm(q, f == DenseFormat::int8 ? DType::I8 : DType::FP8_E4M3FN, {rows, cols}), rm(s, DType::FP32, {rows})};
+}
+
+// Rows [row, row + n) of `d` from n BF16 rows (dense fp8_rows / int8_rows; each row is quantized on its own).
+void quantize(const Dense& d, int row, const void* bf16, int n, cudaStream_t stream) {
+  void* q = static_cast<char*>(d.w.data) + std::size_t(row) * d.cols();
+  float* s = static_cast<float*>(d.scale.data) + row;
+  const auto* w = static_cast<const __nv_bfloat16*>(bf16);
+  if (d.int8()) kernels::dense::int8_rows(w, n, d.cols(), q, s, stream);
+  else kernels::dense::fp8_rows(w, n, d.cols(), q, s, stream);
 }
 
 Dense row_view(const Dense& d, int begin, int end) {
   const int cols = d.cols();
-  const std::size_t esize = d.fp8() ? 1 : 2;
+  const std::size_t esize = d.quantized() ? 1 : 2;
   Dense v;
   v.w = rm(static_cast<char*>(d.w.data) + std::size_t(begin) * cols * esize, d.w.dtype, {end - begin, cols});
-  if (d.fp8()) v.scale = rm(static_cast<float*>(d.scale.data) + begin, DType::FP32, {end - begin});
+  if (d.quantized()) v.scale = rm(static_cast<float*>(d.scale.data) + begin, DType::FP32, {end - begin});
   return v;
 }
 
-Layer load_layer_into(Loader& ld, int l, ExpertFormat fmt, bool dense_fp8) {
+Layer load_layer_into(Loader& ld, int l, ExpertFormat fmt, DenseFormat dense) {
+  const bool quant = dense != DenseFormat::bf16;
   const SafetensorsModel& m = ld.model();
   const std::string p = "model.llm.layers." + std::to_string(l) + ".";
   Layer layer;
@@ -196,11 +208,11 @@ Layer load_layer_into(Loader& ld, int l, ExpertFormat fmt, bool dense_fp8) {
     ld.queue(name, dst);
   };
   {
-    void* d = dense_fp8 ? (proj_tmp = DeviceBuffer(std::size_t(R) * H * 2)).p : ld.heap.alloc(std::size_t(R) * H * 2);
+    void* d = quant ? (proj_tmp = DeviceBuffer(std::size_t(R) * H * 2)).p : ld.heap.alloc(std::size_t(R) * H * 2);
     for (int s = 0; s < num_segs(layer.full); ++s)
       queue_bf16_rows(p + seg_names[s], static_cast<char*>(d) + std::size_t(SEG_BEGIN[s]) * H * 2, SEG_ROWS[s], H);
     wproj_bf16 = rm(d, DType::BF16, {R, H});
-    void* o = dense_fp8 ? (wo_tmp = DeviceBuffer(std::size_t(H) * 3072 * 2)).p : ld.heap.alloc(std::size_t(H) * 3072 * 2);
+    void* o = quant ? (wo_tmp = DeviceBuffer(std::size_t(H) * 3072 * 2)).p : ld.heap.alloc(std::size_t(H) * 3072 * 2);
     queue_bf16_rows(p + "attn.wo_ud.weight", o, H, HEADS * HEAD_DIM);
     wo_bf16 = rm(o, DType::BF16, {H, HEADS * HEAD_DIM});
   }
@@ -298,9 +310,11 @@ Layer load_layer_into(Loader& ld, int l, ExpertFormat fmt, bool dense_fp8) {
   }
 
   ld.flush();
-  if (dense_fp8) {
-    layer.wproj = to_fp8(ld, wproj_bf16, R, H);
-    layer.wo = to_fp8(ld, wo_bf16, H, HEADS * HEAD_DIM);
+  if (quant) {
+    layer.wproj = create_quantized(ld, dense, R, H);
+    quantize(layer.wproj, 0, wproj_bf16.data, R, ld.stream());
+    layer.wo = create_quantized(ld, dense, H, HEADS * HEAD_DIM);
+    quantize(layer.wo, 0, wo_bf16.data, H, ld.stream());
     CUDA_CHECK(cudaStreamSynchronize(ld.stream()));  // before the BF16 temporaries are freed
   } else {
     layer.wproj = Dense{wproj_bf16, {}};
@@ -314,15 +328,15 @@ Layer load_layer_into(Loader& ld, int l, ExpertFormat fmt, bool dense_fp8) {
 
 }  // namespace
 
-Weights load_weights(const fs::path& model_dir, bool dense_fp8, bool embed_host, cudaStream_t stream) {
+Weights load_weights(const fs::path& model_dir, DenseFormat dense, bool embed_host, cudaStream_t stream) {
   const SafetensorsModel m(model_dir);
   DeviceUploader up;
   Weights w;
-  w.dense_fp8 = dense_fp8;
+  w.dense = dense;
   w.expert_formats = expert_formats(model_dir);
   Loader ld(m, up, stream, w.heap);
   const int H = HIDDEN;
-  for (int l = 0; l < LAYERS; ++l) w.layers.push_back(load_layer_into(ld, l, w.expert_formats[l], dense_fp8));
+  for (int l = 0; l < LAYERS; ++l) w.layers.push_back(load_layer_into(ld, l, w.expert_formats[l], dense));
 
   // message_queries [12, 4, H] = cat([queries[:, :1], kv_queries, queries[:, 1:]], dim=1) with queries and
   // kv_queries [24, H] unflattened to [12, 2, H]
@@ -351,32 +365,39 @@ Weights load_weights(const fs::path& model_dir, bool dense_fp8, bool embed_host,
   w.embed_norm = ld.f32("model.llm.embed_norm.weight", {H});
   w.final_query = ld.f32("model.llm.attn_res.output_query", {1, H});
   w.final_norm = ld.f32("model.llm.norm.weight", {H});
-  DeviceBuffer unembed_tmp;
   {
     const std::string name = "model.llm.unembed.weight";
     if (m.at(name)->dtype != "BF16") throw std::runtime_error("weights: unembed must be BF16");
-    const std::size_t bytes = std::size_t(UNPADDED_VOCAB) * H * 2;
-    void* d = dense_fp8 ? (unembed_tmp = DeviceBuffer(bytes)).p : ld.heap.alloc(bytes);
-    ld.queue(name, d, UNPADDED_VOCAB);  // unembed[:UNPADDED_VOCAB]
-    ld.flush();
-    const Tensor bf = rm(d, DType::BF16, {UNPADDED_VOCAB, H});
-    if (dense_fp8) {
-      w.unembed = to_fp8(ld, bf, UNPADDED_VOCAB, H);
-      CUDA_CHECK(cudaStreamSynchronize(stream));
+    if (dense == DenseFormat::bf16) {
+      void* d = ld.heap.alloc(std::size_t(UNPADDED_VOCAB) * H * 2);
+      ld.queue(name, d, UNPADDED_VOCAB);  // unembed[:UNPADDED_VOCAB]
+      ld.flush();
+      w.unembed = Dense{rm(d, DType::BF16, {UNPADDED_VOCAB, H}), {}};
     } else {
-      w.unembed = Dense{bf, {}};
+      // [Agent] Quantized a slice at a time: the BF16 staging is 72 MiB instead of the whole 883 MiB head. Rows are
+      // quantized independently, so the bytes are those of one call over all rows. The upload of the next slice
+      // waits for the kernel queued on the stream before it, which still reads the staging.
+      w.unembed = create_quantized(ld, dense, UNPADDED_VOCAB, H);
+      DeviceBuffer tmp(std::size_t(UNEMBED_SLICE) * H * 2);
+      for (int r = 0; r < UNPADDED_VOCAB; r += UNEMBED_SLICE) {
+        const int n = std::min(UNEMBED_SLICE, UNPADDED_VOCAB - r);
+        ld.queue(name, tmp.p, n, r);
+        ld.flush();
+        quantize(w.unembed, r, tmp.p, n, stream);
+      }
+      CUDA_CHECK(cudaStreamSynchronize(stream));  // before the staging is freed
     }
   }
   CUDA_CHECK(cudaStreamSynchronize(stream));
   return w;
 }
 
-Layer load_layer(const fs::path& model_dir, int l, bool dense_fp8, cudaStream_t stream, DeviceHeap& heap) {
+Layer load_layer(const fs::path& model_dir, int l, DenseFormat dense, cudaStream_t stream, DeviceHeap& heap) {
   if (l < 0 || l >= LAYERS) throw std::invalid_argument("load_layer: layer out of range");
   const SafetensorsModel m(model_dir);
   DeviceUploader up;
   Loader ld(m, up, stream, heap);
-  Layer layer = load_layer_into(ld, l, expert_formats(model_dir)[l], dense_fp8);
+  Layer layer = load_layer_into(ld, l, expert_formats(model_dir)[l], dense);
   CUDA_CHECK(cudaStreamSynchronize(stream));
   return layer;
 }

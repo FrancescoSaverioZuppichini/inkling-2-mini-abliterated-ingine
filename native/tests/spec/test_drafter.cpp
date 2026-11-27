@@ -50,7 +50,7 @@ void* upload(ingine::DeviceHeap& heap, const void* host, std::size_t bytes) {
   return d;
 }
 
-// the synthetic target's unembedding as FP8 rows + scales (dense_fp8), from BF16 rows [V, H]
+// the synthetic target's unembedding as FP8 rows + scales (DenseFormat::fp8), from BF16 rows [V, H]
 void fp8_unembed(model::Weights& w, const std::vector<__nv_bfloat16>& rows, int V) {
   DeviceBuffer u16(rows.size() * 2);
   u16.copy_from_host(rows.data(), rows.size() * 2);
@@ -60,7 +60,7 @@ void fp8_unembed(model::Weights& w, const std::vector<__nv_bfloat16>& rows, int 
   INGINE_TEST_CUDA(cudaDeviceSynchronize());
   w.unembed.w = model::rm(q, DType::FP8_E4M3FN, {V, H});
   w.unembed.scale = model::rm(sc, DType::FP32, {V});
-  w.dense_fp8 = true;
+  w.dense = model::DenseFormat::fp8;
 }
 
 DraftOut fetch(const model::Drafter::Draft& d, cudaStream_t s) {

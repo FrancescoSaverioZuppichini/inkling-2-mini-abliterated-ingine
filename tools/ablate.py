@@ -627,7 +627,7 @@ def cmd_baseline(args):
 def serve(server: str, model_dir, ablation: str | None, port: int, log: str):
     """Starts ingine-serve with the serving profile's flags and waits until it answers /health."""
     cmd = [server, "--engine", "--model-dir", str(model_dir), "--host", "127.0.0.1", "--port", str(port),
-           "--max-ctx", "16384", "--dense-fp8", "--kv-fp8", "--spec", "--spec-threshold", "0.8", "--park-mb", "0"]
+           "--max-ctx", "16384", "--dense-fp8", "--kv-fp8", "--spec", "--spec-threshold", "0.8", "--park-host-mb", "0"]
     if ablation:
         cmd += ["--ablation", ablation]
     proc = subprocess.Popen(cmd, stdout=open(log, "w"), stderr=subprocess.STDOUT)

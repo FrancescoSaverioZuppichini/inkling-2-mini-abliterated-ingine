@@ -173,10 +173,11 @@ void markov_step(int i, const __nv_bfloat16* rnn_w, const __nv_bfloat16* rnn_b, 
                  const std::int32_t* cand_row, const DraftParams* p, __nv_bfloat16* state, __nv_bfloat16* latent,
                  cudaStream_t stream);
 
-// Step i's candidate logits: bias = bf16(fold_b[c] + bf16(fold_w[c] . latent)),
+// Step i's candidate logits: bias = bf16(fold_b[c] + bf16(fold_w[c] . latent)), fold_w bf16 [V, 256], or INT8 rows
+// (dense int8_rows layout) with fp32 row scales fold_s (fold_w[c] . latent = fold_s[c] * (q_c . latent));
 // logit = bf16(30 tanh(bf16(cand_val + bias) / 30)) -> cand_logits fp32 [7, 1024]; picks[i] = argmax of the
 // logits (greedy) or of logits / max(T, 1e-6) - log(-log(u)) (Gumbel-max), packed (pack_argmax).
-void markov_logits(int i, const __nv_bfloat16* fold_w, const __nv_bfloat16* fold_b, const float* cand_val,
+void markov_logits(int i, const void* fold_w, const float* fold_s, const __nv_bfloat16* fold_b, const float* cand_val,
                    const std::int32_t* cand_idx, const __nv_bfloat16* latent, const DraftParams* p,
                    float* cand_logits, unsigned long long* picks, cudaStream_t stream);
 

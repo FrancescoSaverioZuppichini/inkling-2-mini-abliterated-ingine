@@ -5,11 +5,8 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 
-#include <atomic>
 #include <cstdio>
 #include <limits>
-#include <map>
-#include <mutex>
 #include <new>
 #include <stdexcept>
 #include <string>
@@ -58,58 +55,15 @@ void free_pinned(void*& ptr) noexcept {
     }
 }
 
-struct ReleaseHooks {
-    std::mutex mutex;
-    std::map<int, ReleaseHook> hooks;
-    int next_id = 0;
-};
-ReleaseHooks& release_hooks() {
-    static ReleaseHooks h;
-    return h;
-}
-std::atomic<int> g_fail_next{0};
-
-cudaError_t try_malloc(void** ptr, std::size_t bytes) {
-    for (int left = g_fail_next.load(); left > 0;)
-        if (g_fail_next.compare_exchange_weak(left, left - 1)) return cudaErrorMemoryAllocation;
-    return cudaMalloc(ptr, bytes);
-}
-
 } // namespace
-
-int add_release_hook(ReleaseHook hook) {
-    ReleaseHooks& h = release_hooks();
-    std::lock_guard<std::mutex> lock(h.mutex);
-    h.hooks.emplace(h.next_id, std::move(hook));
-    return h.next_id++;
-}
-
-void remove_release_hook(int id) {
-    ReleaseHooks& h = release_hooks();
-    std::lock_guard<std::mutex> lock(h.mutex);
-    h.hooks.erase(id);
-}
-
-void fail_next_allocations(int n) { g_fail_next = n; }
 
 DeviceBuffer::DeviceBuffer(std::size_t size_bytes) : bytes(size_bytes) {
     if (bytes == 0) { return; }
 
     void* ptr       = nullptr;
-    cudaError_t err = try_malloc(&ptr, bytes);
-    if (err == cudaErrorMemoryAllocation) {
-        cudaGetLastError();  // not sticky; clear it before retrying
-        std::vector<ReleaseHook> hooks;
-        {
-            ReleaseHooks& h = release_hooks();
-            std::lock_guard<std::mutex> lock(h.mutex);
-            for (const auto& [id, hook] : h.hooks) hooks.push_back(hook);
-        }
-        bool freed = false;
-        for (const ReleaseHook& hook : hooks) freed |= hook();
-        if (freed) err = try_malloc(&ptr, bytes);
-    }
+    const cudaError_t err = cudaMalloc(&ptr, bytes);
     if (err != cudaSuccess) {
+        cudaGetLastError();  // an out-of-memory error is not sticky: clear it so the caller can go on
         throw std::runtime_error(cuda_error_message("cudaMalloc failed", err));
     }
     p = ptr;
@@ -387,6 +341,7 @@ PinnedHostBuffer::PinnedHostBuffer(std::size_t size_bytes) {
     void* ptr             = nullptr;
     const cudaError_t err = cudaMallocHost(&ptr, size_bytes);
     if (err != cudaSuccess) {
+        cudaGetLastError();  // not sticky: clear it so the caller can go on without the buffer
         throw std::runtime_error(cuda_error_message("cudaMallocHost failed", err));
     }
 

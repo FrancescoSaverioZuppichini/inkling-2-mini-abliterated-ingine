@@ -11,6 +11,7 @@
 #include "core/host_memory.h"
 #include "core/tensor.h"
 #include "ingine/generator.h"
+#include "kernels/dense/dense.h"
 
 #include <array>
 #include <cstdint>
@@ -48,6 +49,8 @@ struct Visit {
   int pass;  // loop pass (0 outside the loop)
 };
 
+// Rows of the unembedding processed per pass when it is quantized or folded at load (bounds the BF16 staging).
+inline constexpr int UNEMBED_SLICE = 16384;
 inline constexpr int NUM_VISITS = 48;
 inline constexpr int NUM_FULL_VISITS = 8;
 inline constexpr int NUM_SLIDING_VISITS = NUM_VISITS - NUM_FULL_VISITS;
@@ -122,12 +125,17 @@ inline T* ptr(const Tensor& t) {
 
 // ----------------------------------------------------------------------------------------------- weights
 
-// A dense matrix as the decoder stores it: BF16 rows, or float8_e4m3fn rows with FP32 per-row scales
-// (`scale.data != nullptr`; value = fp8 * scale, see weights.dequant / dense fp8_rows).
+// A dense matrix as the decoder stores it: BF16 rows, or float8_e4m3fn / INT8 rows with FP32 per-row scales
+// (`scale.data != nullptr`; value = code * scale, see weights.dequant / dense fp8_rows, int8_rows).
 struct Dense {
-  Tensor w;      // [rows, cols] bf16 or fp8
+  Tensor w;      // [rows, cols] bf16, fp8 or int8 (I8: the dense int8_rows layout)
   Tensor scale;  // [rows] fp32, or empty (data == nullptr) for BF16
-  bool fp8() const { return scale.data != nullptr; }
+  bool quantized() const { return scale.data != nullptr; }
+  bool fp8() const { return w.dtype == DType::FP8_E4M3FN; }
+  bool int8() const { return w.dtype == DType::I8; }
+  kernels::dense::Format format() const {
+    return !quantized() ? kernels::dense::Format::bf16 : int8() ? kernels::dense::Format::int8 : kernels::dense::Format::fp8;
+  }
   int rows() const { return w.ne[1]; }
   int cols() const { return w.ne[0]; }
 };
@@ -195,10 +203,10 @@ struct Weights {
   Tensor embed_norm;          // fp32 [H]
   Tensor final_query;         // fp32 [1, H]
   Tensor final_norm;          // fp32 [H] (also final_norm1 = [1, H] view of the same memory)
-  Dense unembed;              // [UNPADDED_VOCAB, H] bf16, or FP8 rows + scales (dense_fp8)
+  Dense unembed;              // [UNPADDED_VOCAB, H] bf16, or FP8 / INT8 rows + scales
   Tensor message_queries;     // fp32 [12, 4, H]: q, k, v, mlp per loop layer
   std::array<ExpertFormat, LAYERS> expert_formats{};
-  bool dense_fp8 = false;     // wproj (+ views), wo and unembed are FP8 rows
+  DenseFormat dense = DenseFormat::bf16;  // wproj (+ views), wo and unembed
 
   DeviceHeap heap;                    // device memory behind the views (one packed range)
   MappedHostBuffer embed_host;        // the embedding table when it is kept in host memory
@@ -227,7 +235,7 @@ struct State {
   KvFormat kv = KvFormat::bf16;
   Tensor k_ring, v_ring;      // bf16 [40, 1024, 8, 128] (sliding visits, RING_INDEX)
   Tensor ring_pos;            // int64 [40, 1024], absolute position per slot, -1 = empty
-  Tensor k_full, v_full;      // bf16 or fp8 e4m3 [8, max_ctx, 8, 128]; int4 u8 [8, bytes] (full visits, FULL_INDEX)
+  Tensor k_full, v_full;      // bf16 or fp8 e4m3 [8, max_ctx, 8, 128]; low-bit formats: u8 [8, bytes] (full visits, FULL_INDEX)
   Tensor conv_k, conv_v;      // fp32 [48, 3, 1024] previous 3 key/value conv inputs (oldest first)
   Tensor conv_attn, conv_mlp; // fp32 [48, 3, H]
   int length = 0;             // tokens in the context (host copy; decode steps do not advance it)

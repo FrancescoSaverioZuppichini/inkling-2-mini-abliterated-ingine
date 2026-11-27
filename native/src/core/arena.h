@@ -7,7 +7,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <functional>
 #include <initializer_list>
 #include <vector>
 
@@ -45,15 +44,6 @@ public:
 private:
     void require_range(std::size_t byte_offset, std::size_t count, const char* operation) const;
 };
-
-// Device memory pressure: when the cudaMalloc of a DeviceBuffer fails, the registered release hooks free what
-// they can (the Generator drops its parked conversations; each returns whether it freed anything) and the
-// allocation is retried once. add_release_hook returns an id for remove_release_hook. fail_next_allocations(n)
-// makes the next n DeviceBuffer allocation attempts fail as out of memory (tests).
-using ReleaseHook = std::function<bool()>;
-int add_release_hook(ReleaseHook hook);
-void remove_release_hook(int id);
-void fail_next_allocations(int n);
 
 // [Agent] Long-lived buffers packed back to back in one virtual address range that is backed by physical memory 2 MiB
 // at a time (CUDA virtual memory management). One cudaMalloc per tensor rounds every allocation of 2 MiB or more up to

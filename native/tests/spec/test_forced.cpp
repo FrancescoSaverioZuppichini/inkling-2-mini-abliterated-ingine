@@ -51,7 +51,7 @@ int main() {
   model::RuntimeOptions o;
   o.model_dir = dir;
   o.max_ctx = 8192;
-  o.dense_fp8 = true;
+  o.dense = model::DenseFormat::fp8;
   o.kv = ingine::model::KvFormat::fp8;
   const int tokens = 160;
   std::vector<std::int32_t> greedy_out, out;

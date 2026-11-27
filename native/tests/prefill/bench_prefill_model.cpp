@@ -35,7 +35,7 @@ int main() {
   const std::string abl = std::string(INGINE_SOURCE_DIR) + "/../ablation/inkling-2-mini-abliterated.safetensors";
   if (std::ifstream(abl)) opt.ablation = abl;
   opt.max_ctx = 262144;
-  opt.dense_fp8 = true;
+  opt.dense = DenseFormat::fp8;
   opt.kv = KvFormat::fp8;
   Runtime rt(opt);
   const cudaStream_t s = rt.stream();

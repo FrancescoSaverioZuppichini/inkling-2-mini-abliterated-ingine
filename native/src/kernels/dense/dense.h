@@ -14,7 +14,10 @@
 
 namespace ingine::kernels::dense {
 
-// A weight matrix [rows, K]: BF16 rows (scale == nullptr) or float8_e4m3fn rows with fp32 per-row scales.
+// The row format of a weight matrix: BF16, or float8_e4m3fn / INT8 (int8_rows layout) codes with fp32 per-row scales.
+enum class Format : std::uint8_t { bf16, fp8, int8 };
+
+// A weight matrix [rows, K] in `format`; `scale` is set exactly when the format is fp8 or int8.
 struct Matrix {
   const void* w = nullptr;
   const float* scale = nullptr;
@@ -23,6 +26,7 @@ struct Matrix {
   // shortlist head reads its rows straight out of the unembedding this way instead of keeping a 216 MiB copy; each
   // row is still one contiguous run, so the loads stay coalesced and every dot product keeps its bits. proj only.
   const int* row_map = nullptr;
+  Format format = Format::bf16;
 };
 
 // proj: multi-segment GEMV. xin bf16 [3, M, H]; segments int32 device [nseg, 3] = (row_begin, row_end,
@@ -46,8 +50,14 @@ void gemv(const __nv_bfloat16* x, int M, int K, Matrix w, float* out, bool pdl, 
 // fp8_rows: bf16 [rows, K] -> float8_e4m3fn [rows, K] (q) + fp32 scale [rows] = amax / 448.
 void fp8_rows(const __nv_bfloat16* w, int rows, int K, void* q, float* scale, cudaStream_t stream);
 
-// dequant_rows: weights.dequant: out = bf16(float(q) * scale[row]) for FP8 rows [rows, K].
-void dequant_rows(const void* q, const float* scale, int rows, int K, __nv_bfloat16* out, cudaStream_t stream);
+// int8_rows: bf16 [rows, K] -> INT8 rows q (K bytes per row) + fp32 scale [rows] = amax / 127, q = rint(w / scale)
+// in [-127, 127], value = q * scale. K % 16 == 0. Codes are sign-magnitude (bit 7 = sign, bits 0-6 = |q|), and the
+// 4-byte word holding elements 0..3 of a row stores them as bytes [m0 | s2, m3 | s0, m1 | s3, m2 | s1] (m = |q|,
+// s = sign << 7), so that the GEMVs turn a pair into BF16 with 2.5 instructions (gemv.cu).
+void int8_rows(const __nv_bfloat16* w, int rows, int K, void* q, float* scale, cudaStream_t stream);
+
+// dequant_rows: weights.dequant: out = bf16(float(q) * scale[row]) for FP8 or INT8 rows [rows, K] (format f).
+void dequant_rows(const void* q, const float* scale, int rows, int K, __nv_bfloat16* out, cudaStream_t stream, Format f);
 
 // router: x bf16 [M, H]; w bf16 [128, H]; bias fp32 [128];
 // idx int32 [M, 8] (descending score), wts fp32 [M, 8] = 8 s / (sum s + 1e-20).

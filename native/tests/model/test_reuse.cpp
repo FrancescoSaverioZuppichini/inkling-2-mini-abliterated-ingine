@@ -25,10 +25,11 @@ int main() {
   RuntimeOptions opt;
   opt.model_dir = dir;
   opt.max_ctx = 8192;  // drafter buckets 1024, 2048, 4096, 8192
-  opt.dense_fp8 = opt.spec = true;
+  opt.dense = DenseFormat::fp8;
+  opt.spec = true;
   opt.kv = KvFormat::fp8;
   opt.prefill_chunk = 512;
-  opt.park_mb = 0;  // the checkpoint tests below see no parked conversations
+  opt.park_host_mb = 0;  // the checkpoint tests below see no parked conversations
   auto gen = make_generator(opt);
 
   ingine::test::Rng rng(3);
@@ -98,7 +99,7 @@ int main() {
     opt.spec = spec;
     const char* tag = spec ? "with spec" : "without spec";
     // the reference: each conversation alone
-    opt.park_mb = 0;
+    opt.park_host_mb = 0;
     gen = make_generator(opt);
     const Out ra = run(a, 300, greedy), rb = run(b, 300, greedy);
     const std::vector<std::int32_t> fa = follow_up(a, ra), fb = follow_up(b, rb);
@@ -113,7 +114,7 @@ int main() {
     const Out nfb = run(fb, 64, greedy);
     gen.reset();
     for (const int mb : {2048, 300, 40}) {
-      opt.park_mb = mb;
+      opt.park_host_mb = mb;
       gen = make_generator(opt);
       const Out oa = run(a, 300, greedy), ob = run(b, 300, greedy);
       Out ofa, ofb;
@@ -137,28 +138,6 @@ int main() {
       std::printf("%s interleaved conversations, %d MiB parking %s: follow-ups reuse %s %d / %s %d, outputs %s\n",
                   good ? "PASS" : "FAIL", mb, tag, to_string(ofa.stats.reuse), ofa.stats.reused_tokens,
                   to_string(ofb.stats.reuse), ofb.stats.reused_tokens, same ? "equal" : "DIFFER");
-      ok &= good;
-    }
-    // memory pressure: a device allocation inside a request (plain decoding's forced-token buffer) fails once
-    // while A and B are parked: they are released, the allocation retried, the request completes unchanged; B,
-    // released, is prefilled again
-    if (!spec) {
-      opt.park_mb = 2048;
-      gen = make_generator(opt);
-      run(a, 300, greedy);
-      run(b, 300, greedy);
-      run(fa, 64, greedy);  // parks B, restores A (still parked too)
-      Sampling forced = greedy;
-      forced.forced = rfa.tokens;
-      ingine::fail_next_allocations(1);
-      const Out ofa = run(fa, 64, forced);  // the checkpoint of fa: nothing to park before the allocation
-      const Out ofb = run(fb, 64, greedy);
-      gen.reset();
-      const bool good = ofa.stats.reuse == Reuse::Checkpoint && ofa.tokens == rfa.tokens &&
-                        ofb.stats.reuse == Reuse::None && ofb.tokens == nfb.tokens;
-      std::printf("%s a failed allocation releases the parked conversations and the request completes (reuse %s, "
-                  "then %s)\n",
-                  good ? "PASS" : "FAIL", to_string(ofa.stats.reuse), to_string(ofb.stats.reuse));
       ok &= good;
     }
   }

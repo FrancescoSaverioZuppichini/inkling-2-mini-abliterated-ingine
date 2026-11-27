@@ -50,7 +50,7 @@ class Drafter {
   static constexpr int CONTEXT_ROWS = 16384;           // context tokens added to it (until reset())
 
   // Loads mtp.safetensors from model_dir; `w` supplies the embedding, its norm and the unembedding (the
-  // base logits use w.unembed as stored: FP8 rows with dense_fp8). `w` must outlive the drafter.
+  // base logits use w.unembed as stored: FP8 or INT8 rows when quantized). `w` must outlive the drafter.
   // shortlist_rows: ranked rows of the shortlist head (tests use fewer to leave tokens of a small vocabulary out).
   Drafter(const std::filesystem::path& model_dir, const Weights& w, int max_ctx, cudaStream_t stream,
           int shortlist_rows = SHORTLIST_ROWS);
@@ -146,7 +146,8 @@ class Drafter {
     const __nv_bfloat16 *in_norm, *post_norm, *ctx_norm, *q_norm, *k_norm, *k_norm_ctx;
     kernels::dense::Matrix qkv, gate_up;  // FP8 rows + scales
     kernels::dense::Matrix wo, w_down;    // FP8 rows + scales: [H, 3072], [H, inter]
-    const __nv_bfloat16* wkv_ctx;         // BF16 [2048, H]: k_proj_ctx | v_proj_ctx (large commits)
+    const __nv_bfloat16* wkv_ctx;         // BF16 [2048, H]: k_proj_ctx | v_proj_ctx (large commits); null with INT8
+                                          // dense weights, whose large commits dequantize wkv_all_'s rows instead
     void *k_ctx, *v_ctx;                  // [slots, 8, 128]: BF16 (local rings), BF16 or E4M3 (the global ring)
     std::int32_t* ctx_pos;                // local layers: int32 [WINDOW]; null for the global layer
   };
@@ -181,7 +182,9 @@ class Drafter {
   MappedHostBuffer w1_host_;              // markov_w1, all rows (mapped host memory)
   __nv_bfloat16* w1_rows_ = nullptr;      // markov_w1 rows of the shortlist head's rows (device)
   void put_w1_rows(std::span<const std::int32_t> ids, int row);
-  __nv_bfloat16 *fold_w_ = nullptr, *fold_b_ = nullptr;
+  void* fold_w_ = nullptr;          // bf16 [V, 256], or INT8 rows (dense int8_rows) with --dense int8
+  float* fold_s_ = nullptr;         // fold_w_'s row scales (INT8), else null
+  __nv_bfloat16* fold_b_ = nullptr;
   kernels::dense::Matrix head_{};         // the unembedding
   // the shortlist head: rows [0, short_K_) = ranked tokens and specials (ascending ids), then context tokens
   kernels::dense::Matrix short_head_{};   // [short_K_ + CONTEXT_ROWS, H]: head_'s rows through short_map_
@@ -209,6 +212,7 @@ class Drafter {
   // commit scratch: large commits (cuBLASLt) and the small commit (dense proj over the three layers)
   __nv_bfloat16 *warm_feats_ = nullptr, *ctx_c_ = nullptr, *ctx_kv_ = nullptr, *commit_xin_ = nullptr;
   void* gemm_ws_ = nullptr;  // in the lent commit scratch
+  __nv_bfloat16* wkv_tmp_ = nullptr;  // in the lent commit scratch (INT8 dense): one layer's dequantized wkv_all_ rows
   float* commit_kv_ = nullptr;
 
   AcceptScratch accept_{};

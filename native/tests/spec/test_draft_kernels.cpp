@@ -98,6 +98,16 @@ bool check_cache(const std::vector<float>& got, const std::vector<float>& ref, b
                  double ulps = 2.0, double floor = 1e-3);
 
 // every |got - ref| within `ulps` BF16 ulps of max(|ref|, floor)
+// The values q of dense int8_rows bytes: sign-magnitude words [m0 | s2, m3 | s0, m1 | s3, m2 | s1].
+std::vector<float> int8_rows_values(const std::vector<uint8_t>& b) {
+  std::vector<float> q(b.size());
+  for (size_t w = 0; w + 3 < b.size(); w += 4) {
+    auto v = [&](int mb, int sb) { const float m = float(b[w + mb] & 127); return (b[w + sb] & 128) ? -m : m; };
+    q[w] = v(0, 1), q[w + 1] = v(2, 3), q[w + 2] = v(3, 0), q[w + 3] = v(1, 2);
+  }
+  return q;
+}
+
 bool check_close(const std::vector<float>& got, const std::vector<float>& ref, const char* what, double ulps = 2.0,
            double floor = 1e-3) {
   double worst = 0;
@@ -680,9 +690,9 @@ void test_shortlist_head(Rng& r) {
       auto x = rand_bf16(r, std::size_t(3) * M * H);
       DeviceArray<bf16> d_x(x);
       DeviceArray<float> d_a(std::size_t(M) * n), d_b(std::size_t(M) * n);
-      kdense::proj(d_x.get(), M, kdense::Matrix{d_src.get(), fp8 ? d_scale.get() : nullptr, n, d_ids.get()}, d_seg.get(),
+      kdense::proj(d_x.get(), M, kdense::Matrix{d_src.get(), fp8 ? d_scale.get() : nullptr, n, d_ids.get(), fp8 ? kdense::Format::fp8 : kdense::Format::bf16}, d_seg.get(),
                    1, d_a.get(), false, nullptr);
-      kdense::proj(d_x.get(), M, kdense::Matrix{d_copy.get(), fp8 ? d_cscale.get() : nullptr, n}, d_seg.get(), 1,
+      kdense::proj(d_x.get(), M, kdense::Matrix{d_copy.get(), fp8 ? d_cscale.get() : nullptr, n, nullptr, fp8 ? kdense::Format::fp8 : kdense::Format::bf16}, d_seg.get(), 1,
                    d_b.get(), false, nullptr);
       INGINE_TEST_CUDA(cudaDeviceSynchronize());
       const auto a = d_a.download(), b = d_b.download();
@@ -743,8 +753,17 @@ void test_markov(Rng& r) {
     expect(report("markov_pre", compare(part.data(), ref.data(), ref.size()), 1e-5), "markov_pre");
   }
 
+  // INT8 fold rows (--dense int8): int8_rows of the same fold_w
+  DeviceArray<uint8_t> d_fq(size_t(V) * kd::RANK);
+  DeviceArray<float> d_fs(V), d_logits8(size_t(kd::GAMMA) * kd::CANDIDATES);
+  DeviceArray<unsigned long long> d_picks8(kd::GAMMA);
+  kdense::int8_rows(d_fw.get(), V, kd::RANK, d_fq.get(), d_fs.get(), nullptr);
+  INGINE_TEST_CUDA(cudaDeviceSynchronize());
+  const std::vector<float> fq = int8_rows_values(d_fq.download()), fs = d_fs.download();
+
   for (const float T : {0.f, 0.7f}) {
     set_params(p.get(), anchor, 100, T, 0, 42);
+    INGINE_TEST_CUDA(cudaMemset(d_picks8.get(), 0, sizeof(unsigned long long) * kd::GAMMA));
     INGINE_TEST_CUDA(cudaMemset(d_state.get(), 0, sizeof(bf16) * (kd::GAMMA + 1) * kd::RANK));
     INGINE_TEST_CUDA(cudaMemset(d_picks.get(), 0, sizeof(unsigned long long) * kd::GAMMA));
     std::vector<float> state(kd::RANK, 0.f);
@@ -781,8 +800,8 @@ void test_markov(Rng& r) {
       std::snprintf(name, sizeof(name), "markov_step %d latent (T=%.1f)", i, T);
       check_close(got_latent, ref_latent, name, 2.0, 1e-2);
 
-      kd::markov_logits(i, d_fw.get(), d_fb.get(), d_val.get(), d_idx.get(), d_latent.get(), p.get(), d_logits.get(),
-                        d_picks.get(), nullptr);
+      kd::markov_logits(i, d_fw.get(), nullptr, d_fb.get(), d_val.get(), d_idx.get(), d_latent.get(), p.get(),
+                        d_logits.get(), d_picks.get(), nullptr);
       INGINE_TEST_CUDA(cudaDeviceSynchronize());
       const auto logits = d_logits.download();
       std::vector<float> ref_logits(kd::CANDIDATES), got_logits(kd::CANDIDATES);
@@ -797,6 +816,22 @@ void test_markov(Rng& r) {
       }
       std::snprintf(name, sizeof(name), "markov_logits %d (T=%.1f)", i, T);
       check_close(got_logits, ref_logits, name, 2.0, 1e-2);
+      kd::markov_logits(i, d_fq.get(), d_fs.get(), d_fb.get(), d_val.get(), d_idx.get(), d_latent.get(), p.get(),
+                        d_logits8.get(), d_picks8.get(), nullptr);
+      INGINE_TEST_CUDA(cudaDeviceSynchronize());
+      const auto logits8 = d_logits8.download();
+      std::vector<float> ref8(kd::CANDIDATES), got8(kd::CANDIDATES);
+      for (int k = 0; k < kd::CANDIDATES; ++k) {
+        const int c = cand_idx[size_t(i) * kd::CANDIDATES + k];
+        double dot = 0;
+        for (int e = 0; e < kd::RANK; ++e) dot += double(fq[size_t(c) * kd::RANK + e]) * got_latent[e];
+        const float bias = bfr(fbf[c] + bfr(float(dot * fs[c])));
+        const float t = bfr(cand_val[size_t(i) * kd::CANDIDATES + k] + bias);
+        ref8[k] = bfr(30.f * std::tanh(t / 30.f));
+        got8[k] = logits8[size_t(i) * kd::CANDIDATES + k];
+      }
+      std::snprintf(name, sizeof(name), "markov_logits %d int8 fold (T=%.1f)", i, T);
+      check_close(got8, ref8, name, 2.0, 1e-2);
       // the pick must be the argmax (first maximum) of the kernel's own scores
       const auto picks = d_picks.download();
       const int pick = int(0xffffffffu - uint32_t(picks[i] & 0xffffffffu));

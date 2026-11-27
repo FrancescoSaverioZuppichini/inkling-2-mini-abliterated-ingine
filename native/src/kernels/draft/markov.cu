@@ -3,6 +3,7 @@
 // the draft outputs. PDL launches (see block.cu).
 #include "kernels/draft/draft.h"
 #include "kernels/draft/draft_device.cuh"
+#include "kernels/dense/int8_rows.cuh"
 
 #include <stdexcept>
 
@@ -335,8 +336,10 @@ __global__ void __launch_bounds__(256) markov_step_kernel(int i, const __nv_bflo
   }
 }
 
-// warp per candidate
-__global__ void __launch_bounds__(256) markov_logits_kernel(int i, const __nv_bfloat16* __restrict__ fold_w,
+// warp per candidate; I8: fold_w holds INT8 rows with row scales fold_s
+template <bool I8>
+__global__ void __launch_bounds__(256) markov_logits_kernel(int i, const void* __restrict__ fold_w,
+                                                            const float* __restrict__ fold_s,
                                                             const __nv_bfloat16* __restrict__ fold_b,
                                                             const float* cand_val, const std::int32_t* cand_idx,
                                                             const __nv_bfloat16* latent, const DraftParams* p,
@@ -347,12 +350,18 @@ __global__ void __launch_bounds__(256) markov_logits_kernel(int i, const __nv_bf
   const int at = i * CANDIDATES + k;
   const int c = cand_idx[at];
   float w[8], l[8];
-  unpack8(*reinterpret_cast<const uint4*>(fold_w + size_t(c) * RANK + 8 * lane), w);
+  if constexpr (I8) {
+    const uint2 q = *reinterpret_cast<const uint2*>(static_cast<const uint8_t*>(fold_w) + size_t(c) * RANK + 8 * lane);
+    int8_word(q.x, w), int8_word(q.y, w + 4);
+  } else {
+    unpack8(*reinterpret_cast<const uint4*>(static_cast<const __nv_bfloat16*>(fold_w) + size_t(c) * RANK + 8 * lane), w);
+  }
   unpack8(*reinterpret_cast<const uint4*>(latent + 8 * lane), l);
   float acc = 0.f;
 #pragma unroll
   for (int e = 0; e < 8; ++e) acc = fmaf(w[e], l[e], acc);
   acc = warp_sum(acc);
+  if constexpr (I8) acc *= fold_s[c];
   if (lane == 0) {
     const float bias = bf_round(__fadd_rn(bf(fold_b[c]), bf_round(acc)));
     const float t = bf_round(__fadd_rn(cand_val[at], bias));
@@ -439,12 +448,16 @@ void markov_step(int i, const __nv_bfloat16* rnn_w, const __nv_bfloat16* rnn_b, 
              picks, cand_row, p, state, latent);
 }
 
-void markov_logits(int i, const __nv_bfloat16* fold_w, const __nv_bfloat16* fold_b, const float* cand_val,
+void markov_logits(int i, const void* fold_w, const float* fold_s, const __nv_bfloat16* fold_b, const float* cand_val,
                    const std::int32_t* cand_idx, const __nv_bfloat16* latent, const DraftParams* p,
                    float* cand_logits, unsigned long long* picks, cudaStream_t stream) {
   if (i < 0 || i >= GAMMA) throw std::invalid_argument("markov_logits: step out of range");
-  launch_pdl(markov_logits_kernel, dim3(CANDIDATES * 32 / 256), dim3(256), stream, i, fold_w, fold_b, cand_val,
-             cand_idx, latent, p, cand_logits, picks);
+  auto launch = [&](auto kernel) {
+    launch_pdl(kernel, dim3(CANDIDATES * 32 / 256), dim3(256), stream, i, fold_w, fold_s, fold_b, cand_val, cand_idx, latent,
+               p, cand_logits, picks);
+  };
+  if (fold_s) launch(markov_logits_kernel<true>);
+  else launch(markov_logits_kernel<false>);
 }
 
 void markov_finish(const std::int32_t* cand_idx, const float* cand_logits, const unsigned long long* picks,

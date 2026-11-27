@@ -1,6 +1,7 @@
 add_library(ingine_kernels_attn STATIC
   attn.cu
   attn_lb.cu
+  attn_lb_prefill.cu
 )
 ingine_cuda_target(ingine_kernels_attn)
 ingine_internal_includes(ingine_kernels_attn)

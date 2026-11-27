@@ -1,10 +1,10 @@
-// proj, proj_conv, head, fp8_rows: weight-streaming GEMVs for M = 1..8 tokens.
+// proj, proj_conv, head, fp8_rows, int8_rows: weight-streaming GEMVs for M = 1..8 tokens.
 //
 // Design. Decode GEMVs are pure weight streams (M <= 8 activations, K = 2304 or 3072): the goal is to keep
 // DRAM busy with the fewest instructions per weight byte. Two kernels share the epilogues:
 //
 // M = 1, `gemv_kernel` (CUDA cores):
-// * One row per lane group: a full warp per BF16 row, a half warp per FP8 row, so every lane owns exactly
+// * One row per lane group: a full warp per BF16 row, a half warp per FP8 or INT8 row, so every lane owns exactly
 //   CH = K * bytes / (16 * LANES) 16-byte chunks (BF16 K=2304: 9; FP8 K=2304: 9; K=3072: 12). Chunk i of
 //   lane l is bytes [(i * LANES + l) * 16, +16) of the row: each load instruction of a group reads one
 //   contiguous 256/512-byte span (fully coalesced).
@@ -33,8 +33,8 @@
 // Epilogues: proj rounds to BF16 (input vector per row from the device-side segment table), head applies
 // the softcap, proj_conv applies the post-attention causal conv for its channel (= row) over the call's
 // M tokens, rewrites that channel's conv state and optionally records the conv inputs (conv_hist), so
-// every op is one launch with no grid-wide dependency. M is a template parameter; FP8 rows multiply the
-// dot by the row scale.
+// every op is one launch with no grid-wide dependency. M is a template parameter; FP8 and INT8 rows multiply
+// the dot by the row scale.
 //
 // Programmatic dependent launch (pdl=True): the M = 1 kernel issues all its row's weight loads, the
 // M >= 2 kernel its first batch, before griddepcontrol.wait, so they overlap the previous kernel's tail
@@ -57,6 +57,42 @@ namespace ingine::kernels::dense {
 namespace {
 
 constexpr l2::Evict WEIGHT_L2 = l2::Evict::first;
+
+// Weight formats of a Matrix: BF16 rows, FP8 E4M3 rows + row scale, INT8 rows + row scale.
+constexpr int F_BF16 = 0, F_FP8 = 1, F_INT8 = 2;
+static_assert(int(Format::bf16) == F_BF16 && int(Format::fp8) == F_FP8 && int(Format::int8) == F_INT8);
+
+// [Agent] INT8 rows (layout in dense.h) are sign-magnitude codes placed so that one AND turns elements 0 and 1 of a
+// 4-byte word into two BF16 words with the sign at bit 15 and |q| in the low mantissa bits, and a byte rotation plus
+// the same AND does it for elements 2 and 3. Such a word is the subnormal BF16 |q| * 2^-133; one BF16x2 FMA by 2^127
+// (+ -0, which keeps the sign of zero) makes it exactly q * 2^-6: 7 significant bits fit BF16, and BF16 math keeps
+// subnormals (the sm_86 E4M3 decode in fp8x.cuh relies on the same). 2.5 instructions per pair against 5 for E4M3
+// on sm_86; the 2^6 moves into the row scale, a power of two, so every product and sum keeps its bits.
+constexpr float INT8_UNIT = 64.f;
+// elements 0, 1 (lo) and 2, 3 (hi) of an INT8 word as BF16x2, value q * 2^-6
+__device__ __forceinline__ uint32_t i8_lo_bf16x2(uint32_t b) {
+  uint32_t r;
+  asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(r) : "r"(b & 0x807f807fu), "r"(0x7f007f00u), "r"(0x80008000u));
+  return r;
+}
+__device__ __forceinline__ uint32_t i8_hi_bf16x2(uint32_t w) { return i8_lo_bf16x2(__funnelshift_l(w, w, 8)); }
+
+__device__ __forceinline__ void unpack_i8x16(const uint4& v, float* f) {
+  const uint32_t ws[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const uint32_t lo = i8_lo_bf16x2(ws[i]), hi = i8_hi_bf16x2(ws[i]);
+    f[4 * i] = __uint_as_float(lo << 16), f[4 * i + 1] = __uint_as_float(lo & 0xffff0000u);
+    f[4 * i + 2] = __uint_as_float(hi << 16), f[4 * i + 3] = __uint_as_float(hi & 0xffff0000u);
+  }
+}
+
+template <int FMT>
+__device__ __forceinline__ float row_scale(const float* w_scale, size_t row) {
+  if constexpr (FMT == F_BF16) return 1.f;
+  else if constexpr (FMT == F_FP8) return __ldg(w_scale + row);
+  else return __ldg(w_scale + row) * INT8_UNIT;
+}
 
 // ---- epilogues ----------------------------------------------------------------------------------------
 // input_of(row): input index of a row (-1: row not computed); x_of(i): that input, bf16 [M, K].
@@ -157,14 +193,14 @@ struct ConvEpi {
 
 // ---- M = 1: CUDA cores --------------------------------------------------------------------------------
 
-template <bool FP8, int K, int LANES, int BLOCK, class Epi, bool GATHER = false>
+template <int FMT, int K, int LANES, int BLOCK, class Epi, bool GATHER = false>
 __global__ void __launch_bounds__(BLOCK) gemv_kernel(const uint8_t* __restrict__ w,
                                                      const float* __restrict__ w_scale, int rows, uint32_t zero,
                                                      Epi epi, const int* __restrict__ row_map) {
-  constexpr int EPC = FP8 ? 16 : 8;  // elements per 16-byte chunk
+  constexpr int EPC = FMT != F_BF16 ? 16 : 8;  // elements per 16-byte chunk
   constexpr int CH = K / (EPC * LANES);
   static_assert(K % (EPC * LANES) == 0, "row must split evenly over the lane group");
-  constexpr size_t ROW_BYTES = size_t(K) * (FP8 ? 1 : 2);
+  constexpr size_t ROW_BYTES = size_t(K) * (FMT != F_BF16 ? 1 : 2);
 
   const int gl = threadIdx.x % LANES;
   const int row = (blockIdx.x * BLOCK + threadIdx.x) / LANES;
@@ -188,15 +224,16 @@ __global__ void __launch_bounds__(BLOCK) gemv_kernel(const uint8_t* __restrict__
   for (int i = 0; i < CH; ++i) {
     const int col = (i * LANES + gl) * EPC;
     float wf[EPC], xf[EPC];
-    if constexpr (FP8) unpack_e4m3x16(wv[i], wf);
+    if constexpr (FMT == F_FP8) unpack_e4m3x16(wv[i], wf);
+    else if constexpr (FMT == F_INT8) unpack_i8x16(wv[i], wf);
     else unpack_bf16x8(wv[i], wf);
     unpack_bf16x8(ld_act(x + col), xf);
-    if constexpr (FP8) unpack_bf16x8(ld_act(x + col + 8), xf + 8);
+    if constexpr (EPC == 16) unpack_bf16x8(ld_act(x + col + 8), xf + 8);
 #pragma unroll
     for (int j = 0; j < EPC; ++j) acc = fmaf(wf[j], xf[j], acc);
   }
 
-  float v[1] = {group_sum<LANES>(acc) * (FP8 ? __ldg(w_scale + wrow) : 1.f)};
+  float v[1] = {group_sum<LANES>(acc) * row_scale<FMT>(w_scale, wrow)};
   if constexpr (Epi::kScatter) {
     if (gl == 0) epi.store1(row, 0, v[0]);
   } else {
@@ -213,7 +250,6 @@ __device__ __forceinline__ void mma_bf16(float (&c)[4], uint32_t a0, uint32_t a1
                : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
                : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
-
 
 #ifndef MMA_U_BF16
 #define MMA_U_BF16 6
@@ -234,17 +270,17 @@ __device__ __forceinline__ void mma_bf16(float (&c)[4], uint32_t a0, uint32_t a1
 #else
 #define GEMV_MMA_BOUNDS(threads) __launch_bounds__(threads)
 #endif
-template <bool FP8, int K, int M, int SPLITK, int U, class Epi, bool GATHER = false>
+template <int FMT, int K, int M, int SPLITK, int U, class Epi, bool GATHER = false>
 __global__ void GEMV_MMA_BOUNDS(32 * SPLITK) gemv_mma_kernel(const uint8_t* __restrict__ w,
                                                               const float* __restrict__ w_scale, int rows,
                                                               uint32_t zero, Epi epi,
                                                               const int* __restrict__ row_map) {
-  constexpr int CPL = FP8 ? 16 : 8;  // columns per lane per 16-byte weight load
+  constexpr int CPL = FMT != F_BF16 ? 16 : 8;  // columns per lane per 16-byte weight load
   constexpr int SPAN = 4 * CPL;      // columns per step (4 lanes t)
   constexpr int KS = K / SPLITK;     // columns per warp
   static_assert(KS % (SPAN * U) == 0, "K slice must split into unrolled steps");
   constexpr int NJ = KS / SPAN;
-  constexpr size_t ROW_BYTES = size_t(K) * (FP8 ? 1 : 2);
+  constexpr size_t ROW_BYTES = size_t(K) * (FMT != F_BF16 ? 1 : 2);
   __shared__ float cs[SPLITK][16][8];
 
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
@@ -268,7 +304,7 @@ __global__ void GEMV_MMA_BOUNDS(32 * SPLITK) gemv_mma_kernel(const uint8_t* __re
       uint4 A[U], B[U], X[U][CPL / 8];
 #pragma unroll
       for (int u = 0; u < U; ++u) {
-        const size_t off = size_t(c0 + (jb + u) * SPAN) * (FP8 ? 1 : 2);
+        const size_t off = size_t(c0 + (jb + u) * SPAN) * (FMT != F_BF16 ? 1 : 2);
         A[u] = la ? l2::ld_stream<WEIGHT_L2>(wa + off, wpol) : make_uint4(0, 0, 0, 0);
         B[u] = lb ? l2::ld_stream<WEIGHT_L2>(wb + off, wpol) : make_uint4(0, 0, 0, 0);
       }
@@ -293,7 +329,16 @@ __global__ void GEMV_MMA_BOUNDS(32 * SPLITK) gemv_mma_kernel(const uint8_t* __re
       dep &= zero;
 #pragma unroll
       for (int u = 0; u < U; ++u) {
-        if constexpr (FP8) {
+        if constexpr (FMT == F_INT8) {
+          // as FP8 below, each word's pairs decoded with the INT8 AND / FMA
+          const uint32_t aw[4] = {A[u].x, A[u].y, A[u].z, A[u].w}, bw[4] = {B[u].x, B[u].y, B[u].z, B[u].w};
+          const uint32_t xw[8] = {X[u][0].x, X[u][0].y, X[u][0].z, X[u][0].w,
+                                  X[u][1].x, X[u][1].y, X[u][1].z, X[u][1].w};
+#pragma unroll
+          for (int s = 0; s < 4; ++s)
+            mma_bf16(c, i8_lo_bf16x2(aw[s]), i8_lo_bf16x2(bw[s]), i8_hi_bf16x2(aw[s]), i8_hi_bf16x2(bw[s]),
+                     xw[2 * s] ^ dep, xw[2 * s + 1]);
+        } else if constexpr (FMT == F_FP8) {
           // 16 columns = 4 k-steps of 4 columns (2 k-pairs) each
           const uint32_t aw[4] = {A[u].x, A[u].y, A[u].z, A[u].w}, bw[4] = {B[u].x, B[u].y, B[u].z, B[u].w};
           const uint32_t xw[8] = {X[u][0].x, X[u][0].y, X[u][0].z, X[u][0].w,
@@ -334,12 +379,12 @@ __global__ void GEMV_MMA_BOUNDS(32 * SPLITK) gemv_mma_kernel(const uint8_t* __re
     for (int k = threadIdx.x; k < 16 * M; k += 32 * SPLITK) {
       const int r = k / M, m = k % M, row = r0 + r;
       if (row < rows && epi.input_of(row) >= 0)
-        epi.store1(row, m, total(r, m) * (FP8 ? __ldg(w_scale + wrow(row)) : 1.f));
+        epi.store1(row, m, total(r, m) * row_scale<FMT>(w_scale, wrow(row)));
     }
   } else {
     const int r = threadIdx.x, row = r0 + r;
     if (r < 16 && row < rows) {
-      const float scale = FP8 ? __ldg(w_scale + wrow(row)) : 1.f;
+      const float scale = row_scale<FMT>(w_scale, wrow(row));
       float y[M];
 #pragma unroll
       for (int m = 0; m < M; ++m) y[m] = total(r, m) * scale;
@@ -350,13 +395,33 @@ __global__ void GEMV_MMA_BOUNDS(32 * SPLITK) gemv_mma_kernel(const uint8_t* __re
 
 // ---- launch helpers -----------------------------------------------------------------------------------
 
+// [Agent] INT8 rows at M = 1 decode on CUDA cores at ~4.3 instructions per weight. That hides behind the DRAM stream
+// only where the GPU issues at least one warp instruction per byte DRAM delivers (4 schedulers x SMs x clock /
+// bandwidth: ~1.3 on an RTX 4090, ~0.6 on an RTX 3090); below that the tensor-core kernel (~1.4 per weight) wins.
+bool int8_m1_tensor_cores() {
+  static const bool tc = [] {
+    int dev = 0, sms = 0, clk_khz = 0, mem_khz = 0, bus_bits = 0;
+    CUDA_CHECK(cudaGetDevice(&dev));
+    CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
+    CUDA_CHECK(cudaDeviceGetAttribute(&clk_khz, cudaDevAttrClockRate, dev));
+    CUDA_CHECK(cudaDeviceGetAttribute(&mem_khz, cudaDevAttrMemoryClockRate, dev));
+    CUDA_CHECK(cudaDeviceGetAttribute(&bus_bits, cudaDevAttrGlobalMemoryBusWidth, dev));
+    const double issue_per_s = 4.0 * sms * clk_khz * 1e3, bytes_per_s = 2.0 * mem_khz * 1e3 * bus_bits / 8;
+    return issue_per_s < bytes_per_s;
+  }();
+  return tc;
+}
+
 // BLOCK: threads per block of the M = 1 kernel (0: M = 1 runs the tensor-core kernel too, for K whose
 // whole row per lane would not fit in registers); SPLITK: warps per 16-row block of the M >= 2 kernel;
-// UFP8: steps per load batch of its FP8 instantiation.
-template <int K, int BLOCK, int SPLITK, int UFP8, template <int> class Epi, bool GATHER = false, class Make>
+// UQ: steps per load batch of its FP8 and INT8 instantiations; I8_TC: INT8 rows at M = 1 may run the tensor-core
+// kernel (int8_m1_tensor_cores).
+template <int K, int BLOCK, int SPLITK, int UQ, template <int> class Epi, bool GATHER = false, bool I8_TC = false,
+          class Make>
 void launch_gemv(const Matrix& w, int M, bool pdl, cudaStream_t stream, Make make) {
-  const bool fp8 = w.scale != nullptr;
+  const int fmt = int(w.format);
   require(w.w != nullptr && w.rows > 0, "weight matrix is empty");
+  require((w.format == Format::bf16) == (w.scale == nullptr), "FP8 and INT8 rows carry row scales, BF16 rows none");
   require(GATHER == (w.row_map != nullptr), "row_map: only proj reads mapped rows");
   const int* rm = w.row_map;
   const int rows = w.rows;
@@ -368,12 +433,17 @@ void launch_gemv(const Matrix& w, int M, bool pdl, cudaStream_t stream, Make mak
     using E = decltype(epi);
     if constexpr (MM == 1 && BLOCK > 0) {
       constexpr int B = BLOCK > 0 ? BLOCK : 32;  // (the branch is discarded for BLOCK = 0)
-      if (fp8) launch_ex(gemv_kernel<true, K, 16, B, E, GATHER>, dim3((rows * 16 + B - 1) / B), B, 0, 1, pdl, stream, wp, sc, rows, 0u, epi, rm);
-      else launch_ex(gemv_kernel<false, K, 32, B, E, GATHER>, dim3((rows * 32 + B - 1) / B), B, 0, 1, pdl, stream, wp, sc, rows, 0u, epi, rm);
+      if (fmt == F_FP8) launch_ex(gemv_kernel<F_FP8, K, 16, B, E, GATHER>, dim3((rows * 16 + B - 1) / B), B, 0, 1, pdl, stream, wp, sc, rows, 0u, epi, rm);
+      else if (fmt == F_INT8) {
+        if (I8_TC && int8_m1_tensor_cores()) launch_ex(gemv_mma_kernel<F_INT8, K, MM, SPLITK, UQ, E, GATHER>, dim3((rows + 15) / 16), 32 * SPLITK, 0, 1, pdl, stream, wp, sc, rows, 0u, epi, rm);
+        else launch_ex(gemv_kernel<F_INT8, K, 16, B, E, GATHER>, dim3((rows * 16 + B - 1) / B), B, 0, 1, pdl, stream, wp, sc, rows, 0u, epi, rm);
+      }
+      else launch_ex(gemv_kernel<F_BF16, K, 32, B, E, GATHER>, dim3((rows * 32 + B - 1) / B), B, 0, 1, pdl, stream, wp, sc, rows, 0u, epi, rm);
     } else {
       const dim3 blocks((rows + 15) / 16);
-      if (fp8) launch_ex(gemv_mma_kernel<true, K, MM, SPLITK, UFP8, E, GATHER>, blocks, 32 * SPLITK, 0, 1, pdl, stream, wp, sc, rows, 0u, epi, rm);
-      else launch_ex(gemv_mma_kernel<false, K, MM, SPLITK, MMA_U_BF16, E, GATHER>, blocks, 32 * SPLITK, 0, 1, pdl, stream, wp, sc, rows, 0u, epi, rm);
+      if (fmt == F_FP8) launch_ex(gemv_mma_kernel<F_FP8, K, MM, SPLITK, UQ, E, GATHER>, blocks, 32 * SPLITK, 0, 1, pdl, stream, wp, sc, rows, 0u, epi, rm);
+      else if (fmt == F_INT8) launch_ex(gemv_mma_kernel<F_INT8, K, MM, SPLITK, UQ, E, GATHER>, blocks, 32 * SPLITK, 0, 1, pdl, stream, wp, sc, rows, 0u, epi, rm);
+      else launch_ex(gemv_mma_kernel<F_BF16, K, MM, SPLITK, MMA_U_BF16, E, GATHER>, blocks, 32 * SPLITK, 0, 1, pdl, stream, wp, sc, rows, 0u, epi, rm);
     }
   };
   switch (M) {
@@ -426,6 +496,48 @@ __global__ void fp8_rows_kernel(const __nv_bfloat16* __restrict__ w, int rows, i
         s > 0.f ? __nv_cvt_float_to_fp8(__bfloat162float(wr[k]) / s, __NV_SATFINITE, __NV_E4M3) : 0;
 }
 
+// INT8 rows: scale = amax / 127, q = rint(w / scale), written in the word layout of dense.h. One warp per row, one
+// 4-element word per lane step.
+__global__ void int8_rows_kernel(const __nv_bfloat16* __restrict__ w, int rows, int K, uint32_t* q, float* scale) {
+  const int lane = threadIdx.x & 31;
+  const int row = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+  if (row >= rows) return;
+  const __nv_bfloat16* wr = w + size_t(row) * K;
+  float amax = 0.f;
+  for (int k = lane; k < K; k += 32) amax = fmaxf(amax, fabsf(__bfloat162float(wr[k])));
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+  const float s = amax / 127.f;
+  if (lane == 0) scale[row] = s;
+  for (int k4 = lane; k4 < K / 4; k4 += 32) {
+    uint32_t m[4], g[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const float v = s > 0.f ? rintf(__bfloat162float(wr[4 * k4 + j]) / s) : 0.f;
+      m[j] = uint32_t(fminf(fabsf(v), 127.f));
+      g[j] = v < 0.f ? 0x80u : 0u;
+    }
+    q[size_t(row) * (K / 4) + k4] = (m[0] | g[2]) | (m[3] | g[0]) << 8 | (m[1] | g[3]) << 16 | (m[2] | g[1]) << 24;
+  }
+}
+
+// bf16(q * scale[row]) of INT8 rows ((q 2^-6) (scale 2^6): the same product); one thread per 16 elements.
+__global__ void dequant_int8_rows_kernel(const uint4* __restrict__ q, const float* __restrict__ scale, int K,
+                                         long long total16, __nv_bfloat16* __restrict__ out) {
+  const long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x;
+  if (i >= total16) return;
+  const long long e = i * 16;
+  const float s = scale[e / K] * INT8_UNIT;
+  float f[16];
+  unpack_i8x16(q[i], f);
+  __align__(16) __nv_bfloat16 v[16];
+#pragma unroll
+  for (int j = 0; j < 16; ++j) v[j] = __float2bfloat16_rn(f[j] * s);
+  uint4* dst = reinterpret_cast<uint4*>(out + e);
+  dst[0] = reinterpret_cast<const uint4*>(v)[0];
+  dst[1] = reinterpret_cast<const uint4*>(v)[1];
+}
+
 // weights.dequant: bf16(float(q) * scale[row]); one thread per 16 elements (K % 16 == 0).
 __global__ void dequant_rows_kernel(const __nv_fp8_storage_t* __restrict__ q, const float* __restrict__ scale,
                                     int K, long long total16, __nv_bfloat16* __restrict__ out) {
@@ -454,8 +566,10 @@ void proj(const __nv_bfloat16* xin, int M, Matrix w, const int* segments, int ns
     constexpr int MM = decltype(mc)::value;
     return ProjEpi<MM>{xin, segments, nseg, R, out};
   };
-  if (w.row_map) launch_gemv<H, 256, PROJ_SPLITK, MMA_U_FP8, ProjEpi, true>(w, M, pdl, stream, make);
-  else launch_gemv<H, 256, PROJ_SPLITK, MMA_U_FP8, ProjEpi>(w, M, pdl, stream, make);
+  // [Agent] INT8 proj at M = 1 may run on tensor cores (int8_m1_tensor_cores: the RTX 3090 yes, the RTX 4090 no).
+  // proj_conv (2,304 rows) and head gain nothing from them on either GPU (3090: 10.4 vs 10.7, 520 vs 520 us).
+  if (w.row_map) launch_gemv<H, 256, PROJ_SPLITK, MMA_U_FP8, ProjEpi, true, true>(w, M, pdl, stream, make);
+  else launch_gemv<H, 256, PROJ_SPLITK, MMA_U_FP8, ProjEpi, false, true>(w, M, pdl, stream, make);
 }
 
 void proj_conv(const __nv_bfloat16* x, int M, Matrix w, const float* conv_w, float* conv_state, float* out,
@@ -501,10 +615,19 @@ void fp8_rows(const __nv_bfloat16* w, int rows, int K, void* q, float* scale, cu
   CUDA_CHECK(cudaGetLastError());
 }
 
-void dequant_rows(const void* q, const float* scale, int rows, int K, __nv_bfloat16* out, cudaStream_t stream) {
+void int8_rows(const __nv_bfloat16* w, int rows, int K, void* q, float* scale, cudaStream_t stream) {
+  require(rows >= 0 && K > 0 && K % 16 == 0, "int8_rows: K must be a multiple of 16");
+  if (rows > 0) int8_rows_kernel<<<(rows + 7) / 8, 256, 0, stream>>>(w, rows, K, static_cast<uint32_t*>(q), scale);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void dequant_rows(const void* q, const float* scale, int rows, int K, __nv_bfloat16* out, cudaStream_t stream, Format f) {
   require(rows >= 0 && K > 0 && K % 16 == 0, "dequant_rows: K must be a multiple of 16");
   const long long total16 = (long long)rows * K / 16;
-  if (total16 > 0)
+  if (total16 > 0 && f == Format::int8)
+    dequant_int8_rows_kernel<<<unsigned((total16 + 255) / 256), 256, 0, stream>>>(static_cast<const uint4*>(q), scale,
+                                                                                    K, total16, out);
+  else if (total16 > 0)
     dequant_rows_kernel<<<unsigned((total16 + 255) / 256), 256, 0, stream>>>(
         static_cast<const __nv_fp8_storage_t*>(q), scale, K, total16, out);
   CUDA_CHECK(cudaGetLastError());

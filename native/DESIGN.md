@@ -121,8 +121,9 @@ struct GenerateStats { int prompt_tokens = 0, reused_tokens = 0, generated_token
 struct RuntimeOptions {
   std::filesystem::path model_dir, ablation;      // empty ablation: original model
   int max_ctx = 65536; int prefill_chunk = 2048;
-  bool dense_fp8 = true, spec = false; float spec_threshold = 0.8f;
-  KvFormat kv = KvFormat::bf16;                   // full-attention caches: bf16 | fp8 | int4 (--kv-cache, --kv-fp8 = fp8)
+  bool spec = false; float spec_threshold = 0.8f;
+  DenseFormat dense = DenseFormat::bf16;          // dense weights: bf16 | fp8 | int8 (--dense; --dense-fp8 = fp8); was bool dense_fp8 = true
+  KvFormat kv = KvFormat::int8;                   // full-attention caches: int8 | bf16 | fp8 | k8v4 | int4 | fp4 (--kv-cache, --kv-fp8 = fp8); the apps default to default_kv_format(): fp8 on compute capability 8.9+, int8 below
 };
 class Generator {
  public:
@@ -214,8 +215,7 @@ Path of an image through a request:
 Precision: matrix products take BF16 operands with FP32 accumulation, the residual stream, LayerNorm, softmax
 and GELU are FP32. Against transformers in FP32, the output is about twice as close as transformers' own BF16
 model on every fixture (relative RMS error 0.3-3%, cosine 0.9995-0.99999; the tower amplifies rounding noise
-about a hundredfold over its 23 layers). Memory: the weights are resident (609 MiB, loaded before the park
-budget is measured); one encode holds about 36 KB per patch plus up to 256 MiB of attention scores (0.85 GB
+about a hundredfold over its 23 layers). Memory: the weights are resident (609 MiB); one encode holds about 36 KB per patch plus up to 256 MiB of attention scores (0.85 GB
 for 4096 tokens), released on return. Time on an RTX 5090: 3 ms up to 64 tokens, 21 ms for 576, 0.17 s for
 1849, 1.1 s for 4096 (attention is a GEMM pair per head over chunks of queries; a fused kernel would be the
 next step). `RuntimeOptions::vision` (ingine-serve: on unless `--no-vision`) loads the tower.
@@ -249,9 +249,9 @@ taken right after that prefill (target state, drafter context, last logits; one 
 max_ctx 262144) is restored and only the rest is prefilled. That is the agent-loop case: the next request
 re-renders the previous answer (canonical tool-call JSON, retokenised text), which differs from the generated
 tokens right after the previous prompt. A conversation displaced by another one is parked: its checkpoint and
-its full-attention rows [0, n) are copied aside on the device (about 18 KB per token + 220 MB, within
-`RuntimeOptions::park_mb`, least recently used evicted, all released when a device allocation fails) and
-restored when a later prompt starts with its prompt. Otherwise the state is reset. The server logs the path
+its full-attention rows [0, n) are copied into pinned host memory (one arena of `RuntimeOptions::park_host_mb`,
+default max(two conversations at max_ctx, min(RAM / 4, 32 GiB)), at most RAM / 2; an explicit size that cannot be pinned fails start-up; first fit, least recently used evicted; about 18 KB per token at
+FP8 + 220 MB) and copied back when a later prompt starts with its prompt. Otherwise the state is reset. The server logs the path
 per request (`<id>: reuse=extend|checkpoint|parked|none reused=N prefilled=M prefill=<seconds>`).
 
 Third-party CMake targets: `nlohmann_json::nlohmann_json`, `httplib::httplib`, `spdlog::spdlog`, `ingine_utf8proc`,

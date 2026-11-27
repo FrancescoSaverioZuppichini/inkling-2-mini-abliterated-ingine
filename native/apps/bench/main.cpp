@@ -139,7 +139,8 @@ int main(int argc, char** argv) {
   std::string model_dir = default_model_dir(), backend = "fast", ablation, effort = "low", forced, forced_trace;
   int max_ctx = 32768, tokens = 512, runs = 3, long_prompt = 0, forced_items = 0, forced_skip = 0, forced_free = -1;
   bool dense_fp8 = false, kv_fp8 = false, spec = false;
-  std::string kv_cache = "bf16";
+  std::string dense = "bf16";
+  std::string kv_cache;
   double spec_threshold = 0.8, temperature = 0.0;
 
   ingine::serve::ArgParser ap("ingine-bench",
@@ -151,12 +152,13 @@ int main(int argc, char** argv) {
   ap.option("--tokens", "", "", &tokens);
   ap.option("--runs", "", "", &runs);
   ap.option("--effort", "", "", &effort);
-  ap.flag("--dense-fp8", "", &dense_fp8);
+  ap.option("--dense", "{bf16,fp8,int8}", "dense projections, wo and head: bf16 (default), fp8 or int8 rows", &dense,
+            {"bf16", "fp8", "int8"});
+  ap.flag("--dense-fp8", "same as --dense fp8", &dense_fp8);
+  ap.exclusive({"--dense", "--dense-fp8"}, false);
   ap.flag("--kv-fp8", "same as --kv-cache fp8", &kv_fp8);
-  ap.option("--kv-cache", "{bf16,fp8,int4}",
-            "full-attention KV caches: bf16 (default), fp8 (half the memory), int4 (4.06 bits, rotated, lossy: 500K "
-            "positions on 24 GB)",
-            &kv_cache, {"bf16", "fp8", "int4"});
+  ap.option("--kv-cache", "{bf16,fp8,int8,k8v4,int4,fp4}", ingine::model::KV_CACHE_HELP,
+            &kv_cache, {"bf16", "fp8", "int8", "k8v4", "int4", "fp4"});
   ap.exclusive({"--kv-fp8", "--kv-cache"}, false);
   ap.flag("--spec", "DSpark speculative decoding", &spec);
   ap.option("--spec-threshold", "", "verify the leading drafts whose draft probability exceeds this (0 = always all 7)",
@@ -181,8 +183,8 @@ int main(int argc, char** argv) {
     options.model_dir = model_dir;
     options.ablation = ablation;
     options.max_ctx = max_ctx;
-    options.dense_fp8 = dense_fp8;
-    options.kv = ingine::model::kv_format_of(kv_fp8 ? "fp8" : kv_cache);
+    options.dense = ingine::model::dense_format_of(dense_fp8 ? "fp8" : dense);
+    options.kv = ingine::model::kv_cache_option(kv_fp8 ? "fp8" : kv_cache);
     options.spec = spec;
     options.spec_threshold = float(spec_threshold);
     auto gen = ingine::model::make_generator(options);

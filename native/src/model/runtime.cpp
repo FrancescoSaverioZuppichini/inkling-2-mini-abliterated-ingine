@@ -70,7 +70,7 @@ Runtime::Runtime(const RuntimeOptions& options) : options_(options) {
   // holds only what the kernels use. Values do not change.
   CUDA_CHECK(cudaDeviceSetLimit(cudaLimitStackSize, 0));
   CUDA_CHECK(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
-  weights_ = load_weights(options.model_dir, options.dense_fp8, options.embed_host, stream_);
+  weights_ = load_weights(options.model_dir, options.dense, options.embed_host, stream_);
   ablation_ = load_ablation(options.ablation);
   init();
 }

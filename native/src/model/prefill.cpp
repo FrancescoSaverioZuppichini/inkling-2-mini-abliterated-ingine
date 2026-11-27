@@ -57,39 +57,51 @@ Prefiller::Prefiller(const Weights& w, const Ablation& abl, int max_chunk, cudaS
     throw std::invalid_argument("Prefiller: max_chunk above " +
                                 std::to_string(pk::kAttnMaxTiles * pk::kAttnKeyTile - WINDOW));
   const std::size_t C = std::size_t(max_chunk);
-  auto alloc = [&](std::size_t bytes) {
-    storage_.emplace_back(bytes);
-    return storage_.back().p;
-  };
+  // [Agent] One heap, so the activations at the front form one range that idle() can lend out between runs.
+  auto alloc = [&](std::size_t bytes) { return heap_.alloc(bytes); };
   auto f32 = [&](std::size_t n) { return static_cast<float*>(alloc(n * 4)); };
   auto bf16 = [&](std::size_t n) { return static_cast<__nv_bfloat16*>(alloc(n * 2)); };
   auto i32 = [&](std::size_t n) { return static_cast<int*>(alloc(n * 4)); };
   B0_ = f32(C * H), B1_ = f32(C * H);
   for (int p = 0; p < PASSES; ++p) B2_[p] = f32(C * H), E_[p] = f32(C * H);
   hid_ = f32(C * H), part_ = f32(C * H), y_ = f32(C * H), y2_ = f32(C * H);
-  xin_ = bf16(3 * C * H), xm_ = bf16(C * H), xf_ = bf16(C * H);
-  mixf_ = f32(3 * C * H), msgs_ = f32(4 * C * H), mixm_ = f32(C * H);
+  xin_ = bf16(3 * C * H), xf_ = bf16(C * H);
+  mixf_ = f32(3 * C * H), msgs_ = f32(4 * C * H);
   proj_ = bf16(C * PROJ_ROWS_FULL);
   q_ = bf16(C * HEADS * HEAD_DIM), rel16_ = bf16(C * HEADS * D_REL), rel_ = bf16(C * HEADS * REL_EXTENT);
+  // [Agent] idle() ends here: the gathered sliding rows past ring + chunk are read (masked) without being written in
+  // a run, so they must keep the zeros below; nothing allocated before this line is read before it is written.
+  idle_bytes_ = heap_.used();
   krows_ = bf16(std::size_t(kpos_rows_) * KV_DIM), vrows_ = bf16(std::size_t(kpos_rows_) * KV_DIM);
   kpos_ = i32(kpos_rows_);
   bounds_ = static_cast<int4*>(alloc(std::size_t(kpos_rows_ / pk::kAttnKeyTile) * sizeof(int4)));
-  attn_out_ = bf16(C * HEADS * HEAD_DIM), wo_out_ = bf16(C * H);
   g16_ = bf16(C * GATE_RANK);
-  // message-gate scratch lives in buffers dead while the gates run: gin_ in rel_ (written by rel_logits after
-  // the attention-side gates, dead before the MLP-side gate), fpre_/gpre_ in down_ (written by the experts after
-  // both gates)
-  static_assert(3 * 2 * HIDDEN * 2 <= HEADS * REL_EXTENT * 2 && 2 * HIDDEN * 4 <= TOP_K * HIDDEN * 2);
   router_logits_ = f32(C * EXPERTS), wts_ = f32(C * TOP_K);
   idx_ = i32(C * TOP_K);
   counts_ = i32(EXPERTS), tiles_n_ = i32(1), pair_token_ = i32(C * TOP_K), pair_dst_ = i32(C * TOP_K);
   tiles_ = static_cast<int4*>(alloc(std::size_t(pk::moe_tiles_capacity(max_chunk)) * sizeof(int4)));
-  act_ = bf16(C * TOP_K * INTER), down_ = bf16(C * TOP_K * H), moe_sum_ = bf16(C * H);
-  gin_ = rel_;
-  fpre_ = reinterpret_cast<float*>(down_), gpre_ = fpre_ + C * H;
-  wscratch_ = w.dense_fp8 ? bf16(std::max(std::size_t(PROJ_ROWS_FULL) * H, std::size_t(H) * HEADS * HEAD_DIM)) : nullptr;
+  act_ = bf16(C * TOP_K * INTER);
+  // [Agent] Buffers packed by lifetime. A visit runs: attention-side gates -> projections -> attention -> wo -> MLP mix
+  // -> MLP gate -> experts. Each buffer below lives inside one whose data is dead for its whole span:
+  //   mixf_ (attention-side gate inputs, read by those gates only) holds attn_out_ (attention -> wo), then mixm_ (MLP
+  //     mix -> MLP gate), xm_ (-> experts) and moe_sum_ (combine -> conv), side by side;
+  //   q_ (read last by attention) holds wo_out_ (wo -> conv);
+  //   rel_ holds gin_ (gate inputs, both gates), the bias (rel_logits -> attention), the dequantized weight rows of the
+  //     projections (before rel_logits) and of wo (after attention), and down_ (expert down -> combine);
+  //   act_ (expert gate/up -> down) holds fpre_/gpre_ while a gate runs.
+  static_assert(HEADS * HEAD_DIM * 2 <= HIDDEN * 4 && 2 * HIDDEN * 2 <= HIDDEN * 4 && HIDDEN <= HEADS * HEAD_DIM);
+  static_assert(3 * 2 * HIDDEN * 2 <= HEADS * REL_EXTENT * 2 && TOP_K * HIDDEN * 2 <= HEADS * REL_EXTENT * 2 &&
+                2 * HIDDEN * 4 <= TOP_K * INTER * 2);
+  attn_out_ = reinterpret_cast<__nv_bfloat16*>(mixf_ + 2 * C * H);
+  mixm_ = mixf_;
+  xm_ = reinterpret_cast<__nv_bfloat16*>(mixf_ + C * H), moe_sum_ = xm_ + C * H;
+  wo_out_ = q_;
+  gin_ = rel_, down_ = rel_;
+  fpre_ = reinterpret_cast<float*>(act_), gpre_ = fpre_ + C * H;
+  const std::size_t wrows = std::max(std::size_t(PROJ_ROWS_FULL) * H, std::size_t(H) * HEADS * HEAD_DIM);
+  if (w.dense != DenseFormat::bf16) wscratch_ = wrows <= C * HEADS * REL_EXTENT ? rel_ : bf16(wrows);
   ids_ = static_cast<std::int64_t*>(alloc(C * 8));
-  for (auto& b : storage_) b.fill(0);  // e.g. gathered sliding rows past ring + chunk: never keys, kept finite
+  CUDA_CHECK(cudaMemset(B0_, 0, heap_.used()));  // e.g. gathered sliding rows past ring + chunk: never keys, kept finite
 
   // [Agent] Sliding attention reads a relative bias for every score, scattered over rel_ (48 KB per token). On the
   // RTX 4090 a 1024-token part (48 MB) stays in its 72 MB L2 while a 2048-token chunk spills to DRAM (L2 hit 66 %,
@@ -104,9 +116,7 @@ Prefiller::Prefiller(const Weights& w, const Ablation& abl, int max_chunk, cudaS
 Prefiller::~Prefiller() = default;
 
 std::size_t Prefiller::device_bytes() const {
-  std::size_t n = 0;
-  for (const auto& b : storage_) n += b.bytes;
-  return n;
+  return heap_.mapped();
 }
 
 const float* const* Prefiller::block_table(const std::vector<const float*>& blocks) {
@@ -154,10 +164,10 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
     p.M = T;
     dense::mix(p, false, s);
   };
-  // B rows of a Dense matrix as BF16: the matrix itself, or its FP8 rows dequantized (weights.dequant)
+  // B rows of a Dense matrix as BF16: the matrix itself, or its FP8 / INT8 rows dequantized (weights.dequant)
   auto bf16_rows = [&](const Dense& d) -> const __nv_bfloat16* {
-    if (!d.fp8()) return bf16p(d.w);
-    dense::dequant_rows(d.w.data, f32p(d.scale), d.rows(), d.cols(), wscratch_, s);
+    if (!d.quantized()) return bf16p(d.w);
+    dense::dequant_rows(d.w.data, f32p(d.scale), d.rows(), d.cols(), wscratch_, s, d.format());
     return wscratch_;
   };
   // message_gate for G gates: h_g, msg_g fp32 [T, H] -> out bf16 [G, T, H] = bf16(rms_norm(gated) * norm_w[g])
@@ -270,12 +280,12 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
     at.q = q_, at.T = T, at.pos0 = pos0, at.rel = rel_, at.proj = proj_, at.ld = R, at.out = attn_out_;
     const bool packed = layer.full && kernels::attn::low_bit(st.kv);
     if (packed) {
-      // [Agent] int4 caches: attn_prep writes the chunk's BF16 rows into the sliding-ring scratch (free during a
+      // [Agent] Low-bit caches: attn_prep writes the chunk's BF16 rows into the sliding-ring scratch (free during a
       // full visit) and pack_rows encodes them into the cache, so every key, the chunk's own included, is attended
       // from the cache exactly as decode will read it.
       ap.k_out = krows_, ap.v_out = vrows_, ap.out_fp8 = false;
       pk::attn_prep(ap, s);
-      kernels::attn::pack_rows(krows_, vrows_, T, pos0, st.k_full_at(FULL_INDEX[v]).data,
+      kernels::attn::pack_rows(st.kv, krows_, vrows_, T, pos0, st.k_full_at(FULL_INDEX[v]).data,
                                st.v_full_at(FULL_INDEX[v]).data, s);
     } else if (layer.full) {
       const int fi = FULL_INDEX[v];
@@ -309,8 +319,9 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
     if (layer.full || !split_sliding_) {
       pk::rel_logits(rel16_, f32p(layer.rel_proj), T, rel_, s);
       if (packed)
-        kernels::attn::prefill_attend({q_, rel_, proj_, R, T, pos0, st.k_full_at(FULL_INDEX[v]).data,
-                                       st.v_full_at(FULL_INDEX[v]).data, attn_out_}, s);
+        kernels::attn::prefill_attend({.q = q_, .rel = rel_, .proj = proj_, .ld = R, .T = T, .pos0 = pos0,
+                                       .k_cache = st.k_full_at(FULL_INDEX[v]).data,
+                                       .v_cache = st.v_full_at(FULL_INDEX[v]).data, .kv = st.kv, .out = attn_out_}, s);
       else
         pk::attention(at, s);
     } else {
@@ -369,7 +380,13 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
   if (tap_out)
     CUDA_CHECK(cudaMemcpy2DAsync(tap_out + std::size_t(NUM_TAPS - 1) * H, std::size_t(NUM_TAPS) * H * 2, xf_,
                                  std::size_t(H) * 2, std::size_t(H) * 2, T, cudaMemcpyDeviceToDevice, s));
-  pk::head_logits(xf_ + std::size_t(T - 1) * H, w.unembed.w.data, f32p(w.unembed.scale), UNPADDED_VOCAB, logits, s);
+  // [Agent] INT8 rows: the decode head GEMV (q . x times the row scale); head_logits reads BF16 and FP8 rows.
+  if (w.unembed.int8()) {
+    const dense::Matrix head{w.unembed.w.data, f32p(w.unembed.scale), UNPADDED_VOCAB, nullptr, dense::Format::int8};
+    dense::head(xf_ + std::size_t(T - 1) * H, 1, head, logits, false, s);
+  } else {
+    pk::head_logits(xf_ + std::size_t(T - 1) * H, w.unembed.w.data, f32p(w.unembed.scale), UNPADDED_VOCAB, logits, s);
+  }
   CUDA_CHECK(cudaGetLastError());
   st.length = pos0 + T;
 }

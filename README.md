@@ -83,22 +83,143 @@ driver holds CUDA programs at. On an RTX 5090 that raises the memory clock by 1.
 ## RTX 3090 and RTX 4090
 
 The installer targets the RTX 5090. On a 24 GB RTX 3090 (sm_86) or RTX 4090 (sm_89), build by hand with a system CUDA 13
-toolkit, CMake 3.28 or newer and GCC 12 to 16:
+toolkit, CMake 3.28 or newer and GCC 12 to 16, then start:
 
 ```bash
-cd native
-cmake --preset ampere            # sm_86 and sm_89 in one binary
-cmake --build --preset ampere
-build-ampere/apps/serve/ingine-serve --engine --model-dir <Inkling-2-Mini folder> --port 8003 \
-  --max-ctx 245760 --kv-fp8 --spec --spec-threshold 0.8 --no-vision --embed-host --prefill-chunk 2048
+cd native && cmake --preset ampere && cmake --build --preset ampere && cd ..   # sm_86 and sm_89 in one binary
+./start.sh <Inkling-2-Mini folder>      # http://127.0.0.1:8003/v1; PORT=..., MAX_CTX=... and extra flags work too
 ```
 
-That serves the original checkpoint in BF16 with 245,760 tokens of context in about 23.7 GB (RTX 3090) or 23.9 GB
-(RTX 4090). `--embed-host` keeps the embedding table (0.86 GiB) in host memory that the GPU reads over PCIe, which makes
-room for the context on 24 GB. `--prefill-chunk 2048` reads prompts 9-15 % faster than 1024; 3072 does not fit with
-this context. Other programs holding GPU memory (a desktop, another server) can push 2048 over the edge: then use 1024. Without clusters, PDL or FP4/FP8 converts these GPUs take their own
-kernel paths (exact decoders, a cooperative exchange for the router and message gates, one-wave attention); the
-`ampere-dev` preset adds the tests.
+`start.sh` reads the GPU and starts the profile for agentic coding with 512,000 tokens of context. Both 24 GB cards hold 524,288 (`MAX_CTX=524288`); the default leaves ~150 MiB of headroom, so the GPU must not drive a desktop or run other programs. Flags given after the folder win over it. On start-up the server prints what it loaded:
+
+```
+ingine-serve · inkling-2-mini · ready in 8.3 s
+  gpu       NVIDIA GeForce RTX 4090 (sm_89, 25.3 GB)
+  weights   int8 dense
+  context   512,000 tokens · KV k8v4 6.4 GB · prefill chunk 2048
+  drafter   DSpark, threshold 0.8
+  parking   16.3 GB host RAM · 2 conversations at full context
+  memory    25.0 GB of 25.3 GB in use
+  sampling  temperature 1 · top-p 1 · top-k 0
+  images    off
+  serving   http://127.0.0.1:8093/v1
+```
+
+### Profiles per GPU
+
+| GPU | weights | KV cache | context | prefill chunk | embedding table | images |
+|---|---|---|---:|---:|---|---|
+| RTX 3090 24 GB | INT8 | k8v4 | 512,000 | 2048 | host RAM | off |
+| RTX 4090 24 GB | INT8 | k8v4 | 512,000 | 2048 | host RAM | off |
+| RTX 5090 32 GB | FP8 | FP8 | 512,000 (fits on paper; untested) | 3072 | GPU | on |
+
+**Why these choices:**
+- **INT8 weights:** the same size as FP8 (1 GB less than BF16). They are as fast or faster: +2.5 % over FP8 on the 3090, equal on the 4090. They are also closer to BF16: about 20 % lower KL; next-token agreement 97–98 % for both at 32K–128K, and 97.5 % vs 95.0 % at 230K on the 4090.
+- **k8v4 KV:** 8-bit keys and 4-bit values, 6.06 bits per value. Keys go through the softmax, which amplifies their errors; values are only averaged.
+- **Prefill chunk 2048:** 3072 reads long prompts 6–10 % faster but needs 0.37 GB more, which these cards spend on context.
+- **Embedding table in host RAM:** 0.86 GiB; the GPU reads one row per token over PCIe.
+- **No images:** the image tower takes 0.6 GB plus up to 0.85 GiB while encoding.
+
+### Options
+
+`ingine-serve --help` lists them all. The ones that matter:
+
+| option | default | what it does |
+|---|---|---|
+| `--model-dir DIR` | required | the Inkling-2-Mini checkpoint |
+| `--engine` / `--fake` | required, one of them | serve the model / serve canned answers (tests) |
+| `--host`, `--port` | 127.0.0.1, 8003 | where the OpenAI-compatible API listens |
+| `--max-ctx N` | 65,536 | tokens the full-attention caches hold (`start.sh`: 512,000) |
+| `--kv-cache F` | int8 below compute capability 8.9 (3090), fp8 from 8.9 (4090, 5090) | full-attention cache format: `int8` (8.13 bits per value), `fp8` (8), `k8v4` (6.06), `fp4` (4.5), `int4` (4.06), `bf16` (exact, 16). `--kv-fp8` = `--kv-cache fp8` |
+| `--dense F` | bf16 | dense weights (projections, wo, head): `bf16` (the checkpoint), `int8` or `fp8` (one byte plus a scale per row, quantized at load, about 1 GB less). `--dense-fp8` = `--dense fp8` |
+| `--spec`, `--spec-threshold X` | off, 0.8 | DSpark speculative decoding: a drafter proposes up to 7 tokens and the model checks them all, so the output does not change |
+| `--prefill-chunk N` | 3072 | prompt tokens per prefill step; each 1,024 tokens of chunk need about 0.37 GB |
+| `--embed-host` | off | keep the embedding table (0.86 GiB) in pinned host RAM |
+| `--no-vision` | images on | do not load the image tower (0.6 GB) and reject image requests |
+| `--park-host-mb N` | auto | pinned host RAM for conversations displaced by another one; switching back restores them instead of re-reading the prompt. Auto: max(two conversations at `--max-ctx`, min(RAM / 4, 32 GiB)), at most RAM / 2. 0 turns it off |
+| `--temperature`, `--top-p`, `--top-k` | from `generation_config.json` | sampling for requests that set none |
+| `--image-max-tokens`, `--max-images`, `--max-image-tokens` | 4096, 16, 32768 | image limits per image and per request |
+| `--max-queue N` | 4 | requests that may wait behind the running one |
+| `--max-model-len N` | `--max-ctx` | the context limit the API reports and enforces |
+| `--ablation FILE` | none | the abliteration direction file (`inkling-2-mini-abliterated`) |
+| `--log-level L` | INFO | DEBUG, INFO, WARNING or ERROR |
+
+### Speed and context on 24 GB
+
+Measured with **[llm-serving-bench v3.3](https://huggingface.co/datasets/Francesco/llm-serving-bench)**:
+- **What it is:** Spec-Bench, HumanEval, SWE-agent sessions and a LongBench v2 code repository, run against the OpenAI API.
+- **How it runs:** one request at a time, greedy decoding.
+- **Engines:** each one serves its best setup on a 24 GB card at the same 245,760-token context (vLLM holds only 129,280 on the 4090), plus ingine at 512,000. Every engine runs its drafter: ingine and vLLM run DSpark, and strata's own tuner turns its drafter off on the 3090 (it measured 1.06×). strata ran on the 3090 only.
+
+**RTX 3090 · 300 W** (tokens/s unless marked)
+
+| | ingine INT8 + k8v4 · 245K | ingine BF16 · 245K | vLLM · 245K | strata · 245K | ingine INT8 + k8v4 · 512K |
+|---|---:|---:|---:|---:|---:|
+| **decode, all short + code** | **223.0** | 189.5 | 157.6 | 82.5 | 221.2 |
+| decode, chat (MT-Bench) | **185.6** | 153.8 | 118.0 | 82.8 | 184.7 |
+| decode, code (HumanEval) | **239.8** | 210.6 | 183.2 | 81.3 | 237.9 |
+| decode, coding agent | **272.5** | 234.8 | 209.8 | 78.4 | 271.9 |
+| agent follow-up, time to first token | 0.20 s | 0.20 s | 0.23 s | 0.57 s | 0.20 s |
+| prefill 4K / 32K | 5,208 / 4,890 | 5,213 / 4,899 | 4,571 / 4,102 | 1,815 / 1,706 | 5,190 / 4,863 |
+| prefill 224K | **3,070** | 3,026 | 1,676 | 783 | 3,044 |
+| time to read the 224K prompt | **73.9 s** | 74.9 s | 135.3 s | 289.7 s | 74.5 s |
+| decode at 32K / 224K depth | **216.9 / 160.4** | 188.1 / 115.1 | 161.5 / 89.6 | 72.3 / 5.2 | 216.1 / 160.2 |
+| 512K prompt | | does not fit | does not fit | not run | **2,012 prefill · 102.8 decode** |
+
+**RTX 4090 · 400 W**
+
+| | ingine INT8 + k8v4 · 245K | ingine BF16 · 245K | vLLM · 129K (its maximum) | ingine INT8 + k8v4 · 512K |
+|---|---:|---:|---:|---:|
+| **decode, all short + code** | **289.2** | 228.8 | 209.3 | 289.1 |
+| decode, chat (MT-Bench) | **233.6** | 184.3 | 160.1 | 233.4 |
+| decode, code (HumanEval) | **325.3** | 244.8 | 231.9 | 325.2 |
+| decode, coding agent | **337.1** | 283.1 | 309.2 | 337.2 |
+| agent follow-up, time to first token | 0.094 s | 0.096 s | 0.115 s | 0.094 s |
+| prefill 4K / 32K | 10,973 / 10,769 | 11,056 / 11,081 | 9,949 / 9,563 | 11,014 / 10,768 |
+| prefill 224K | 7,283 | **7,661** | does not fit | 7,281 |
+| time to read the 224K prompt | 31.1 s | **29.6 s** | does not fit | 31.1 s |
+| decode at 32K / 224K depth | **281.0 / 224.2** | 218.2 / 161.8 | 218.1 / does not fit | 281.0 / 224.2 |
+| 512K prompt | | does not fit | does not fit | **4,976 prefill · 127.1 decode** |
+
+**The setups:**
+
+| | weights | KV cache | drafter | version |
+|---|---|---|---|---|
+| ingine INT8 + k8v4 (`start.sh`) | NVFP4 experts as shipped; INT8 dense (qkv, `wo`, heads) | k8v4: 8-bit keys, 4-bit values | DSpark, threshold 0.8 | this PR (the 3090 rows ran on `3bfecfa`; the GEMM pin changes nothing there) |
+| ingine BF16 | NVFP4 experts; BF16 dense, the checkpoint as shipped | int8 (3090) / FP8 (4090), each GPU's default | DSpark, threshold 0.8 | this PR (the 3090 rows ran on `3bfecfa`; the GEMM pin changes nothing there) |
+| vLLM | NVFP4 experts; int8 qkv, LM head, Markov head and drafter; BF16 rest | FP8 on the 3090; BF16 on the 4090 (the recipe enables FP8 KV only on sm_86 and sm_120), so 129,280 tokens there | DSpark, 7 tokens | `vllm/vllm-openai` nightly `7cb5dae22` + [inkling2-mini-3090-recipe](https://github.com/lulakien/inkling2-mini-3090-recipe) `9f246b3`, the only vLLM setup for Inkling on Ampere/Ada |
+| strata | SQ-20 (strata's own quant) | FP16, its default for Inkling: 77K tokens fit on the GPU, the rest of the 245,760 sits in host RAM | off (strata's tuner: 1.06× is below its 1.10× bar) | strata 0.2.22, Inkling engine 0.1.69 |
+
+**How to read the tables:**
+- **Runs:** windows up to 32K are the mean of 3 runs (prefill spread under 2 %). 224K and 512K are one run each.
+- **Decode at depth** moves between runs: the answer text changes the drafter's acceptance.
+- **Context:** the context limit itself costs ingine no speed. 245K and 512K give the same numbers.
+- **strata at 224K:** only 77K tokens of its KV fit on the GPU; the rest is read from host RAM over PCIe, so it decodes at 5.2 tokens/s there.
+
+**Closeness to the exact model.** We first run the BF16 checkpoint with a BF16 KV cache (no compression anywhere) on 4 long real prompts: code and prose, at 32K and 128K tokens. It writes 64 greedy tokens per prompt. Each profile then reads the same prompts and is fed those exact tokens (teacher forcing). At every position we compare its next-token distribution with the exact one:
+- **KL(exact ‖ profile):** computed over the full vocabulary in double precision;
+- **top-1:** whether both pick the same next token.
+
+| GPU | profile | positions | mean KL | top-1 agreement |
+|---|---|---:|---:|---:|
+| RTX 3090 | ingine INT8 + k8v4 (`start.sh`) | 250 | 0.0068 | 96.4 % |
+| RTX 3090 | ingine BF16 + int8 KV (default) | 250 | 0.0040 | 98.0 % |
+| RTX 4090 | ingine INT8 + k8v4 (`start.sh`) | 250 | 0.0074 | 96.8 % |
+| RTX 4090 | ingine BF16 + FP8 KV (default) | 250 | 0.0040 | 97.2 % |
+
+The default path (BF16, no new flags) also passes the repo's golden test unchanged: 330 stages, top-1 0.979, the same KL as `main`.
+
+**Switching conversations:** a conversation displaced by another one is parked in host RAM. Coming back to a 229K-token conversation then takes **0.99 s** to the first token on the 3090 instead of 76.0 s, and **0.86 s** on the 4090 instead of 31.4 s. It comes back bit for bit.
+
+**More context:** `--kv-cache int4` (4.06 bits per value) holds 786,432 tokens on the 3090 and 770,048 on the 4090, with INT8 weights.
+
+These GPUs have no thread-block clusters and no FP4 convert, and the 3090 has no FP8 convert either, so they take their own kernel paths:
+- exact decoders;
+- a cooperative exchange for the router and message gates;
+- one-wave attention;
+- a low-bit KV reader.
+
+The `ampere-dev` preset adds the tests.
 
 ## Use
 
@@ -125,7 +246,7 @@ Settings come from the profile in [runtime-manifest.json](runtime-manifest.json)
 | `INGINE_ABLATION` | `$INGINE_MODEL_DIR/inkling-2-mini-abliterated.safetensors` | abliteration file; a relative path is taken relative to the install folder; empty serves the original model (model id `inkling-2-mini`) |
 | `INGINE_CTX` | 262144 | context length; lower it to leave GPU memory to other programs |
 | `HOST`, `PORT` | 127.0.0.1, 8003 | bind address and port |
-| `INGINE_EXTRA_ARGS` | empty | further server arguments, e.g. `--top-p 0.95` (sampling for requests that set none, also `--temperature`, `--top-k`), `--park-mb 0` (see below), `--spec-threshold 0.9` |
+| `INGINE_EXTRA_ARGS` | empty | further server arguments, e.g. `--top-p 0.95` (sampling for requests that set none, also `--temperature`, `--top-k`), `--park-host-mb 0` (see below), `--spec-threshold 0.9` |
 | `INGINE_START_TIMEOUT` | 300 | seconds `ingine start` waits for the server to report ready |
 
 ```bash
@@ -145,8 +266,8 @@ authentication**: keep the server on loopback. Requests run one at a time; up to
 further ones get HTTP 503. `GET /health` and `GET /v1/models` report the state.
 
 A follow-up request only reads what is new in its conversation. Conversations that take turns (subagents, a
-second client) are kept warm in spare GPU memory, by default up to 3 GiB and never the last 4 GiB that are free
-after start-up (`--park-mb N` sets the budget in MiB, `0` turns it off); they are dropped when memory runs short.
+second client) are kept warm in pinned host RAM, sized automatically (see `--park-host-mb` above)
+(`--park-host-mb N` sets it in MiB, `0` turns it off); the least recently used is dropped when it is full.
 
 `POST /v1/chat/completions` takes:
 
