@@ -124,6 +124,12 @@ class Drafter {
 
   int vocab() const { return V_; }
 
+  // Scratch of large commits (prompt chunks): commit_scratch_bytes() of device memory the caller lends, live only
+  // while a commit of more than BLOCK rows runs (ordered on the drafter's stream). Without it the drafter allocates
+  // its own at the first large commit.
+  std::size_t commit_scratch_bytes() const;
+  void lend_commit_scratch(void* p);
+
   // Device scratch of the acceptance step (engine._accept), owned here so it is allocated once.
   struct AcceptScratch {
     std::int32_t* target;                    // int32 [8]: argmax of the verify rows

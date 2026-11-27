@@ -22,6 +22,11 @@ class Bf16Gemm {
 
   void run(const __nv_bfloat16* a, int n, const __nv_bfloat16* w, int N, int K, __nv_bfloat16* c,
            cudaStream_t stream);
+  // [Agent] The workspace is allocated at the first run unless the owner lends one of workspace_bytes() (memory that
+  // is free while this GEMM runs). Its size, not its address, steers cuBLASLt's algorithm choice, so results do not
+  // depend on where it lives.
+  void lend_workspace(void* p);
+  std::size_t workspace_bytes() const { return workspace_bytes_; }
 
  private:
   struct Plan {
@@ -33,6 +38,7 @@ class Bf16Gemm {
 
   cublasLtHandle_t handle_ = nullptr;
   void* workspace_ = nullptr;
+  bool owns_workspace_ = false;
   std::size_t workspace_bytes_ = 0;
   std::map<std::tuple<int, int, int>, Plan> plans_;
 };

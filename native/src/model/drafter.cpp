@@ -96,8 +96,6 @@ Drafter::Drafter(const std::filesystem::path& model_dir, const Weights& w, int m
   qstats_ = f32s(2 * GAMMA);
   tokens_ = i32s(GAMMA);
   warm_feats_ = bf16s(std::size_t(BLOCK) * 4 * H);
-  ctx_c_ = bf16s(std::size_t(COMMIT_PIECE) * H);
-  ctx_kv_ = bf16s(std::size_t(COMMIT_PIECE) * 2 * kd::KV_DIM);
   commit_xin_ = bf16s(std::size_t(3) * BLOCK * H);
   commit_kv_ = f32s(std::size_t(BLOCK) * 3 * 2 * kd::KV_DIM);
   CUDA_CHECK(cudaMemsetAsync(warm_feats_, 0, std::size_t(BLOCK) * 4 * H * 2, stream_));
@@ -439,7 +437,22 @@ void Drafter::restore_checkpoint(const void* src) {
   if (!prefix) note_tokens(checkpoint_extra_);
 }
 
+namespace {
+constexpr std::size_t CTX_C_BYTES = std::size_t(COMMIT_PIECE) * H * 2;
+constexpr std::size_t CTX_KV_BYTES = std::size_t(COMMIT_PIECE) * 2 * kd::KV_DIM * 2;
+}
+
+std::size_t Drafter::commit_scratch_bytes() const { return CTX_C_BYTES + CTX_KV_BYTES + gemm_.workspace_bytes(); }
+
+void Drafter::lend_commit_scratch(void* p) {
+  auto* b = static_cast<std::byte*>(p);
+  ctx_c_ = reinterpret_cast<__nv_bfloat16*>(b);
+  ctx_kv_ = reinterpret_cast<__nv_bfloat16*>(b + CTX_C_BYTES);
+  gemm_.lend_workspace(b + CTX_C_BYTES + CTX_KV_BYTES);
+}
+
 void Drafter::run_commit(const __nv_bfloat16* feats, int n, int row0, bool last_piece) {
+  if (ctx_c_ == nullptr) lend_commit_scratch(alloc(commit_scratch_bytes()));  // no owner lent memory (tests)
   for (int l = 0; l < 3; ++l) {
     const DraftLayer& L = layers_[l];
     kd::mix_rmsnorm(feats, n, alpha_ + 4 * l, L.ctx_norm, ctx_c_, stream_);

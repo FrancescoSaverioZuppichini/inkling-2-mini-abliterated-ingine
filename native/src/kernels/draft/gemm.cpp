@@ -17,7 +17,12 @@ void lt_check(cublasStatus_t s, const char* what) {
 
 Bf16Gemm::Bf16Gemm(std::size_t workspace_bytes) : workspace_bytes_(workspace_bytes) {
   lt_check(cublasLtCreate(&handle_), "create");
-  CUDA_CHECK(cudaMalloc(&workspace_, workspace_bytes_));
+}
+
+void Bf16Gemm::lend_workspace(void* p) {
+  if (owns_workspace_) CUDA_CHECK(cudaFree(workspace_));
+  workspace_ = p;
+  owns_workspace_ = false;
 }
 
 Bf16Gemm::~Bf16Gemm() {
@@ -27,7 +32,7 @@ Bf16Gemm::~Bf16Gemm() {
     cublasLtMatrixLayoutDestroy(p.c);
     cublasLtMatmulDescDestroy(p.op);
   }
-  if (workspace_ != nullptr) cudaFree(workspace_);
+  if (owns_workspace_) cudaFree(workspace_);
   if (handle_ != nullptr) cublasLtDestroy(handle_);
 }
 
@@ -68,6 +73,10 @@ Bf16Gemm::Plan& Bf16Gemm::plan(int n, int N, int K) {
 void Bf16Gemm::run(const __nv_bfloat16* a, int n, const __nv_bfloat16* w, int N, int K, __nv_bfloat16* c,
                    cudaStream_t stream) {
   if (n <= 0) return;
+  if (workspace_ == nullptr) {
+    CUDA_CHECK(cudaMalloc(&workspace_, workspace_bytes_));
+    owns_workspace_ = true;
+  }
   Plan& p = plan(n, N, K);
   const float alpha = 1.f, beta = 0.f;
   lt_check(cublasLtMatmul(handle_, p.op, &alpha, w, p.a, a, p.b, &beta, c, p.c, c, p.c, &p.algo, workspace_,
