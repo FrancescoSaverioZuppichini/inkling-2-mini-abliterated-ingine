@@ -90,13 +90,26 @@ class EngineGenerator final : public Generator {
     }
     if (options.vision) vision_ = std::make_unique<VisionEncoder>(options.model_dir, rt_.stream());
     CUDA_CHECK(cudaStreamSynchronize(rt_.stream()));
+    // [Agent] Pinned memory cannot be swapped or used as page cache, so the default is not all of RAM: room for two
+    // conversations at --max-ctx, at least a quarter of RAM (at most 32 GiB), never more than half. An explicit size
+    // that the machine cannot pin fails the start-up; one too small for a full-length conversation is reported.
     const std::size_t ram = std::size_t(sysconf(_SC_PHYS_PAGES)) * std::size_t(sysconf(_SC_PAGE_SIZE));
-    const std::size_t park = options.park_host_mb < 0 ? std::min<std::size_t>(ram / 4, std::size_t(32) << 30)
-                                                      : std::size_t(options.park_host_mb) << 20;
-    try {  // parking is best-effort: without the pinned memory the server runs without it
-      if (park > 0) park_arena_.emplace(park);
-    } catch (const std::exception& e) {
-      std::fprintf(stderr, "conversation parking disabled: %s\n", e.what());
+    const std::size_t one = park_layout(options.max_ctx).bytes;
+    const std::size_t park = options.park_host_mb >= 0 ? std::size_t(options.park_host_mb) << 20
+        : std::min(std::max(2 * one, std::min<std::size_t>(ram / 4, std::size_t(32) << 30)), ram / 2);
+    if (park > 0) {
+      try {
+        park_arena_.emplace(park);
+      } catch (const std::exception& e) {
+        if (options.park_host_mb >= 0)
+          throw std::runtime_error("--park-host-mb " + std::to_string(options.park_host_mb) + ": " + e.what());
+        std::fprintf(stderr, "conversation parking disabled: %s\n", e.what());
+      }
+    }
+    if (park_arena_ && park < one) {
+      const std::size_t base = park_layout(1).bytes, per_token = (one - base) / std::max(options.max_ctx - 1, 1);
+      std::fprintf(stderr, "conversation parking: %zu MiB holds conversations up to ~%zu tokens (of --max-ctx %d)\n",
+                   park >> 20, park > base ? (park - base) / per_token : 0, options.max_ctx);
     }
   }
 
