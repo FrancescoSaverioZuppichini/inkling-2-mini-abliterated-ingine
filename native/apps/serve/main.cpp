@@ -13,6 +13,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cerrno>
 #include <csignal>
 #include <exception>
@@ -148,6 +149,7 @@ int main(int argc, char** argv) {
   std::signal(SIGPIPE, SIG_IGN);
 
   try {
+    const auto t_start = std::chrono::steady_clock::now();
     const ingine::text::ChatFormat fmt = ingine::text::ChatFormat::load(model_dir);
     std::unique_ptr<ingine::model::Generator> generator;
     if (fake) {
@@ -188,8 +190,6 @@ int main(int argc, char** argv) {
     server_options.images.limits.max_tokens = image_max_tokens;
     server_options.images.max_images = max_images;
     server_options.images.max_total_tokens = max_image_tokens;
-    log.info("default sampling: temperature {} top_p {} top_k {}", server_options.sampling.temperature,
-             server_options.sampling.top_p, server_options.sampling.top_k);
     ingine::serve::ChatServer server(*generator, fmt, server_options);
     if (!server.bind(host, port)) {
       log.critical("cannot bind {}:{}", host, port);
@@ -199,11 +199,18 @@ int main(int argc, char** argv) {
     if (::pipe(g_stop_pipe) != 0) throw std::runtime_error("pipe() failed");
     std::signal(SIGINT, handle_signal);
     std::signal(SIGTERM, handle_signal);
-    log.info("image input: {}", !no_vision && generator->supports_images()
-                                    ? fmt::format("on (at most {} tokens per image, {} images and {} image tokens per request)",
+    // [Agent] One aligned block once the server is ready: what was loaded and how it serves, nothing per kernel.
+    const double ready = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
+    auto rows = generator->summary();
+    rows.emplace_back("sampling", fmt::format("temperature {} · top-p {} · top-k {}", server_options.sampling.temperature,
+                                              server_options.sampling.top_p, server_options.sampling.top_k));
+    rows.emplace_back("images", !no_vision && generator->supports_images()
+                                    ? fmt::format("up to {} tokens per image, {} images and {} image tokens per request",
                                                   image_max_tokens, max_images, max_image_tokens)
                                     : std::string("off"));
-    log.info("serving {} on http://{}:{}/v1", server.model_id(), host, server.port());
+    rows.emplace_back("serving", fmt::format("http://{}:{}/v1", host, server.port()));
+    log.info("ingine-serve · {} · ready in {:.1f} s", server.model_id(), ready);
+    for (const auto& [name, value] : rows) log.info("  {:<9} {}", name, value);
     bool listened = true;
     std::thread listener([&] {
       listened = server.listen();

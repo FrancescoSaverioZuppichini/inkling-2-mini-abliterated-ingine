@@ -57,6 +57,29 @@ class EngineGenerator final : public Generator {
 
   int max_model_len() const override { return options_.max_ctx; }
 
+  std::vector<std::pair<std::string, std::string>> summary() const override {
+    int dev = 0;
+    cudaDeviceProp p{};
+    std::size_t free = 0, total = 0;
+    CUDA_CHECK(cudaGetDevice(&dev));
+    CUDA_CHECK(cudaGetDeviceProperties(&p, dev));
+    CUDA_CHECK(cudaMemGetInfo(&free, &total));
+    static constexpr const char* kDense[] = {"bf16", "fp8", "int8"};
+    static constexpr const char* kKv[] = {"bf16", "fp8", "int4", "int8", "k8v4", "fp4"};
+    const std::size_t one = park_layout(options_.max_ctx).bytes;
+    return {
+        {"gpu", std::string(p.name) + " (sm_" + std::to_string(p.major * 10 + p.minor) + ", " + gb(total) + ")"},
+        {"weights", std::string(kDense[int(options_.dense)]) + " dense"},
+        {"context", thousands(options_.max_ctx) + " tokens · KV " + kKv[int(options_.kv)] + " " +
+                        gb(rt_.full_rows_bytes(options_.max_ctx)) + " · prefill chunk " + std::to_string(options_.prefill_chunk)},
+        {"drafter", drafter_ ? "DSpark, threshold " + trimmed(options_.spec_threshold) : "off"},
+        {"parking", park_arena_ ? gb(park_arena_->size()) + " host RAM · " + std::to_string(park_arena_->size() / one) +
+                                      " conversations at full context"
+                                : "off"},
+        {"memory", gb(total - free) + " of " + gb(total) + " in use"},
+    };
+  }
+
   bool supports_images() const override { return vision_ != nullptr; }
 
  private:
@@ -505,6 +528,21 @@ class EngineGenerator final : public Generator {
   }
 
   static std::size_t carved(std::size_t bytes) { return (bytes + 255) / 256 * 256; }
+  static std::string gb(std::size_t bytes) {
+    char s[32];
+    std::snprintf(s, sizeof s, "%.1f GB", double(bytes) / 1e9);
+    return s;
+  }
+  static std::string thousands(long long n) {
+    std::string s = std::to_string(n);
+    for (int i = int(s.size()) - 3; i > 0; i -= 3) s.insert(std::size_t(i), ",");
+    return s;
+  }
+  static std::string trimmed(float x) {
+    char s[16];
+    std::snprintf(s, sizeof s, "%g", double(x));
+    return s;
+  }
 
   // engine._sample with a host synchronisation (the speculative loop's first anchor): argmax at
   // temperature <= 0, else one draw from engine._probs.

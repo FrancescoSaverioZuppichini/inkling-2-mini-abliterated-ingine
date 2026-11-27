@@ -10,6 +10,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace ingine::model {
@@ -154,6 +155,9 @@ class Generator {
     return generate(prompt.ids, max_new_tokens, sampling, stop_ids, on_tokens);
   }
   virtual bool supports_images() const { return false; }
+  // What was loaded, one "name value" row per line (GPU, weights, context, drafter, parking, memory), for the
+  // start-up log; empty for generators without a model.
+  virtual std::vector<std::pair<std::string, std::string>> summary() const { return {}; }
 };
 
 std::unique_ptr<Generator> make_generator(const RuntimeOptions& options);  // the model (ingine_model)
