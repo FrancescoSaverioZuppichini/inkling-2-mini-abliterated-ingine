@@ -215,8 +215,7 @@ Path of an image through a request:
 Precision: matrix products take BF16 operands with FP32 accumulation, the residual stream, LayerNorm, softmax
 and GELU are FP32. Against transformers in FP32, the output is about twice as close as transformers' own BF16
 model on every fixture (relative RMS error 0.3-3%, cosine 0.9995-0.99999; the tower amplifies rounding noise
-about a hundredfold over its 23 layers). Memory: the weights are resident (609 MiB, loaded before the park
-budget is measured); one encode holds about 36 KB per patch plus up to 256 MiB of attention scores (0.85 GB
+about a hundredfold over its 23 layers). Memory: the weights are resident (609 MiB); one encode holds about 36 KB per patch plus up to 256 MiB of attention scores (0.85 GB
 for 4096 tokens), released on return. Time on an RTX 5090: 3 ms up to 64 tokens, 21 ms for 576, 0.17 s for
 1849, 1.1 s for 4096 (attention is a GEMM pair per head over chunks of queries; a fused kernel would be the
 next step). `RuntimeOptions::vision` (ingine-serve: on unless `--no-vision`) loads the tower.
@@ -251,7 +250,7 @@ max_ctx 262144) is restored and only the rest is prefilled. That is the agent-lo
 re-renders the previous answer (canonical tool-call JSON, retokenised text), which differs from the generated
 tokens right after the previous prompt. A conversation displaced by another one is parked: its checkpoint and
 its full-attention rows [0, n) are copied into pinned host memory (one arena of `RuntimeOptions::park_host_mb`,
-default room for two conversations at max_ctx, at least a quarter of RAM up to 32 GiB, never over half; an explicit size that cannot be pinned fails start-up; first fit, least recently used evicted; about 18 KB per token at
+default max(two conversations at max_ctx, min(RAM / 4, 32 GiB)), at most RAM / 2; an explicit size that cannot be pinned fails start-up; first fit, least recently used evicted; about 18 KB per token at
 FP8 + 220 MB) and copied back when a later prompt starts with its prompt. Otherwise the state is reset. The server logs the path
 per request (`<id>: reuse=extend|checkpoint|parked|none reused=N prefilled=M prefill=<seconds>`).
 

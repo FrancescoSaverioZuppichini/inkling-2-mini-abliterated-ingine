@@ -64,18 +64,13 @@ class EngineGenerator final : public Generator {
     CUDA_CHECK(cudaGetDevice(&dev));
     CUDA_CHECK(cudaGetDeviceProperties(&p, dev));
     CUDA_CHECK(cudaMemGetInfo(&free, &total));
-    static constexpr const char* kDense[] = {"bf16", "fp8", "int8"};
-    static constexpr const char* kKv[] = {"bf16", "fp8", "int4", "int8", "k8v4", "fp4"};
-    const std::size_t one = park_layout(options_.max_ctx).bytes;
     return {
         {"gpu", std::string(p.name) + " (sm_" + std::to_string(p.major * 10 + p.minor) + ", " + gb(total) + ")"},
-        {"weights", std::string(kDense[int(options_.dense)]) + " dense"},
-        {"context", thousands(options_.max_ctx) + " tokens · KV " + kKv[int(options_.kv)] + " " +
+        {"weights", std::string(to_string(options_.dense)) + " dense"},
+        {"context", thousands(options_.max_ctx) + " tokens · KV " + to_string(options_.kv) + " " +
                         gb(rt_.full_rows_bytes(options_.max_ctx)) + " · prefill chunk " + std::to_string(options_.prefill_chunk)},
         {"drafter", drafter_ ? "DSpark, threshold " + trimmed(options_.spec_threshold) : "off"},
-        {"parking", park_arena_ ? gb(park_arena_->size()) + " host RAM · " + std::to_string(park_arena_->size() / one) +
-                                      " conversations at full context"
-                                : "off"},
+        {"parking", park_arena_ ? gb(park_arena_->size()) + " host RAM · " + parked_capacity() : "off"},
         {"memory", gb(total - free) + " of " + gb(total) + " in use"},
     };
   }
@@ -113,10 +108,11 @@ class EngineGenerator final : public Generator {
     }
     if (options.vision) vision_ = std::make_unique<VisionEncoder>(options.model_dir, rt_.stream());
     CUDA_CHECK(cudaStreamSynchronize(rt_.stream()));
-    // [Agent] Pinned memory cannot be swapped or used as page cache, so the default is not all of RAM: room for two
-    // conversations at --max-ctx, at least a quarter of RAM (at most 32 GiB), never more than half. An explicit size
-    // that the machine cannot pin fails the start-up; one too small for a full-length conversation is reported.
-    const std::size_t ram = std::size_t(sysconf(_SC_PHYS_PAGES)) * std::size_t(sysconf(_SC_PAGE_SIZE));
+    // [Agent] Pinned memory cannot be swapped or used as page cache, so the default is not all of RAM:
+    // max(two conversations at max_ctx, min(RAM / 4, 32 GiB)), capped at RAM / 2 (host RAM, not a container's limit).
+    // An explicit size that the machine cannot pin fails the start-up; one too small for a full conversation is reported.
+    const long pages = sysconf(_SC_PHYS_PAGES), page = sysconf(_SC_PAGE_SIZE);
+    const std::size_t ram = pages > 0 && page > 0 ? std::size_t(pages) * std::size_t(page) : std::size_t(16) << 30;
     const std::size_t one = park_layout(options.max_ctx).bytes;
     const std::size_t park = options.park_host_mb >= 0 ? std::size_t(options.park_host_mb) << 20
         : std::min(std::max(2 * one, std::min<std::size_t>(ram / 4, std::size_t(32) << 30)), ram / 2);
@@ -129,11 +125,9 @@ class EngineGenerator final : public Generator {
         std::fprintf(stderr, "conversation parking disabled: %s\n", e.what());
       }
     }
-    if (park_arena_ && park < one) {
-      const std::size_t base = park_layout(1).bytes, per_token = (one - base) / std::max(options.max_ctx - 1, 1);
-      std::fprintf(stderr, "conversation parking: %zu MiB holds conversations up to ~%zu tokens (of --max-ctx %d)\n",
-                   park >> 20, park > base ? (park - base) / per_token : 0, options.max_ctx);
-    }
+    if (park_arena_ && park < one)
+      std::fprintf(stderr, "conversation parking: %zu MiB holds conversations up to %s (of --max-ctx %d)\n", park >> 20,
+                   parked_capacity().c_str(), options.max_ctx);
   }
 
  public:
@@ -422,6 +416,14 @@ class EngineGenerator final : public Generator {
     return l;
   }
 
+  // how much the arena holds: whole conversations at max_ctx, or the longest one when it holds less than one
+  std::string parked_capacity() const {
+    const std::size_t one = park_layout(options_.max_ctx).bytes, size = park_arena_->size();
+    if (size >= one) return std::to_string(size / one) + " conversations at full context";
+    const std::size_t base = park_layout(1).bytes, per_token = (one - base) / std::max(options_.max_ctx - 1, 1);
+    return "one conversation of up to " + thousands(long(size > base ? (size - base) / per_token : 0)) + " tokens";
+  }
+
   // the lowest arena offset with `bytes` free between the parked copies, or kNoGap
   std::size_t park_gap(std::size_t bytes) const {
     std::vector<std::pair<std::size_t, std::size_t>> taken;
@@ -462,8 +464,9 @@ class EngineGenerator final : public Generator {
       return !kept(p) && p.ids.size() < n && std::equal(p.ids.begin(), p.ids.end(), checkpoint_ids_.begin());
     });
     const ParkLayout l = park_layout(int(n));
+    if (l.bytes > park_arena_->size()) return;  // larger than the whole arena: evicting the others would not help
     std::size_t at = park_gap(l.bytes);
-    while (at == kNoGap) {  // least recently used first
+    while (at == kNoGap) {  // least recently used first, adjacent or not: a fragmented arena can lose a few for one park
       auto lru = parked_.end();
       for (auto it = parked_.begin(); it != parked_.end(); ++it)
         if (!kept(*it) && (lru == parked_.end() || it->used < lru->used)) lru = it;
@@ -582,8 +585,8 @@ class EngineGenerator final : public Generator {
 
 }  // namespace
 
-// [Agent] On GPUs with a hardware FP8 convert the FP8 reader is as fast as the INT8 one and FP8 prefill is faster
-// (RTX 4090: int8 -6 % at 229K); without it (RTX 3090) INT8 reads faster and tracks an uncompressed cache closer.
+// [Agent] With a hardware FP8 convert the FP8 reader is as fast as the INT8 one and FP8 prefill is faster; without it
+// (RTX 3090) INT8 reads faster, and it tracks an uncompressed cache closer.
 KvFormat default_kv_format() {
   int dev = 0, major = 0, minor = 0;
   CUDA_CHECK(cudaGetDevice(&dev));

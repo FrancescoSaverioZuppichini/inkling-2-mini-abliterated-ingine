@@ -89,8 +89,6 @@ Prefiller::Prefiller(const Weights& w, const Ablation& abl, int max_chunk, cudaS
   //   rel_ holds gin_ (gate inputs, both gates), the bias (rel_logits -> attention), the dequantized weight rows of the
   //     projections (before rel_logits) and of wo (after attention), and down_ (expert down -> combine);
   //   act_ (expert gate/up -> down) holds fpre_/gpre_ while a gate runs.
-  // Kernels read and write the same values as with one buffer each: only addresses move (-167 MiB at chunk 2048 with
-  // a quantized dense format, -129 MiB with BF16).
   static_assert(HEADS * HEAD_DIM * 2 <= HIDDEN * 4 && 2 * HIDDEN * 2 <= HIDDEN * 4 && HIDDEN <= HEADS * HEAD_DIM);
   static_assert(3 * 2 * HIDDEN * 2 <= HEADS * REL_EXTENT * 2 && TOP_K * HIDDEN * 2 <= HEADS * REL_EXTENT * 2 &&
                 2 * HIDDEN * 4 <= TOP_K * INTER * 2);
@@ -101,7 +99,7 @@ Prefiller::Prefiller(const Weights& w, const Ablation& abl, int max_chunk, cudaS
   gin_ = rel_, down_ = rel_;
   fpre_ = reinterpret_cast<float*>(act_), gpre_ = fpre_ + C * H;
   const std::size_t wrows = std::max(std::size_t(PROJ_ROWS_FULL) * H, std::size_t(H) * HEADS * HEAD_DIM);
-  wscratch_ = w.dense == DenseFormat::bf16 ? nullptr : wrows <= C * HEADS * REL_EXTENT ? rel_ : bf16(wrows);
+  if (w.dense != DenseFormat::bf16) wscratch_ = wrows <= C * HEADS * REL_EXTENT ? rel_ : bf16(wrows);
   ids_ = static_cast<std::int64_t*>(alloc(C * 8));
   CUDA_CHECK(cudaMemset(B0_, 0, heap_.used()));  // e.g. gathered sliding rows past ring + chunk: never keys, kept finite
 

@@ -13,8 +13,8 @@
 #include <unistd.h>
 
 #include <algorithm>
-#include <chrono>
 #include <cerrno>
+#include <chrono>
 #include <csignal>
 #include <exception>
 #include <filesystem>
@@ -96,16 +96,14 @@ int main(int argc, char** argv) {
   ap.exclusive({"--dense", "--dense-fp8"}, false);
   ap.flag("--spec", "DSpark speculative decoding (mtp.safetensors drafter)", &spec);
   ap.flag("--kv-fp8", "same as --kv-cache fp8", &kv_fp8);
-  ap.option("--kv-cache", "{bf16,fp8,int8,k8v4,int4,fp4}",
-            "full-attention KV caches (default: fp8 on GPUs with hardware FP8, compute capability 8.9+; int8 below): int8 (8.13 bits, rotated), bf16 (exact), fp8 (8 bits), k8v4 (6.06 "
-            "bits: int8 keys, 4-bit values), int4 (4.06 bits, lossy: 500K positions on 24 GB), fp4 (4.5 bits, lossy)",
+  ap.option("--kv-cache", "{bf16,fp8,int8,k8v4,int4,fp4}", ingine::model::KV_CACHE_HELP,
             &kv_cache, {"bf16", "fp8", "int8", "k8v4", "int4", "fp4"});
   ap.exclusive({"--kv-fp8", "--kv-cache"}, false);
   ap.option("--spec-threshold", "", "verify the leading drafts whose draft probability exceeds this (0 = always all 7)",
             &spec_threshold);
   ap.option("--park-host-mb", "",
             "pinned host memory (MiB) for conversations displaced by another one, least recently used evicted; "
-            "0 = off (default: room for two conversations at --max-ctx, at least a quarter of RAM up to 32 GiB, never over half)",
+            "0 = off (default: max(two conversations at --max-ctx, min(RAM / 4, 32 GiB)), at most RAM / 2)",
             &park_host_mb);
   ap.option("--prefill-chunk", "",
             "prompt tokens per prefill step; its workspace is ~0.37 GB per 1024 tokens, so 1024 frees ~0.75 GB of "
@@ -163,8 +161,7 @@ int main(int argc, char** argv) {
       options.ablation = ablation;
       options.max_ctx = max_ctx;
       options.dense = ingine::model::dense_format_of(dense_fp8 ? "fp8" : dense);
-      options.kv = kv_fp8 ? ingine::model::KvFormat::fp8
-                 : kv_cache.empty() ? ingine::model::default_kv_format() : ingine::model::kv_format_of(kv_cache);
+      options.kv = ingine::model::kv_cache_option(kv_fp8 ? "fp8" : kv_cache);
       options.spec = spec;
       options.spec_threshold = float(spec_threshold);
       options.park_host_mb = park_host_mb;

@@ -136,7 +136,7 @@ ingine-serve · inkling-2-mini · ready in 8.3 s
 | `--prefill-chunk N` | 3072 | prompt tokens per prefill step; each 1,024 tokens of chunk need about 0.37 GB |
 | `--embed-host` | off | keep the embedding table (0.86 GiB) in pinned host RAM |
 | `--no-vision` | images on | do not load the image tower (0.6 GB) and reject image requests |
-| `--park-host-mb N` | auto | pinned host RAM for conversations displaced by another one; switching back restores them instead of re-reading the prompt. Auto: room for two conversations at `--max-ctx`, at least a quarter of RAM up to 32 GiB, never over half. 0 turns it off |
+| `--park-host-mb N` | auto | pinned host RAM for conversations displaced by another one; switching back restores them instead of re-reading the prompt. Auto: max(two conversations at `--max-ctx`, min(RAM / 4, 32 GiB)), at most RAM / 2. 0 turns it off |
 | `--temperature`, `--top-p`, `--top-k` | from `generation_config.json` | sampling for requests that set none |
 | `--image-max-tokens`, `--max-images`, `--max-image-tokens` | 4096, 16, 32768 | image limits per image and per request |
 | `--max-queue N` | 4 | requests that may wait behind the running one |
@@ -146,7 +146,7 @@ ingine-serve · inkling-2-mini · ready in 8.3 s
 
 ### Speed and context on 24 GB
 
-Measured with `cachebench` (in the lab) on the round-5 code, one window at a time.
+Measured on the round-5 code, one server per profile, one window at a time, with the drafter on (how the server runs).
 - **Setup:** power caps 300 W (3090) and 400 W (4090), greedy decoding.
 - **Prefill:** prompt tokens ÷ time to first token.
 - **Decode:** 127 tokens after the first, with the prompt already cached.
@@ -162,17 +162,8 @@ Measured with `cachebench` (in the lab) on the round-5 code, one window at a tim
 | RTX 4090 · `start.sh` (INT8 + k8v4) | 524,288 | 10,556 / 7,179 / 4,851 | 318.6 / 236.7 / 220.3 / 151.2 |
 | RTX 4090 · BF16 + fp8 KV (its default KV) | 311,296 | 10,942 / 7,590 / — | 227.0 / 221.1 / 207.5 / — |
 
-**Drafter off, bare-metal decode (tokens/s, 4K / 32K / 224K / 512K):**
-
-| GPU · profile | decode |
-|---|---|
-| RTX 3090 · `start.sh` | 136.1 / 127.8 / 92.0 / 65.3 |
-| RTX 3090 · BF16 + int8 KV | 108.8 / 102.0 / 73.0 / — |
-| RTX 4090 · `start.sh` | 175.0 / 164.1 / 115.0 / 79.7 |
-| RTX 4090 · BF16 + fp8 KV | 133.6 / 125.5 / 88.5 / — |
-
 **What the tables show:**
-- **Low-bit caches are faster at depth, not only smaller:** they read fewer bytes per token. At 224K, `start.sh` decodes 26 % (3090) and 30 % (4090) faster than BF16 weights with the default cache, drafter off.
+- **Low-bit caches are faster at depth, not only smaller:** they read fewer bytes per token. At 224K, `start.sh` decodes 42 % faster than BF16 weights with the default cache on the 3090 (177.1 vs 124.7 tokens/s) and 6 % faster on the 4090 (220.3 vs 207.5).
 - **More context:** `--kv-cache int4` (4.06 bits) holds 786,432 tokens (3090) / 770,048 (4090) with INT8 weights. At 512K it decodes 160 / 202 tokens/s with the drafter on.
 - **Switching conversations:** coming back to a parked 229K-token conversation takes **0.86 s** to the first token (4090), against 31.4 s to read it again.
 
@@ -231,7 +222,7 @@ authentication**: keep the server on loopback. Requests run one at a time; up to
 further ones get HTTP 503. `GET /health` and `GET /v1/models` report the state.
 
 A follow-up request only reads what is new in its conversation. Conversations that take turns (subagents, a
-second client) are kept warm in pinned host RAM, by default room for two conversations at `--max-ctx` and at least a quarter of system RAM (at most 32 GiB, never over half)
+second client) are kept warm in pinned host RAM, sized automatically (see `--park-host-mb` above)
 (`--park-host-mb N` sets it in MiB, `0` turns it off); the least recently used is dropped when it is full.
 
 `POST /v1/chat/completions` takes:
