@@ -1378,6 +1378,8 @@ cudaLaunchConfig_t launch_config(const Kernel& k, cudaStream_t stream, cudaLaunc
 
 }  // namespace
 
+void attn_decode_lb(const DecodeArgs& a, cudaStream_t stream);  // attn_lb.cu
+
 std::size_t workspace_bytes(int max_m) {
     require(max_m >= 1 && max_m <= MAXM, "max_m must be in 1..8");
     return ws_bytes(max_m);
@@ -1396,6 +1398,7 @@ int max_active_clusters(int M, int window) {
 }
 
 void attn_decode(const DecodeArgs& a, cudaStream_t stream) {
+    if (a.window == 0 && low_bit(a.kv)) return attn_decode_lb(a, stream);
     require(a.window == 0 || a.window == WIN, "window must be 0 (full layer) or 1024 (sliding layer)");
     const bool full = a.window == 0;
     const int M = a.M;
