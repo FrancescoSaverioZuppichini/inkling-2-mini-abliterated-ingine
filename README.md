@@ -170,23 +170,23 @@ Measured with **[llm-serving-bench v3.3](https://huggingface.co/datasets/Frances
 
 | | ingine INT8 + k8v4 · 245K | ingine BF16 · 245K | vLLM · 129K (its maximum) | ingine INT8 + k8v4 · 512K |
 |---|---:|---:|---:|---:|
-| **decode, all short + code** | **288.4** | 226.7 | 209.3 | 288.2 |
-| decode, chat (MT-Bench) | **234.9** | 183.5 | 160.1 | 234.6 |
-| decode, code (HumanEval) | **325.3** | 244.8 | 231.9 | 325.3 |
-| decode, coding agent | **317.7** | 275.4 | 309.2 | 317.7 |
-| agent follow-up, time to first token | 0.096 s | 0.094 s | 0.115 s | 0.096 s |
-| prefill 4K / 32K | 10,510 / 10,318 | 10,622 / 10,593 | 9,949 / 9,563 | 10,566 / 10,299 |
-| prefill 224K | 7,077 | **7,421** | does not fit | 7,058 |
-| time to read the 224K prompt | 32.0 s | **30.6 s** | does not fit | 32.1 s |
-| decode at 32K / 224K depth | **289.6 / 165.6** | 233.7 / 156.4 | 218.1 / does not fit | 289.6 / 165.6 |
-| 512K prompt | | does not fit | does not fit | **4,870 prefill · 130.1 decode** |
+| **decode, all short + code** | **289.2** | 228.8 | 209.3 | 289.1 |
+| decode, chat (MT-Bench) | **233.6** | 184.3 | 160.1 | 233.4 |
+| decode, code (HumanEval) | **325.3** | 244.8 | 231.9 | 325.2 |
+| decode, coding agent | **337.1** | 283.1 | 309.2 | 337.2 |
+| agent follow-up, time to first token | 0.094 s | 0.096 s | 0.115 s | 0.094 s |
+| prefill 4K / 32K | 10,973 / 10,769 | 11,056 / 11,081 | 9,949 / 9,563 | 11,014 / 10,768 |
+| prefill 224K | 7,283 | **7,661** | does not fit | 7,281 |
+| time to read the 224K prompt | 31.1 s | **29.6 s** | does not fit | 31.1 s |
+| decode at 32K / 224K depth | **281.0 / 224.2** | 218.2 / 161.8 | 218.1 / does not fit | 281.0 / 224.2 |
+| 512K prompt | | does not fit | does not fit | **4,976 prefill · 127.1 decode** |
 
 **The setups:**
 
 | | weights | KV cache | drafter | version |
 |---|---|---|---|---|
-| ingine INT8 + k8v4 (`start.sh`) | NVFP4 experts as shipped; INT8 dense (qkv, `wo`, heads) | k8v4: 8-bit keys, 4-bit values | DSpark, threshold 0.8 | this PR (`3bfecfa`) |
-| ingine BF16 | NVFP4 experts; BF16 dense, the checkpoint as shipped | int8 (3090) / FP8 (4090), each GPU's default | DSpark, threshold 0.8 | this PR (`3bfecfa`) |
+| ingine INT8 + k8v4 (`start.sh`) | NVFP4 experts as shipped; INT8 dense (qkv, `wo`, heads) | k8v4: 8-bit keys, 4-bit values | DSpark, threshold 0.8 | this PR (the 3090 rows ran on `3bfecfa`; the GEMM pin changes nothing there) |
+| ingine BF16 | NVFP4 experts; BF16 dense, the checkpoint as shipped | int8 (3090) / FP8 (4090), each GPU's default | DSpark, threshold 0.8 | this PR (the 3090 rows ran on `3bfecfa`; the GEMM pin changes nothing there) |
 | vLLM | NVFP4 experts; int8 qkv, LM head, Markov head and drafter; BF16 rest | FP8 on the 3090; BF16 on the 4090 (the recipe enables FP8 KV only on sm_86 and sm_120), so 129,280 tokens there | DSpark, 7 tokens | `vllm/vllm-openai` nightly `7cb5dae22` + [inkling2-mini-3090-recipe](https://github.com/lulakien/inkling2-mini-3090-recipe) `9f246b3`, the only vLLM setup for Inkling on Ampere/Ada |
 | strata | SQ-20 (strata's own quant) | FP16, its default for Inkling: 77K tokens fit on the GPU, the rest of the 245,760 sits in host RAM | off (strata's tuner: 1.06× is below its 1.10× bar) | strata 0.2.22, Inkling engine 0.1.69 |
 
@@ -204,8 +204,8 @@ Measured with **[llm-serving-bench v3.3](https://huggingface.co/datasets/Frances
 |---|---|---:|---:|---:|
 | RTX 3090 | ingine INT8 + k8v4 (`start.sh`) | 250 | 0.0068 | 96.4 % |
 | RTX 3090 | ingine BF16 + int8 KV (default) | 250 | 0.0040 | 98.0 % |
-| RTX 4090 | ingine INT8 + k8v4 (`start.sh`) | 239 | 0.0051 | 97.9 % |
-| RTX 4090 | ingine BF16 + FP8 KV (default) | 239 | 0.0040 | 97.9 % |
+| RTX 4090 | ingine INT8 + k8v4 (`start.sh`) | 250 | 0.0074 | 96.8 % |
+| RTX 4090 | ingine BF16 + FP8 KV (default) | 250 | 0.0040 | 97.2 % |
 
 The default path (BF16, no new flags) also passes the repo's golden test unchanged: 330 stages, top-1 0.979, the same KL as `main`.
 
