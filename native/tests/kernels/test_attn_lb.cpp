@@ -167,7 +167,7 @@ bool run(Rng& rng, int M, int p0) {
   DeviceArray<__nv_bfloat16> drk(to_bf16(rk)), drv(to_bf16(rv));
   DeviceArray<uint8_t> dk(attn::cache_bytes(attn::KvFormat::int4, CAP, false)),
       dv(attn::cache_bytes(attn::KvFormat::int4, CAP, true));
-  attn::pack_rows(drk.get(), drv.get(), CAP, 0, dk.get(), dv.get(), g_stream);
+  attn::pack_rows(attn::KvFormat::int4, drk.get(), drv.get(), CAP, 0, dk.get(), dv.get(), g_stream);
   INGINE_TEST_CUDA(cudaStreamSynchronize(g_stream));
 
   DeviceArray<float> dproj(proj), dqs(q_scale), drs(r_scale), drp(rel_proj), dkc(kconv), dvc(vconv), dck(ck0), dcv(cv0);
@@ -331,11 +331,11 @@ bool run_prefill(Rng& rng, int pos0, int T) {
                      pj = randn_bf16(rng, size_t(T) * R, 1.0);
   DeviceArray<__nv_bfloat16> drk(to_bf16(rk)), drv(to_bf16(rv)), dq(to_bf16(qv)), drel(to_bf16(rel)), dpj(to_bf16(pj));
   DeviceArray<uint8_t> dk(attn::cache_bytes(attn::KvFormat::int4, L, false)), dv(attn::cache_bytes(attn::KvFormat::int4, L, true));
-  attn::pack_rows(drk.get(), drv.get(), L, 0, dk.get(), dv.get(), g_stream);
+  attn::pack_rows(attn::KvFormat::int4, drk.get(), drv.get(), L, 0, dk.get(), dv.get(), g_stream);
   DeviceArray<__nv_bfloat16> out(size_t(T) * HQ * D);
   attn::PrefillArgs a;
   a.q = dq.get(), a.rel = drel.get(), a.proj = dpj.get(), a.ld = R, a.T = T, a.pos0 = pos0;
-  a.k_cache = dk.get(), a.v_cache = dv.get(), a.out = out.get();
+  a.k_cache = dk.get(), a.v_cache = dv.get(), a.kv = attn::KvFormat::int4, a.out = out.get();
   attn::prefill_attend(a, g_stream);
   INGINE_TEST_CUDA(cudaStreamSynchronize(g_stream));
   const Deq q = dequant(dk.download(), dv.download(), L);

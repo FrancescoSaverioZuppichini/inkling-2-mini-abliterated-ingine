@@ -270,12 +270,12 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
     at.q = q_, at.T = T, at.pos0 = pos0, at.rel = rel_, at.proj = proj_, at.ld = R, at.out = attn_out_;
     const bool packed = layer.full && kernels::attn::low_bit(st.kv);
     if (packed) {
-      // [Agent] int4 caches: attn_prep writes the chunk's BF16 rows into the sliding-ring scratch (free during a
+      // [Agent] Low-bit caches: attn_prep writes the chunk's BF16 rows into the sliding-ring scratch (free during a
       // full visit) and pack_rows encodes them into the cache, so every key, the chunk's own included, is attended
       // from the cache exactly as decode will read it.
       ap.k_out = krows_, ap.v_out = vrows_, ap.out_fp8 = false;
       pk::attn_prep(ap, s);
-      kernels::attn::pack_rows(krows_, vrows_, T, pos0, st.k_full_at(FULL_INDEX[v]).data,
+      kernels::attn::pack_rows(st.kv, krows_, vrows_, T, pos0, st.k_full_at(FULL_INDEX[v]).data,
                                st.v_full_at(FULL_INDEX[v]).data, s);
     } else if (layer.full) {
       const int fi = FULL_INDEX[v];
@@ -310,7 +310,7 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
       pk::rel_logits(rel16_, f32p(layer.rel_proj), T, rel_, s);
       if (packed)
         kernels::attn::prefill_attend({q_, rel_, proj_, R, T, pos0, st.k_full_at(FULL_INDEX[v]).data,
-                                       st.v_full_at(FULL_INDEX[v]).data, attn_out_}, s);
+                                       st.v_full_at(FULL_INDEX[v]).data, st.kv, attn_out_}, s);
       else
         pk::attention(at, s);
     } else {

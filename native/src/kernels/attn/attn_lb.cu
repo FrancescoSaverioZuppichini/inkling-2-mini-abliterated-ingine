@@ -819,7 +819,8 @@ std::size_t cache_bytes(KvFormat f, std::int64_t rows, bool values) {
 }
 
 void attn_decode_lb(const DecodeArgs& a, cudaStream_t stream) {
-    require(a.log_scaling, "the int4 reader always applies the log-length temperature");
+    require(a.log_scaling, "the low-bit reader always applies the log-length temperature");
+    require(a.kv == KvFormat::int4, "not a low-bit format");
     Params p{};
     p.proj = a.proj;
     p.cap = a.cache_rows;
@@ -844,6 +845,7 @@ void attn_decode_lb(const DecodeArgs& a, cudaStream_t stream) {
 
 void prefill_attend(const PrefillArgs& a, cudaStream_t stream) {
     require(a.T > 0 && a.q && a.rel && a.proj && a.k_cache && a.v_cache && a.out, "prefill_attend: null argument");
+    require(a.kv == KvFormat::int4, "prefill_attend: not a low-bit format");
     static const bool attr = [] {
         CUDA_CHECK(cudaFuncSetAttribute(lb_prefill_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, int(PfSmem::BYTES)));
         return true;
@@ -853,8 +855,9 @@ void prefill_attend(const PrefillArgs& a, cudaStream_t stream) {
     CUDA_CHECK(cudaGetLastError());
 }
 
-void pack_rows(const __nv_bfloat16* k, const __nv_bfloat16* v, int T, std::int64_t pos0, void* k_cache, void* v_cache,
-               cudaStream_t stream) {
+void pack_rows(KvFormat kv, const __nv_bfloat16* k, const __nv_bfloat16* v, int T, std::int64_t pos0, void* k_cache,
+               void* v_cache, cudaStream_t stream) {
+    require(kv == KvFormat::int4, "pack_rows: not a low-bit format");
     if (T <= 0) return;
     pack_kernel<<<(T * HKV + NW - 1) / NW, NT, 0, stream>>>(k, v, T, pos0, static_cast<char*>(k_cache),
                                                           static_cast<char*>(v_cache));

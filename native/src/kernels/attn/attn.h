@@ -15,9 +15,9 @@
 namespace ingine::kernels::attn {
 
 // Full-attention cache formats (RuntimeOptions::kv). bf16 and fp8 caches are [rows, 8, 128] and read by the original
-// kernel; int4 caches are 16-position blocks (kv_format.h, KERNELS.md) read by the low-bit kernel (attn_lb.cu).
+// kernel; the low-bit ones (int8, k8v4, int4, fp4) are 16-position blocks (kv_format.h, KERNELS.md) read by attn_lb.cu.
 using model::KvFormat;
-inline bool low_bit(KvFormat f) { return f == KvFormat::int4; }
+inline bool low_bit(KvFormat f) { return f != KvFormat::bf16 && f != KvFormat::fp8; }
 // Bytes of one full visit's K (or V) cache holding `rows` positions.
 std::size_t cache_bytes(KvFormat f, std::int64_t rows, bool values);
 
@@ -54,12 +54,12 @@ int max_active_clusters(int M, int window);
 
 void attn_decode(const DecodeArgs& a, cudaStream_t stream);
 
-// int4 caches: encode T BF16 rows (keys clipped, values RMS-normalised, [T, 8, 128]) at positions pos0 .. pos0 + T - 1
+// Low-bit caches: encode T BF16 rows (keys clipped, values RMS-normalised, [T, 8, 128]) at positions pos0 .. pos0 + T - 1
 // into one visit's K and V caches, with the arithmetic attn_decode uses for its own new rows.
-void pack_rows(const __nv_bfloat16* k, const __nv_bfloat16* v, int T, std::int64_t pos0, void* k_cache,
+void pack_rows(KvFormat kv, const __nv_bfloat16* k, const __nv_bfloat16* v, int T, std::int64_t pos0, void* k_cache,
                void* v_cache, cudaStream_t stream);
 
-// int4 caches, prefill: the chunk's T tokens (positions pos0 ..) against every cached key up to each token, the
+// Low-bit caches, prefill: the chunk's T tokens (positions pos0 ..) against every cached key up to each token, the
 // chunk's own rows already packed. q: attn_prep's [T, 24, 128]; rel: rel_logits [T, 24, 1024]; proj: [T, ld] BF16
 // (gate and sink columns); out [T, 3072] = bf16(bf16(softmax-with-sink attention) * sigmoid(gate)).
 struct PrefillArgs {
@@ -69,6 +69,7 @@ struct PrefillArgs {
   int ld = 0, T = 0, pos0 = 0;
   const void* k_cache = nullptr;
   const void* v_cache = nullptr;
+  KvFormat kv = KvFormat::bf16;  // the caches' low-bit format (anything else throws)
   __nv_bfloat16* out = nullptr;
 };
 void prefill_attend(const PrefillArgs& a, cudaStream_t stream);

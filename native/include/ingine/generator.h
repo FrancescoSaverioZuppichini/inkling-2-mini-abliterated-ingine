@@ -15,13 +15,17 @@
 namespace ingine::model {
 
 // Format of the full-attention KV caches. bf16: [rows, 8, 128] BF16; fp8: the same in E4M3 without scale (half the
-// bytes); int4: 4.06 bits per value in 16-position blocks (rotated, lossy; native/KERNELS.md, area `attn`).
-enum class KvFormat : std::uint8_t { bf16, fp8, int4 };
-// "bf16" | "fp8" | "int4"; throws std::invalid_argument on anything else.
+// bytes). The low-bit formats are 16-position blocks of rotated rows (native/KERNELS.md, area `attn`): int8 8.13 bits
+// per value (FP16 scale per row), k8v4 6.06 (int8 keys, scale-free 4-bit values), int4 4.06 and fp4 4.5 (lossy).
+enum class KvFormat : std::uint8_t { bf16, fp8, int4, int8, k8v4, fp4 };
+// "bf16" | "fp8" | "int8" | "k8v4" | "int4" | "fp4"; throws std::invalid_argument on anything else.
 inline KvFormat kv_format_of(const std::string& name) {
   if (name == "bf16") return KvFormat::bf16;
   if (name == "fp8") return KvFormat::fp8;
+  if (name == "int8") return KvFormat::int8;
+  if (name == "k8v4") return KvFormat::k8v4;
   if (name == "int4") return KvFormat::int4;
+  if (name == "fp4") return KvFormat::fp4;
   throw std::invalid_argument("unknown KV cache format: " + name);
 }
 

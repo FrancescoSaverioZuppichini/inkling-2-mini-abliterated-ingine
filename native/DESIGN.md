@@ -122,7 +122,7 @@ struct RuntimeOptions {
   std::filesystem::path model_dir, ablation;      // empty ablation: original model
   int max_ctx = 65536; int prefill_chunk = 2048;
   bool dense_fp8 = true, spec = false; float spec_threshold = 0.8f;
-  KvFormat kv = KvFormat::bf16;                   // full-attention caches: bf16 | fp8 | int4 (--kv-cache, --kv-fp8 = fp8)
+  KvFormat kv = KvFormat::bf16;                   // full-attention caches: bf16 | fp8 | int8 | k8v4 | int4 | fp4 (--kv-cache, --kv-fp8 = fp8)
 };
 class Generator {
  public:

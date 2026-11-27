@@ -89,10 +89,10 @@ int main(int argc, char** argv) {
   ap.flag("--dense-fp8", "FP8 E4M3 dense projections and head (row scales)", &dense_fp8);
   ap.flag("--spec", "DSpark speculative decoding (mtp.safetensors drafter)", &spec);
   ap.flag("--kv-fp8", "same as --kv-cache fp8", &kv_fp8);
-  ap.option("--kv-cache", "{bf16,fp8,int4}",
-            "full-attention KV caches: bf16 (default), fp8 (half the memory), int4 (4.06 bits, rotated, lossy: 500K "
-            "positions on 24 GB)",
-            &kv_cache, {"bf16", "fp8", "int4"});
+  ap.option("--kv-cache", "{bf16,fp8,int8,k8v4,int4,fp4}",
+            "full-attention KV caches: bf16 (default), fp8 (half the memory), int8 (8.13 bits, rotated), k8v4 (6.06 "
+            "bits: int8 keys, 4-bit values), int4 (4.06 bits, lossy: 500K positions on 24 GB), fp4 (4.5 bits, lossy)",
+            &kv_cache, {"bf16", "fp8", "int8", "k8v4", "int4", "fp4"});
   ap.exclusive({"--kv-fp8", "--kv-cache"}, false);
   ap.option("--spec-threshold", "", "verify the leading drafts whose draft probability exceeds this (0 = always all 7)",
             &spec_threshold);
