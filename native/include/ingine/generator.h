@@ -19,6 +19,10 @@ namespace ingine::model {
 // per value (FP16 scale per row), k8v4 6.06 (int8 keys, scale-free 4-bit values), int4 4.06 and fp4 4.5 (lossy).
 enum class KvFormat : std::uint8_t { bf16, fp8, int4, int8, k8v4, fp4 };
 // "bf16" | "fp8" | "int8" | "k8v4" | "int4" | "fp4"; throws std::invalid_argument on anything else.
+// The default full-attention KV cache of the current GPU: fp8 where the GPU converts FP8 in hardware (compute
+// capability 8.9+, e.g. RTX 4090 and 5090), int8 below (e.g. RTX 3090).
+KvFormat default_kv_format();
+
 inline KvFormat kv_format_of(const std::string& name) {
   if (name == "bf16") return KvFormat::bf16;
   if (name == "fp8") return KvFormat::fp8;

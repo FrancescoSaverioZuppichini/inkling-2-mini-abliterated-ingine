@@ -541,6 +541,16 @@ class EngineGenerator final : public Generator {
 
 }  // namespace
 
+// [Agent] On GPUs with a hardware FP8 convert the FP8 reader is as fast as the INT8 one and FP8 prefill is faster
+// (RTX 4090: int8 -6 % at 229K); without it (RTX 3090) INT8 reads faster and tracks an uncompressed cache closer.
+KvFormat default_kv_format() {
+  int dev = 0, major = 0, minor = 0;
+  CUDA_CHECK(cudaGetDevice(&dev));
+  CUDA_CHECK(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev));
+  CUDA_CHECK(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev));
+  return major * 10 + minor >= 89 ? KvFormat::fp8 : KvFormat::int8;
+}
+
 std::unique_ptr<Generator> make_generator(const RuntimeOptions& options) {
   return std::make_unique<EngineGenerator>(options);
 }

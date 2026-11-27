@@ -123,7 +123,7 @@ struct RuntimeOptions {
   int max_ctx = 65536; int prefill_chunk = 2048;
   bool spec = false; float spec_threshold = 0.8f;
   DenseFormat dense = DenseFormat::bf16;          // dense weights: bf16 | fp8 | int8 (--dense; --dense-fp8 = fp8); was bool dense_fp8 = true
-  KvFormat kv = KvFormat::int8;                   // full-attention caches: int8 (default) | bf16 | fp8 | k8v4 | int4 | fp4 (--kv-cache, --kv-fp8 = fp8)
+  KvFormat kv = KvFormat::int8;                   // full-attention caches: int8 | bf16 | fp8 | k8v4 | int4 | fp4 (--kv-cache, --kv-fp8 = fp8); the apps default to default_kv_format(): fp8 on compute capability 8.9+, int8 below
 };
 class Generator {
  public:
