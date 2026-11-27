@@ -248,9 +248,13 @@ void Drafter::load(const std::filesystem::path& model_dir) {
   {
     auto kv = [](int l, const char* x) { return "layers." + std::to_string(l) + ".self_attn." + x + "_proj_ctx.weight"; };
     const std::vector<std::int64_t> shape{kd::KV_DIM, h};
-    const __nv_bfloat16* all = persist({{kv(0, "k"), shape}, {kv(0, "v"), shape}, {kv(1, "k"), shape},
-                                        {kv(1, "v"), shape}, {kv(2, "k"), shape}, {kv(2, "v"), shape}});
-    for (int l = 0; l < 3; ++l) layers_[l].wkv_ctx = all + std::size_t(l) * 2 * kd::KV_DIM * H;
+    // [Agent] With INT8 dense weights (the 500K profile) the 27 MiB BF16 copy is not kept: a large commit dequantizes
+    // the layer's FP8 rows into the commit scratch first (9 MiB, ~13 us per 1024-row piece and layer).
+    if (!head_.int8) {
+      const __nv_bfloat16* all = persist({{kv(0, "k"), shape}, {kv(0, "v"), shape}, {kv(1, "k"), shape},
+                                          {kv(1, "v"), shape}, {kv(2, "k"), shape}, {kv(2, "v"), shape}});
+      for (int l = 0; l < 3; ++l) layers_[l].wkv_ctx = all + std::size_t(l) * 2 * kd::KV_DIM * H;
+    }
     wkv_all_ = fp8({{kv(0, "k"), kd::KV_DIM}, {kv(0, "v"), kd::KV_DIM}, {kv(1, "k"), kd::KV_DIM},
                     {kv(1, "v"), kd::KV_DIM}, {kv(2, "k"), kd::KV_DIM}, {kv(2, "v"), kd::KV_DIM}});
   }
@@ -289,22 +293,30 @@ void Drafter::load(const std::filesystem::path& model_dir) {
   f_norm_ = persist({{mh + "dflare_norm.weight", {h}}});
 
   // fold_w / fold_b (FP64, from the unembedding as the decoder stores it)
-  fold_w_ = static_cast<__nv_bfloat16*>(heap_.alloc(std::size_t(V_) * kd::RANK * 2));
   fold_b_ = static_cast<__nv_bfloat16*>(heap_.alloc(std::size_t(V_) * 2));
   const __nv_bfloat16* hw = persist({{mh + "hidden_out.weight", {h, kd::RANK}}});
   const __nv_bfloat16* hb = persist({{mh + "hidden_out.bias", {h}}});
   if (!head_.int8) {
-    kd::fold_head(w_.unembed.w.data, head_.scale, V_, hw, hb, fold_w_, fold_b_, stream_);
+    fold_w_ = heap_.alloc(std::size_t(V_) * kd::RANK * 2);
+    kd::fold_head(w_.unembed.w.data, head_.scale, V_, hw, hb, static_cast<__nv_bfloat16*>(fold_w_), fold_b_, stream_);
   } else {
-    // [Agent] fold_head reads BF16 or FP8 rows. INT8 rows reach it dequantized (bf16(q * scale), the weights.dequant
-    // value it would compute itself) one slice at a time in `cat` (2 I rows of H), so no extra memory is needed.
-    const int slice = int(2 * I);
+    // [Agent] INT8 dense weights: fold_w is kept as INT8 rows + row scales too (49 instead of 98 MiB). fold_head reads
+    // BF16 or FP8 rows, so each slice of the unembedding reaches it dequantized (bf16(q * scale), the weights.dequant
+    // value it would compute itself) in `cat`, its BF16 fold rows land in `cat` behind them and are quantized from
+    // there: no memory beyond `cat`, which is freed on return.
+    constexpr int SLICE = 16384;
+    if (std::size_t(SLICE) * (H + kd::RANK) * 2 > cat.bytes) throw std::logic_error("Drafter: fold slice exceeds cat");
+    fold_w_ = heap_.alloc(std::size_t(V_) * kd::RANK);
+    fold_s_ = static_cast<float*>(heap_.alloc(std::size_t(V_) * 4));
     auto* u = static_cast<__nv_bfloat16*>(cat.p);
-    for (int r = 0; r < V_; r += slice) {
-      const int n = std::min(slice, V_ - r);
+    auto* f16 = u + std::size_t(SLICE) * H;
+    for (int r = 0; r < V_; r += SLICE) {
+      const int n = std::min(SLICE, V_ - r);
       kdense::dequant_rows(static_cast<const std::int8_t*>(head_.w) + std::size_t(r) * H, head_.scale + r, n, H, u,
                            stream_, true);
-      kd::fold_head(u, nullptr, n, hw, hb, fold_w_ + std::size_t(r) * kd::RANK, fold_b_ + r, stream_);
+      kd::fold_head(u, nullptr, n, hw, hb, f16, fold_b_ + r, stream_);
+      kdense::int8_rows(f16, n, kd::RANK, static_cast<std::uint8_t*>(fold_w_) + std::size_t(r) * kd::RANK, fold_s_ + r,
+                        stream_);
     }
   }
   CUDA_CHECK(cudaStreamSynchronize(stream_));  // cat is freed on return
@@ -451,22 +463,34 @@ void Drafter::restore_checkpoint(const void* src) {
 namespace {
 constexpr std::size_t CTX_C_BYTES = std::size_t(COMMIT_PIECE) * H * 2;
 constexpr std::size_t CTX_KV_BYTES = std::size_t(COMMIT_PIECE) * 2 * kd::KV_DIM * 2;
+constexpr std::size_t WKV_TMP_BYTES = std::size_t(2) * kd::KV_DIM * H * 2;  // one layer's k/v rows, BF16
 }
 
-std::size_t Drafter::commit_scratch_bytes() const { return CTX_C_BYTES + CTX_KV_BYTES + kd::Bf16Gemm::kWorkspaceBytes; }
+std::size_t Drafter::commit_scratch_bytes() const {
+  return CTX_C_BYTES + CTX_KV_BYTES + kd::Bf16Gemm::kWorkspaceBytes + (head_.int8 ? WKV_TMP_BYTES : 0);
+}
 
 void Drafter::lend_commit_scratch(void* p) {
   auto* b = static_cast<std::byte*>(p);
   ctx_c_ = reinterpret_cast<__nv_bfloat16*>(b);
   ctx_kv_ = reinterpret_cast<__nv_bfloat16*>(b + CTX_C_BYTES);
   gemm_ws_ = b + CTX_C_BYTES + CTX_KV_BYTES;
+  wkv_tmp_ = head_.int8 ? reinterpret_cast<__nv_bfloat16*>(b + CTX_C_BYTES + CTX_KV_BYTES + kd::Bf16Gemm::kWorkspaceBytes)
+                        : nullptr;
 }
 
 void Drafter::run_commit(const __nv_bfloat16* feats, int n, int row0, bool last_piece) {
   for (int l = 0; l < 3; ++l) {
     const DraftLayer& L = layers_[l];
     kd::mix_rmsnorm(feats, n, alpha_ + 4 * l, L.ctx_norm, ctx_c_, stream_);
-    gemm_.run(ctx_c_, n, L.wkv_ctx, 2 * kd::KV_DIM, H, ctx_kv_, gemm_ws_, stream_);
+    const __nv_bfloat16* wkv = L.wkv_ctx;
+    if (!wkv) {  // INT8 dense: this layer's FP8 rows of wkv_all_ as BF16 (weights.dequant)
+      const std::size_t r0 = std::size_t(l) * 2 * kd::KV_DIM;
+      kdense::dequant_rows(static_cast<const std::uint8_t*>(wkv_all_.w) + r0 * H, wkv_all_.scale + r0, 2 * kd::KV_DIM, H,
+                           wkv_tmp_, stream_);
+      wkv = wkv_tmp_;
+    }
+    gemm_.run(ctx_c_, n, wkv, 2 * kd::KV_DIM, H, ctx_kv_, gemm_ws_, stream_);
     const int size = is_local(l) ? kd::WINDOW : ctx_;
     kd::ctx_kv_store(ctx_kv_, n, params_, row0, n - std::min(n, size), L.k_norm_ctx, L.k_ctx, L.v_ctx,
                      !is_local(l) && GLOBAL_FP8, size, L.ctx_pos, stream_);
@@ -534,7 +558,8 @@ void Drafter::run_layers(int bucket) {
   for (int i = 0; i < GAMMA; ++i) {
     kd::markov_step(i, rnn_w_, rnn_b_, w1_rows_, static_cast<const __nv_bfloat16*>(w1_host_.device_ptr()), part_,
                     picks_, cand_row_, params_, state_, latent_, stream_);
-    kd::markov_logits(i, fold_w_, fold_b_, cand_val_, cand_idx_, latent_, params_, cand_logits_, picks_, stream_);
+    kd::markov_logits(i, fold_w_, fold_s_, fold_b_, cand_val_, cand_idx_, latent_, params_, cand_logits_, picks_,
+                      stream_);
   }
   kd::markov_finish(cand_idx_, cand_logits_, picks_, prev_cand_, draft_logits_, V_, tokens_, conf_, qstats_, params_,
                     stream_);
