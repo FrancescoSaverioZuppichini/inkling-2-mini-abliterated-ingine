@@ -90,6 +90,8 @@ struct RuntimeOptions {
   // than 2048 for 0.38 GB more scratch; results differ between chunk sizes only by rounding.
   int prefill_chunk = 3072;
   bool dense_fp8 = true, kv_fp8 = false, spec = false;
+  // Full-attention cache format (kernels::attn::KvFormat: 0 bf16, 1 fp8, 2 int4); -1: kv_fp8 decides.
+  int kv_cache = -1;
   // [Agent] Keep the BF16 embedding table (0.86 GiB) in pinned host memory that the GPU reads over PCIe. A step reads
   // only its 1-8 token rows (4.6 KB each), so it costs about a microsecond and frees the memory for context on 24 GB.
   bool embed_host = false;

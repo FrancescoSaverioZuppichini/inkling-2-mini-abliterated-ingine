@@ -2,6 +2,7 @@
 #include "model/runtime.h"
 
 #include "core/device.h"
+#include "kernels/attn/attn.h"
 
 #include <stdexcept>
 
@@ -26,27 +27,45 @@ Tensor State::v_ring_at(int ring) const {
 }
 std::int64_t* State::ring_pos_at(int ring) const { return ptr<std::int64_t>(ring_pos) + std::size_t(ring) * WINDOW; }
 Tensor State::k_full_at(int full) const {
+  if (kernels::attn::low_bit(kernels::attn::KvFormat(kv_format))) {
+    const std::size_t n = k_full.bytes() / NUM_FULL_VISITS;
+    return rm(ptr<char>(k_full) + std::size_t(full) * n, DType::U8, {std::int32_t(n)});
+  }
   const std::size_t es = kv_fp8 ? 1 : 2;
   return rm(ptr<char>(k_full) + std::size_t(full) * max_ctx * KV_DIM * es, k_full.dtype, {max_ctx, KV_HEADS, HEAD_DIM});
 }
 Tensor State::v_full_at(int full) const {
+  if (kernels::attn::low_bit(kernels::attn::KvFormat(kv_format))) {
+    const std::size_t n = v_full.bytes() / NUM_FULL_VISITS;
+    return rm(ptr<char>(v_full) + std::size_t(full) * n, DType::U8, {std::int32_t(n)});
+  }
   const std::size_t es = kv_fp8 ? 1 : 2;
   return rm(ptr<char>(v_full) + std::size_t(full) * max_ctx * KV_DIM * es, v_full.dtype, {max_ctx, KV_HEADS, HEAD_DIM});
 }
 
-State make_state(int max_ctx, bool kv_fp8) {
+State make_state(int max_ctx, bool kv_fp8, int kv_format) {
   // the attention kernel keeps positions in int32 and caps full caches at 2^30 rows
   if (max_ctx < 1 || max_ctx > (1 << 30)) throw std::invalid_argument("max_ctx must be in 1..2^30");
   State st;
   st.max_ctx = max_ctx;
-  st.kv_fp8 = kv_fp8;
-  const DType full = kv_fp8 ? DType::FP8_E4M3FN : DType::BF16;
+  const auto fmt = kv_format < 0 ? (kv_fp8 ? kernels::attn::KvFormat::fp8 : kernels::attn::KvFormat::bf16)
+                                 : kernels::attn::KvFormat(kv_format);
+  st.kv_fp8 = fmt == kernels::attn::KvFormat::fp8;
+  st.kv_format = std::uint8_t(fmt);
+  const DType full = st.kv_fp8 ? DType::FP8_E4M3FN : DType::BF16;
   st.k_ring = zeros(st.storage, DType::BF16, {NUM_SLIDING_VISITS, WINDOW, KV_HEADS, HEAD_DIM});
   st.v_ring = zeros(st.storage, DType::BF16, {NUM_SLIDING_VISITS, WINDOW, KV_HEADS, HEAD_DIM});
   st.ring_pos = zeros(st.storage, DType::I64, {NUM_SLIDING_VISITS, WINDOW});
   CUDA_CHECK(cudaMemset(st.ring_pos.data, 0xff, st.storage.back().bytes));  // -1
-  st.k_full = zeros(st.storage, full, {NUM_FULL_VISITS, max_ctx, KV_HEADS, HEAD_DIM});
-  st.v_full = zeros(st.storage, full, {NUM_FULL_VISITS, max_ctx, KV_HEADS, HEAD_DIM});
+  if (kernels::attn::low_bit(fmt)) {  // [8 visits][blocks of 16 positions][8 heads][format bytes]
+    const std::size_t kb = kernels::attn::cache_bytes(fmt, max_ctx, false), vb = kernels::attn::cache_bytes(fmt, max_ctx, true);
+    if (kb > std::size_t(INT32_MAX) || vb > std::size_t(INT32_MAX)) throw std::invalid_argument("max_ctx too large for the cache format");
+    st.k_full = zeros(st.storage, DType::U8, {NUM_FULL_VISITS, std::int32_t(kb)});
+    st.v_full = zeros(st.storage, DType::U8, {NUM_FULL_VISITS, std::int32_t(vb)});
+  } else {
+    st.k_full = zeros(st.storage, full, {NUM_FULL_VISITS, max_ctx, KV_HEADS, HEAD_DIM});
+    st.v_full = zeros(st.storage, full, {NUM_FULL_VISITS, max_ctx, KV_HEADS, HEAD_DIM});
+  }
   st.conv_k = zeros(st.storage, DType::FP32, {NUM_VISITS, CONV_K - 1, KV_DIM});
   st.conv_v = zeros(st.storage, DType::FP32, {NUM_VISITS, CONV_K - 1, KV_DIM});
   st.conv_attn = zeros(st.storage, DType::FP32, {NUM_VISITS, CONV_K - 1, HIDDEN});

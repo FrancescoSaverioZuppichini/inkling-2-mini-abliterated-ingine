@@ -69,6 +69,7 @@ int main(int argc, char** argv) {
   int port = 8003, max_ctx = 65536, max_queue = 4, max_model_len = 0, park_mb = -1, prefill_chunk = 3072;
   bool engine = false, fake = false, dense_fp8 = false, kv_fp8 = false, spec = false, no_vision = false;
   bool embed_host = false;
+  std::string kv_cache;
   int image_max_tokens = 4096, max_images = 16, max_image_tokens = 32768;
   double spec_threshold = 0.8, fake_delay = 0.02;
   // sampling defaults; negative: from generation_config.json
@@ -89,6 +90,8 @@ int main(int argc, char** argv) {
   ap.flag("--spec", "DSpark speculative decoding (mtp.safetensors drafter)", &spec);
   ap.flag("--kv-fp8", "FP8 E4M3 full-attention KV caches (half the memory; needed for 262144 positions on 32 GB)",
           &kv_fp8);
+  ap.option("--kv-cache", "{bf16,fp8,int4}", "full-attention KV cache format (default bf16; --kv-fp8 = fp8; int4: 4.06 bits, 500K on 24 GB)",
+            &kv_cache, {"bf16", "fp8", "int4"});
   ap.option("--spec-threshold", "", "verify the leading drafts whose draft probability exceeds this (0 = always all 7)",
             &spec_threshold);
   ap.option("--park-mb", "",
@@ -150,7 +153,8 @@ int main(int argc, char** argv) {
       options.ablation = ablation;
       options.max_ctx = max_ctx;
       options.dense_fp8 = dense_fp8;
-      options.kv_fp8 = kv_fp8;
+      options.kv_fp8 = kv_fp8 || kv_cache == "fp8";
+      if (!kv_cache.empty()) options.kv_cache = kv_cache == "bf16" ? 0 : kv_cache == "fp8" ? 1 : 2;
       options.spec = spec;
       options.spec_threshold = float(spec_threshold);
       options.park_mb = park_mb;

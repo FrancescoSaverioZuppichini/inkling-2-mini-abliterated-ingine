@@ -187,6 +187,7 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
       a.k_cache = st.k_full_at(fi).data;
       a.v_cache = st.v_full_at(fi).data;
       a.cache_fp8 = st.kv_fp8;
+      a.kv = attn::KvFormat(st.kv_format);
       a.cache_rows = st.max_ctx;
       a.kpos = nullptr;
       a.window = 0;
