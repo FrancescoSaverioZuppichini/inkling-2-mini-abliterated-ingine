@@ -3,6 +3,7 @@
 // outputs (candidate sets, picks, tokens, slots) must match exactly or be consistent with the kernel's own
 // logits.
 #include "common/test_util.h"
+#include "kernels/dense/dense.h"
 #include "kernels/draft/draft.h"
 #include "kernels/draft/rng.h"
 
@@ -16,6 +17,7 @@
 
 using namespace ingine::test;
 namespace kd = ingine::kernels::draft;
+namespace kdense = ingine::kernels::dense;
 using bf16 = __nv_bfloat16;
 
 namespace {
@@ -644,35 +646,50 @@ void test_topk(Rng& r) {
   }
 }
 
-// gather_head_rows copies the chosen rows (FP8 + scales, or BF16) and records their ids.
+// The shortlist head reads mapped rows of the unembedding (dense::Matrix::row_map): the base logits must equal, bit for
+// bit, proj over a copy of the same rows (the layout the drafter used before), FP8 rows + scales and BF16, M = 1 and 7.
 void test_shortlist_head(Rng& r) {
   const int V = 3000, n = 777;
   for (const bool fp8 : {true, false}) {
     const std::size_t row_bytes = fp8 ? std::size_t(H) : std::size_t(H) * 2;
     std::vector<uint8_t> src(std::size_t(V) * row_bytes);
-    for (auto& b : src) b = uint8_t(r.uniform(0, 256));
+    for (std::size_t i = 0; i < src.size(); ++i) {
+      uint8_t b = uint8_t(r.uniform(0, 256));
+      if (fp8) b &= 0xbf;  // finite E4M3 only
+      else if (i % 2) b = uint8_t(0x38 + (b & 0x07)) | (b & 0x80);  // BF16 high bytes of moderate magnitude
+      src[i] = b;
+    }
     std::vector<float> scale(V);
     for (auto& s : scale) s = float(r.uniform(0.1, 2.0));
     std::vector<int32_t> ids(n);
     for (auto& t : ids) t = int32_t(r.uniform(0, V));
-    DeviceArray<uint8_t> d_src(src), d_dst(std::size_t(n + 5) * row_bytes);
-    DeviceArray<float> d_scale(scale), d_dscale(n + 5);
-    DeviceArray<int32_t> d_ids(ids), d_map(n + 5);
-    // rows from 5 on, as for context rows appended to a shortlist
-    kd::gather_head_rows(d_src.get(), fp8 ? d_scale.get() : nullptr, row_bytes, d_ids.get(), n,
-                         d_dst.get() + 5 * row_bytes, fp8 ? d_dscale.get() + 5 : nullptr, d_map.get() + 5, nullptr);
-    INGINE_TEST_CUDA(cudaDeviceSynchronize());
-    const auto dst = d_dst.download();
-    const auto dscale = d_dscale.download();
-    const auto map = d_map.download();
-    bool ok = true;
+    std::vector<uint8_t> copy(std::size_t(n) * row_bytes);
+    std::vector<float> copy_scale(n);
     for (int i = 0; i < n; ++i) {
-      ok &= std::equal(dst.begin() + std::ptrdiff_t((5 + i) * row_bytes), dst.begin() + std::ptrdiff_t((6 + i) * row_bytes),
-                       src.begin() + std::ptrdiff_t(ids[i] * row_bytes));
-      ok &= map[5 + i] == ids[i] && (!fp8 || dscale[5 + i] == scale[ids[i]]);
+      std::memcpy(copy.data() + std::size_t(i) * row_bytes, src.data() + std::size_t(ids[i]) * row_bytes, row_bytes);
+      copy_scale[i] = scale[ids[i]];
     }
-    for (int i = 0; i < 5; ++i) ok &= map[i] == 0 && dscale[i] == 0.f;  // rows before untouched
-    expect(ok, fp8 ? "gather_head_rows FP8 rows + scales" : "gather_head_rows BF16 rows");
+    const std::vector<int32_t> seg = {0, n, 0};
+    DeviceArray<uint8_t> d_src(src), d_copy(copy);
+    DeviceArray<float> d_scale(scale), d_cscale(copy_scale);
+    DeviceArray<int32_t> d_ids(ids), d_seg(seg);
+    for (const int M : {1, 7}) {
+      auto x = rand_bf16(r, std::size_t(3) * M * H);
+      DeviceArray<bf16> d_x(x);
+      DeviceArray<float> d_a(std::size_t(M) * n), d_b(std::size_t(M) * n);
+      kdense::proj(d_x.get(), M, kdense::Matrix{d_src.get(), fp8 ? d_scale.get() : nullptr, n, d_ids.get()}, d_seg.get(),
+                   1, d_a.get(), false, nullptr);
+      kdense::proj(d_x.get(), M, kdense::Matrix{d_copy.get(), fp8 ? d_cscale.get() : nullptr, n}, d_seg.get(), 1,
+                   d_b.get(), false, nullptr);
+      INGINE_TEST_CUDA(cudaDeviceSynchronize());
+      const auto a = d_a.download(), b = d_b.download();
+      const bool ok = std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0;
+      char what[96];
+      std::snprintf(what, sizeof(what), "shortlist head over a row map == over copied rows (%s, M=%d)",
+                    fp8 ? "FP8" : "BF16", M);
+      std::printf("%s %s\n", ok ? "PASS" : "FAIL", what);
+      expect(ok, what);
+    }
   }
 }
 

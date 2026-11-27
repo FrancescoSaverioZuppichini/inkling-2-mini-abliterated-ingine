@@ -157,10 +157,10 @@ struct ConvEpi {
 
 // ---- M = 1: CUDA cores --------------------------------------------------------------------------------
 
-template <bool FP8, int K, int LANES, int BLOCK, class Epi>
+template <bool FP8, int K, int LANES, int BLOCK, class Epi, bool GATHER = false>
 __global__ void __launch_bounds__(BLOCK) gemv_kernel(const uint8_t* __restrict__ w,
                                                      const float* __restrict__ w_scale, int rows, uint32_t zero,
-                                                     Epi epi) {
+                                                     Epi epi, const int* __restrict__ row_map) {
   constexpr int EPC = FP8 ? 16 : 8;  // elements per 16-byte chunk
   constexpr int CH = K / (EPC * LANES);
   static_assert(K % (EPC * LANES) == 0, "row must split evenly over the lane group");
@@ -174,7 +174,8 @@ __global__ void __launch_bounds__(BLOCK) gemv_kernel(const uint8_t* __restrict__
   if (in < 0) return;
   const __nv_bfloat16* x = epi.x_of(in);  // pointer arithmetic only: the segment table is a constant
 
-  const uint8_t* wr = w + size_t(row) * ROW_BYTES;
+  const size_t wrow = GATHER ? size_t(__ldg(row_map + row)) : size_t(row);
+  const uint8_t* wr = w + wrow * ROW_BYTES;
   const std::uint64_t wpol = l2::policy<WEIGHT_L2>();
   uint4 wv[CH];
 #pragma unroll
@@ -195,7 +196,7 @@ __global__ void __launch_bounds__(BLOCK) gemv_kernel(const uint8_t* __restrict__
     for (int j = 0; j < EPC; ++j) acc = fmaf(wf[j], xf[j], acc);
   }
 
-  float v[1] = {group_sum<LANES>(acc) * (FP8 ? __ldg(w_scale + row) : 1.f)};
+  float v[1] = {group_sum<LANES>(acc) * (FP8 ? __ldg(w_scale + wrow) : 1.f)};
   if constexpr (Epi::kScatter) {
     if (gl == 0) epi.store1(row, 0, v[0]);
   } else {
@@ -233,10 +234,11 @@ __device__ __forceinline__ void mma_bf16(float (&c)[4], uint32_t a0, uint32_t a1
 #else
 #define GEMV_MMA_BOUNDS(threads) __launch_bounds__(threads)
 #endif
-template <bool FP8, int K, int M, int SPLITK, int U, class Epi>
+template <bool FP8, int K, int M, int SPLITK, int U, class Epi, bool GATHER = false>
 __global__ void GEMV_MMA_BOUNDS(32 * SPLITK) gemv_mma_kernel(const uint8_t* __restrict__ w,
                                                               const float* __restrict__ w_scale, int rows,
-                                                              uint32_t zero, Epi epi) {
+                                                              uint32_t zero, Epi epi,
+                                                              const int* __restrict__ row_map) {
   constexpr int CPL = FP8 ? 16 : 8;  // columns per lane per 16-byte weight load
   constexpr int SPAN = 4 * CPL;      // columns per step (4 lanes t)
   constexpr int KS = K / SPLITK;     // columns per warp
@@ -250,14 +252,16 @@ __global__ void GEMV_MMA_BOUNDS(32 * SPLITK) gemv_mma_kernel(const uint8_t* __re
   const int ra = r0 + g, rb = r0 + g + 8;
   const int ia = ra < rows ? epi.input_of(ra) : -1, ib = rb < rows ? epi.input_of(rb) : -1;
   const int c0 = warp * KS + t * CPL;
+  auto wrow = [&](int r) { return GATHER ? size_t(__ldg(row_map + r)) : size_t(r); };
+  const size_t wra = GATHER && ia >= 0 ? wrow(ra) : size_t(ra), wrb = GATHER && ib >= 0 ? wrow(rb) : size_t(rb);
 
   float c[4] = {0.f, 0.f, 0.f, 0.f};
   bool waited = false;
   const std::uint64_t wpol = l2::policy<WEIGHT_L2>();
   auto pass = [&](int cur) {
     const bool la = ia == cur, lb = ib == cur, lx = g < M;
-    const uint8_t* wa = w + size_t(la ? ra : 0) * ROW_BYTES;
-    const uint8_t* wb = w + size_t(lb ? rb : 0) * ROW_BYTES;
+    const uint8_t* wa = w + (la ? wra : 0) * ROW_BYTES;
+    const uint8_t* wb = w + (lb ? wrb : 0) * ROW_BYTES;
     const __nv_bfloat16* xg = epi.x_of(cur) + size_t(lx ? g : 0) * K;
 #pragma unroll 1
     for (int jb = 0; jb < NJ; jb += U) {
@@ -330,12 +334,12 @@ __global__ void GEMV_MMA_BOUNDS(32 * SPLITK) gemv_mma_kernel(const uint8_t* __re
     for (int k = threadIdx.x; k < 16 * M; k += 32 * SPLITK) {
       const int r = k / M, m = k % M, row = r0 + r;
       if (row < rows && epi.input_of(row) >= 0)
-        epi.store1(row, m, total(r, m) * (FP8 ? __ldg(w_scale + row) : 1.f));
+        epi.store1(row, m, total(r, m) * (FP8 ? __ldg(w_scale + wrow(row)) : 1.f));
     }
   } else {
     const int r = threadIdx.x, row = r0 + r;
     if (r < 16 && row < rows) {
-      const float scale = FP8 ? __ldg(w_scale + row) : 1.f;
+      const float scale = FP8 ? __ldg(w_scale + wrow(row)) : 1.f;
       float y[M];
 #pragma unroll
       for (int m = 0; m < M; ++m) y[m] = total(r, m) * scale;
@@ -349,10 +353,12 @@ __global__ void GEMV_MMA_BOUNDS(32 * SPLITK) gemv_mma_kernel(const uint8_t* __re
 // BLOCK: threads per block of the M = 1 kernel (0: M = 1 runs the tensor-core kernel too, for K whose
 // whole row per lane would not fit in registers); SPLITK: warps per 16-row block of the M >= 2 kernel;
 // UFP8: steps per load batch of its FP8 instantiation.
-template <int K, int BLOCK, int SPLITK, int UFP8, template <int> class Epi, class Make>
+template <int K, int BLOCK, int SPLITK, int UFP8, template <int> class Epi, bool GATHER = false, class Make>
 void launch_gemv(const Matrix& w, int M, bool pdl, cudaStream_t stream, Make make) {
   const bool fp8 = w.scale != nullptr;
   require(w.w != nullptr && w.rows > 0, "weight matrix is empty");
+  require(GATHER == (w.row_map != nullptr), "row_map: only proj reads mapped rows");
+  const int* rm = w.row_map;
   const int rows = w.rows;
   const float* sc = w.scale;
   const uint8_t* wp = static_cast<const uint8_t*>(w.w);
@@ -362,12 +368,12 @@ void launch_gemv(const Matrix& w, int M, bool pdl, cudaStream_t stream, Make mak
     using E = decltype(epi);
     if constexpr (MM == 1 && BLOCK > 0) {
       constexpr int B = BLOCK > 0 ? BLOCK : 32;  // (the branch is discarded for BLOCK = 0)
-      if (fp8) launch_ex(gemv_kernel<true, K, 16, B, E>, dim3((rows * 16 + B - 1) / B), B, 0, 1, pdl, stream, wp, sc, rows, 0u, epi);
-      else launch_ex(gemv_kernel<false, K, 32, B, E>, dim3((rows * 32 + B - 1) / B), B, 0, 1, pdl, stream, wp, sc, rows, 0u, epi);
+      if (fp8) launch_ex(gemv_kernel<true, K, 16, B, E, GATHER>, dim3((rows * 16 + B - 1) / B), B, 0, 1, pdl, stream, wp, sc, rows, 0u, epi, rm);
+      else launch_ex(gemv_kernel<false, K, 32, B, E, GATHER>, dim3((rows * 32 + B - 1) / B), B, 0, 1, pdl, stream, wp, sc, rows, 0u, epi, rm);
     } else {
       const dim3 blocks((rows + 15) / 16);
-      if (fp8) launch_ex(gemv_mma_kernel<true, K, MM, SPLITK, UFP8, E>, blocks, 32 * SPLITK, 0, 1, pdl, stream, wp, sc, rows, 0u, epi);
-      else launch_ex(gemv_mma_kernel<false, K, MM, SPLITK, MMA_U_BF16, E>, blocks, 32 * SPLITK, 0, 1, pdl, stream, wp, sc, rows, 0u, epi);
+      if (fp8) launch_ex(gemv_mma_kernel<true, K, MM, SPLITK, UFP8, E, GATHER>, blocks, 32 * SPLITK, 0, 1, pdl, stream, wp, sc, rows, 0u, epi, rm);
+      else launch_ex(gemv_mma_kernel<false, K, MM, SPLITK, MMA_U_BF16, E, GATHER>, blocks, 32 * SPLITK, 0, 1, pdl, stream, wp, sc, rows, 0u, epi, rm);
     }
   };
   switch (M) {
@@ -444,10 +450,12 @@ void proj(const __nv_bfloat16* xin, int M, Matrix w, const int* segments, int ns
           cudaStream_t stream) {
   require(xin && segments && out && nseg > 0, "proj: null argument");
   const int R = w.rows;
-  launch_gemv<H, 256, PROJ_SPLITK, MMA_U_FP8, ProjEpi>(w, M, pdl, stream, [&](auto mc) {
+  auto make = [&](auto mc) {
     constexpr int MM = decltype(mc)::value;
     return ProjEpi<MM>{xin, segments, nseg, R, out};
-  });
+  };
+  if (w.row_map) launch_gemv<H, 256, PROJ_SPLITK, MMA_U_FP8, ProjEpi, true>(w, M, pdl, stream, make);
+  else launch_gemv<H, 256, PROJ_SPLITK, MMA_U_FP8, ProjEpi>(w, M, pdl, stream, make);
 }
 
 void proj_conv(const __nv_bfloat16* x, int M, Matrix w, const float* conv_w, float* conv_state, float* out,

@@ -176,9 +176,8 @@ class Drafter {
   __nv_bfloat16 *fold_w_ = nullptr, *fold_b_ = nullptr;
   kernels::dense::Matrix head_{};         // the unembedding
   // the shortlist head: rows [0, short_K_) = ranked tokens and specials (ascending ids), then context tokens
-  kernels::dense::Matrix short_head_{};   // [short_K_ + CONTEXT_ROWS, H] like head_
+  kernels::dense::Matrix short_head_{};   // [short_K_ + CONTEXT_ROWS, H]: head_'s rows through short_map_
   std::int32_t* short_map_ = nullptr;     // row -> token id
-  std::int32_t* short_ids_ = nullptr;     // staging of ids to gather
   int short_K_ = 0, short_E_ = 0;         // ranked rows, context rows in use
   std::vector<std::uint8_t> short_in_;    // host: token has a row
   std::vector<std::int32_t> short_extra_; // host: the context tokens, in row order

@@ -158,11 +158,6 @@ std::size_t topk_workspace_bytes(int rows, int V);
 void topk_candidates(const float* base, int rows, int V, const std::int32_t* map, float* cand_val,
                      std::int32_t* cand_idx, void* ws, cudaStream_t stream);
 
-// Copies head rows ids[0..n) of src [V, row_bytes] (+ the FP32 row scales of FP8 rows if src_scale) to dst
-// rows 0..n (+ dst_scale) and sets map[i] = ids[i]. row_bytes: a multiple of 16.
-void gather_head_rows(const void* src, const float* src_scale, std::size_t row_bytes, const std::int32_t* ids, int n,
-                      void* dst, float* dst_scale, std::int32_t* map, cudaStream_t stream);
-
 // part[i, r] = sum_{c >= 512} rnn_w[r, c] z_i[c] in fp32, z_i[512:] = (h[i], f_rnn): the step-independent
 // part of the rnn projection. rnn_w bf16 [768, 5120], h bf16 [GAMMA, H], f_rnn bf16 [H], part fp32 [7, 768].
 void markov_pre(const __nv_bfloat16* rnn_w, const __nv_bfloat16* h, const __nv_bfloat16* f_rnn, float* part,

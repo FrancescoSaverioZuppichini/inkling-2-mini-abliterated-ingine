@@ -398,29 +398,7 @@ __global__ void __launch_bounds__(CANDIDATES) markov_finish_kernel(const std::in
   }
 }
 
-// block per row
-__global__ void gather_head_rows_kernel(const uint4* __restrict__ src, const float* __restrict__ src_scale,
-                                        int row_chunks, const std::int32_t* __restrict__ ids, uint4* dst,
-                                        float* dst_scale, std::int32_t* map) {
-  const int i = blockIdx.x, id = ids[i];
-  for (int c = threadIdx.x; c < row_chunks; c += blockDim.x)
-    dst[std::size_t(i) * row_chunks + c] = src[std::size_t(id) * row_chunks + c];
-  if (threadIdx.x == 0) {
-    if (src_scale != nullptr) dst_scale[i] = src_scale[id];
-    map[i] = id;
-  }
-}
-
 }  // namespace
-
-void gather_head_rows(const void* src, const float* src_scale, std::size_t row_bytes, const std::int32_t* ids, int n,
-                      void* dst, float* dst_scale, std::int32_t* map, cudaStream_t stream) {
-  if (row_bytes % 16 != 0) throw std::invalid_argument("gather_head_rows: rows must be 16-byte multiples");
-  if (n <= 0) return;
-  gather_head_rows_kernel<<<n, 128, 0, stream>>>(static_cast<const uint4*>(src), src_scale, int(row_bytes / 16), ids,
-                                                  static_cast<uint4*>(dst), dst_scale, map);
-  CUDA_CHECK(cudaGetLastError());
-}
 
 std::size_t topk_workspace_bytes(int rows, int V) {
   (void)V;

@@ -19,6 +19,10 @@ struct Matrix {
   const void* w = nullptr;
   const float* scale = nullptr;
   int rows = 0;
+  // [Agent] Optional int32 [rows]: row r of the matrix is row row_map[r] of `w` (and of `scale`). The drafter's
+  // shortlist head reads its rows straight out of the unembedding this way instead of keeping a 216 MiB copy; each
+  // row is still one contiguous run, so the loads stay coalesced and every dot product keeps its bits. proj only.
+  const int* row_map = nullptr;
 };
 
 // proj: multi-segment GEMV. xin bf16 [3, M, H]; segments int32 device [nseg, 3] = (row_begin, row_end,

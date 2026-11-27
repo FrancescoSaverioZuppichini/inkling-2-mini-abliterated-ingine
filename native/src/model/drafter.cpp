@@ -136,15 +136,12 @@ Drafter::Drafter(const std::filesystem::path& model_dir, const Weights& w, int m
       if (short_in_[t]) list.push_back(t);
     short_K_ = int(list.size());
     const int rows = short_K_ + CONTEXT_ROWS;
-    const std::size_t row_bytes = head_.scale ? std::size_t(H) : std::size_t(H) * 2;
-    void* q = alloc(std::size_t(rows) * row_bytes);
-    auto* qs = head_.scale ? f32s(rows) : nullptr;
+    // [Agent] The shortlist head is a row map over the unembedding (dense::Matrix::row_map), not a copy of its rows:
+    // the same bytes reach the same GEMV, so the base logits keep their bits and 216 MiB stay free.
     short_map_ = i32s(rows);
-    short_ids_ = i32s(rows);
     CUDA_CHECK(cudaMemsetAsync(short_map_, 0, std::size_t(rows) * 4, stream_));
-    CUDA_CHECK(cudaMemcpyAsync(short_ids_, list.data(), list.size() * 4, cudaMemcpyHostToDevice, stream_));
-    kd::gather_head_rows(head_.w, head_.scale, row_bytes, short_ids_, short_K_, q, qs, short_map_, stream_);
-    short_head_ = kdense::Matrix{q, qs, rows};
+    CUDA_CHECK(cudaMemcpyAsync(short_map_, list.data(), list.size() * 4, cudaMemcpyHostToDevice, stream_));
+    short_head_ = kdense::Matrix{head_.w, head_.scale, rows, short_map_};
     seg_short_ = segments({short_K_});
     kd::fill(base_, std::size_t(GAMMA) * rows, -INFINITY, stream_);
   }
@@ -332,12 +329,8 @@ void Drafter::note_tokens(std::span<const std::int32_t> ids) {
     }
   if (add.empty()) return;
   const std::size_t row = std::size_t(short_K_ + short_E_);
-  const std::size_t row_bytes = head_.scale ? std::size_t(H) : std::size_t(H) * 2;
-  // pageable sources: copied before cudaMemcpyAsync returns; short_ids_ is free once earlier gathers ran
-  CUDA_CHECK(cudaMemcpyAsync(short_ids_, add.data(), add.size() * 4, cudaMemcpyHostToDevice, stream_));
-  kd::gather_head_rows(head_.w, head_.scale, row_bytes, short_ids_, int(add.size()),
-                       static_cast<std::uint8_t*>(const_cast<void*>(short_head_.w)) + row * row_bytes,
-                       head_.scale ? const_cast<float*>(short_head_.scale) + row : nullptr, short_map_ + row, stream_);
+  // pageable source: copied before cudaMemcpyAsync returns
+  CUDA_CHECK(cudaMemcpyAsync(short_map_ + row, add.data(), add.size() * 4, cudaMemcpyHostToDevice, stream_));
   short_extra_.insert(short_extra_.end(), add.begin(), add.end());
   short_E_ += int(add.size());
   const int seg[3] = {0, short_K_ + short_E_, 0};
