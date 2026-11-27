@@ -75,7 +75,7 @@ class Prefiller {
   int *counts_, *tiles_n_, *pair_token_, *pair_dst_;
   int4* tiles_;
   __nv_bfloat16 *act_, *down_, *moe_sum_;
-  __nv_bfloat16* wscratch_;  // dequantized FP8 rows of wproj / wo (dense_fp8)
+  __nv_bfloat16* wscratch_;  // dequantized FP8 / INT8 rows of wproj / wo (quantized dense formats)
   std::int64_t* ids_;
   int kpos_rows_;
   bool split_sliding_;

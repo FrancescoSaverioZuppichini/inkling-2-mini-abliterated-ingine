@@ -69,6 +69,7 @@ int main(int argc, char** argv) {
   int port = 8003, max_ctx = 65536, max_queue = 4, max_model_len = 0, park_mb = -1, prefill_chunk = 3072;
   bool engine = false, fake = false, dense_fp8 = false, kv_fp8 = false, spec = false, no_vision = false;
   bool embed_host = false;
+  std::string dense = "bf16";
   std::string kv_cache = "bf16";
   int image_max_tokens = 4096, max_images = 16, max_image_tokens = 32768;
   double spec_threshold = 0.8, fake_delay = 0.02;
@@ -86,7 +87,12 @@ int main(int argc, char** argv) {
   ap.option("--ablation", "", "ablation file (safetensors) applied at every visit", &ablation);
   ap.option("--max-ctx", "", "positions held by the full-attention caches", &max_ctx);
   ap.option("--backend", "{fast}", "decode step implementation", &backend, {"fast"});
-  ap.flag("--dense-fp8", "FP8 E4M3 dense projections and head (row scales)", &dense_fp8);
+  ap.option("--dense", "{bf16,fp8,int8}",
+            "dense projections, wo and head: bf16 (default, the checkpoint), fp8 (E4M3 rows) or int8 (INT8 rows), both "
+            "with a scale per row (about 1 GB less memory, lossy)",
+            &dense, {"bf16", "fp8", "int8"});
+  ap.flag("--dense-fp8", "same as --dense fp8", &dense_fp8);
+  ap.exclusive({"--dense", "--dense-fp8"}, false);
   ap.flag("--spec", "DSpark speculative decoding (mtp.safetensors drafter)", &spec);
   ap.flag("--kv-fp8", "same as --kv-cache fp8", &kv_fp8);
   ap.option("--kv-cache", "{bf16,fp8,int8,k8v4,int4,fp4}",
@@ -154,7 +160,7 @@ int main(int argc, char** argv) {
       options.model_dir = model_dir;
       options.ablation = ablation;
       options.max_ctx = max_ctx;
-      options.dense_fp8 = dense_fp8;
+      options.dense = ingine::model::dense_format_of(dense_fp8 ? "fp8" : dense);
       options.kv = ingine::model::kv_format_of(kv_fp8 ? "fp8" : kv_cache);
       options.spec = spec;
       options.spec_threshold = float(spec_threshold);

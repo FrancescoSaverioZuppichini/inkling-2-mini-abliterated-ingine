@@ -65,13 +65,14 @@ struct Args {
   double max_kl = 0.25;
   double max_mean_kl = 0.01;
   double min_top1 = 0.95;
+  std::string dense;  // --dense: overrides the manifest's dense format (bf16 | fp8 | int8)
 };
 
 void usage() {
   std::printf(
       "usage: ingine-validate [--model-dir DIR] [--ablation FILE] [--golden DIR] [--cases SUBSTR] [--generate [--spec]]\n"
       "                       [--path N [--spec] [--tie-margin X] [--max-gap-rate R]] [--max-kl X] [--max-mean-kl X]\n"
-      "                       [--min-top1 F]\n"
+      "                       [--min-top1 F] [--dense bf16|fp8|int8]\n"
       "--cases takes comma-separated name substrings; --ablation defaults to <golden>/ablation.safetensors, the\n"
       "plain-projection file the goldens of the abliterated model were made with\n");
 }
@@ -297,6 +298,7 @@ int main(int argc, char** argv) {
     else if (k == "--max-kl") a.max_kl = std::stod(val());
     else if (k == "--max-mean-kl") a.max_mean_kl = std::stod(val());
     else if (k == "--min-top1") a.min_top1 = std::stod(val());
+    else if (k == "--dense") a.dense = val();
     else {
       usage();
       return k == "--help" || k == "-h" ? 0 : 2;
@@ -332,7 +334,9 @@ int main(int argc, char** argv) {
       opt.model_dir = a.model_dir;
       opt.ablation = key.first ? a.ablation : fs::path();
       opt.kv = key.second ? ingine::model::KvFormat::fp8 : ingine::model::KvFormat::bf16;
-      opt.dense_fp8 = manifest.value("dense_fp8", true);
+      opt.dense = !a.dense.empty()                      ? ingine::model::dense_format_of(a.dense)
+                  : manifest.value("dense_fp8", true) ? ingine::model::DenseFormat::fp8
+                                                      : ingine::model::DenseFormat::bf16;
       opt.max_ctx = manifest.value("max_ctx", 8192);
       opt.prefill_chunk = manifest.value("prefill_chunk", 2048);
       opt.spec = a.generate && a.spec;

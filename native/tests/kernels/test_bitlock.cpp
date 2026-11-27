@@ -1,5 +1,6 @@
 // Bitwise lock of the weight-streaming and attention decode kernels for every call width M = 1..8 (the dense
-// mix / message_gates / router locks are in test_dense.cpp): proj, proj_conv and head (BF16 and FP8 rows),
+// mix / message_gates / router locks are in test_dense.cpp): proj, proj_conv and head (BF16 and FP8 rows; INT8
+// rows in a lock of their own),
 // moe_up and moe_down (NVFP4 and MXFP8, experts shared between rows), and sliding-window attention. A verify
 // call of M rows must keep giving the bits it gave when these hashes were recorded: on fixed inputs every
 // output byte (activations, conv states and histories, cache rows, ring positions) is hashed and compared
@@ -146,6 +147,46 @@ uint64_t lock_head(LockGen& g, const DenseWeight& w, int M) {
     sync();
     f.add(out.download());
   }
+  return f.h;
+}
+
+// INT8 rows (dense.h layout; every byte is a valid code) with per-row scales: proj in its three layouts, proj_conv
+// and head, one hash per M. Inputs come from their own generator, so the locks above keep theirs.
+struct Int8Weight {
+  int rows;
+  DeviceArray<uint8_t> q;
+  DeviceArray<float> scale;
+  Int8Weight(LockGen& g, int rows_, int K)
+      : rows(rows_), q(g.bytes(size_t(rows_) * K)), scale(g.vec(size_t(rows_), 1e-4f, 4e-4f)) {}
+  dense::Matrix matrix() const { return dense::Matrix{q.get(), scale.get(), rows, nullptr, true}; }
+};
+
+uint64_t lock_int8(LockGen& g, const Int8Weight& wproj, const Int8Weight& wo, int M) {
+  Fnv f;
+  DeviceArray<__nv_bfloat16> xin(to_bf16(g.vec_bf16(size_t(3) * M * H, 1.5f)));
+  for (int shape = 0; shape < 3; ++shape) {
+    const bool full = shape == 2;
+    const std::vector<int> seg = segments(full, shape == 0);
+    dense::Matrix m = wproj.matrix();
+    m.rows = full ? 8664 : 8600;
+    DeviceArray<int> dseg(seg);
+    DeviceArray<float> out(size_t(M) * m.rows);
+    dense::proj(xin.get(), M, m, dseg.get(), int(seg.size() / 3), out.get(), true, g_stream);
+    sync();
+    f.add(out.download());
+  }
+  DeviceArray<__nv_bfloat16> x(to_bf16(g.vec_bf16(size_t(M) * 3072, 1.5f)));
+  DeviceArray<float> cw(g.vec(size_t(H) * 4, 0.5f)), st(g.vec_bf16(size_t(3) * H, 0.3f)), out(size_t(M) * H),
+      hist(size_t(M) * H);
+  dense::proj_conv(x.get(), M, wo.matrix(), cw.get(), st.get(), out.get(), hist.get(), true, g_stream);
+  sync();
+  f.add(out.download()), f.add(hist.download()), f.add(st.download());
+  dense::Matrix head = wproj.matrix();
+  head.rows = 5003;  // a last block with fewer than 16 rows
+  DeviceArray<float> logits(size_t(M) * head.rows);
+  dense::head(xin.get(), M, head, logits.get(), true, g_stream);
+  sync();
+  f.add(logits.download());
   return f.h;
 }
 
@@ -353,6 +394,16 @@ int main() {
       std::printf("%s0x%016llxull", i ? ", " : "", static_cast<unsigned long long>(got[M - 1][i]));
     std::printf("},%s\n", diff.c_str());
     ok = ok && same;
+  }
+  {
+    // [Agent] No INT8 hashes are recorded yet: every GPU prints its own (INFO) until they are.
+    LockGen gw{0x10c55000ull};
+    const Int8Weight wproj(gw, 8664, H), wo(gw, H, 3072);
+    for (int M = 1; M <= 8; ++M) {
+      LockGen g{0x10c56000ull + uint64_t(M)};
+      std::printf("INFO int8 bit lock M=%d: 0x%016llxull\n", M,
+                  static_cast<unsigned long long>(lock_int8(g, wproj, wo, M)));
+    }
   }
   INGINE_TEST_CUDA(cudaStreamDestroy(g_stream));
   std::printf("%s\n", ok ? "ALL PASS" : "SOME FAILED");

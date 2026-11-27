@@ -100,9 +100,9 @@ int main(int argc, char** argv) {
 
   DeviceHeap heap;
   std::vector<Layer> nv;  // NVFP4 layers (sliding 1, 2, 3 and full 5)
-  for (int l : {1, 2, 3, 5}) nv.push_back(load_layer(model_dir, l, true, s, heap));
+  for (int l : {1, 2, 3, 5}) nv.push_back(load_layer(model_dir, l, DenseFormat::fp8, s, heap));
   std::vector<Layer> mx;
-  if (want("moe")) mx.push_back(load_layer(model_dir, 20, true, s, heap));
+  if (want("moe")) mx.push_back(load_layer(model_dir, 20, DenseFormat::fp8, s, heap));
   INGINE_TEST_CUDA(cudaStreamSynchronize(s));
   pk::Gemm gemm;
 

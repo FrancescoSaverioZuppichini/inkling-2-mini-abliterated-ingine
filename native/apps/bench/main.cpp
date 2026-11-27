@@ -139,6 +139,7 @@ int main(int argc, char** argv) {
   std::string model_dir = default_model_dir(), backend = "fast", ablation, effort = "low", forced, forced_trace;
   int max_ctx = 32768, tokens = 512, runs = 3, long_prompt = 0, forced_items = 0, forced_skip = 0, forced_free = -1;
   bool dense_fp8 = false, kv_fp8 = false, spec = false;
+  std::string dense = "bf16";
   std::string kv_cache = "bf16";
   double spec_threshold = 0.8, temperature = 0.0;
 
@@ -151,7 +152,10 @@ int main(int argc, char** argv) {
   ap.option("--tokens", "", "", &tokens);
   ap.option("--runs", "", "", &runs);
   ap.option("--effort", "", "", &effort);
-  ap.flag("--dense-fp8", "", &dense_fp8);
+  ap.option("--dense", "{bf16,fp8,int8}", "dense projections, wo and head: bf16 (default), fp8 or int8 rows", &dense,
+            {"bf16", "fp8", "int8"});
+  ap.flag("--dense-fp8", "same as --dense fp8", &dense_fp8);
+  ap.exclusive({"--dense", "--dense-fp8"}, false);
   ap.flag("--kv-fp8", "same as --kv-cache fp8", &kv_fp8);
   ap.option("--kv-cache", "{bf16,fp8,int8,k8v4,int4,fp4}",
             "full-attention KV caches: bf16 (default), fp8 (half the memory), int8 (8.13 bits, rotated), k8v4 (6.06 "
@@ -181,7 +185,7 @@ int main(int argc, char** argv) {
     options.model_dir = model_dir;
     options.ablation = ablation;
     options.max_ctx = max_ctx;
-    options.dense_fp8 = dense_fp8;
+    options.dense = ingine::model::dense_format_of(dense_fp8 ? "fp8" : dense);
     options.kv = ingine::model::kv_format_of(kv_fp8 ? "fp8" : kv_cache);
     options.spec = spec;
     options.spec_threshold = float(spec_threshold);

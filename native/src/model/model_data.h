@@ -122,12 +122,14 @@ inline T* ptr(const Tensor& t) {
 
 // ----------------------------------------------------------------------------------------------- weights
 
-// A dense matrix as the decoder stores it: BF16 rows, or float8_e4m3fn rows with FP32 per-row scales
-// (`scale.data != nullptr`; value = fp8 * scale, see weights.dequant / dense fp8_rows).
+// A dense matrix as the decoder stores it: BF16 rows, or float8_e4m3fn / INT8 rows with FP32 per-row scales
+// (`scale.data != nullptr`; value = code * scale, see weights.dequant / dense fp8_rows, int8_rows).
 struct Dense {
-  Tensor w;      // [rows, cols] bf16 or fp8
+  Tensor w;      // [rows, cols] bf16, fp8 or int8 (I8: the dense int8_rows layout)
   Tensor scale;  // [rows] fp32, or empty (data == nullptr) for BF16
-  bool fp8() const { return scale.data != nullptr; }
+  bool quantized() const { return scale.data != nullptr; }
+  bool fp8() const { return w.dtype == DType::FP8_E4M3FN; }
+  bool int8() const { return w.dtype == DType::I8; }
   int rows() const { return w.ne[1]; }
   int cols() const { return w.ne[0]; }
 };
@@ -195,10 +197,10 @@ struct Weights {
   Tensor embed_norm;          // fp32 [H]
   Tensor final_query;         // fp32 [1, H]
   Tensor final_norm;          // fp32 [H] (also final_norm1 = [1, H] view of the same memory)
-  Dense unembed;              // [UNPADDED_VOCAB, H] bf16, or FP8 rows + scales (dense_fp8)
+  Dense unembed;              // [UNPADDED_VOCAB, H] bf16, or FP8 / INT8 rows + scales
   Tensor message_queries;     // fp32 [12, 4, H]: q, k, v, mlp per loop layer
   std::array<ExpertFormat, LAYERS> expert_formats{};
-  bool dense_fp8 = false;     // wproj (+ views), wo and unembed are FP8 rows
+  DenseFormat dense = DenseFormat::bf16;  // wproj (+ views), wo and unembed
 
   DeviceHeap heap;                    // device memory behind the views (one packed range)
   MappedHostBuffer embed_host;        // the embedding table when it is kept in host memory

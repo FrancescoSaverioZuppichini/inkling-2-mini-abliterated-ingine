@@ -82,7 +82,7 @@ struct Gen {
 Weights synthetic_weights(cudaStream_t stream) {
   Weights w;
   Gen g{Rng(77), w.heap, stream};
-  w.dense_fp8 = true;
+  w.dense = DenseFormat::fp8;
   // experts shared by every layer (NVFP4); only experts 0..7 exist, the router bias selects exactly them
   Experts ex;
   ex.fmt = ExpertFormat::NVFP4;

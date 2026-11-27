@@ -56,8 +56,8 @@ Drafter::Drafter(const std::filesystem::path& model_dir, const Weights& w, int m
                  int shortlist_rows)
     : w_(w), stream_(stream), ctx_(std::min(max_ctx, DRAFT_CTX)) {
   if (max_ctx < 2 * BLOCK) throw std::invalid_argument("Drafter: max_ctx must hold two blocks");
-  head_ = {w.unembed.w.data, w.unembed.fp8() ? static_cast<const float*>(w.unembed.scale.data) : nullptr,
-           w.unembed.rows()};
+  head_ = {w.unembed.w.data, w.unembed.quantized() ? static_cast<const float*>(w.unembed.scale.data) : nullptr,
+           w.unembed.rows(), nullptr, w.unembed.int8()};
   V_ = w.unembed.rows();
   load(model_dir);
 
@@ -138,7 +138,7 @@ Drafter::Drafter(const std::filesystem::path& model_dir, const Weights& w, int m
     CUDA_CHECK(cudaMemcpyAsync(short_map_, list.data(), list.size() * 4, cudaMemcpyHostToDevice, stream_));
     w1_rows_ = bf16s(std::size_t(rows) * kd::RANK);
     put_w1_rows(list, 0);
-    short_head_ = kdense::Matrix{head_.w, head_.scale, rows, short_map_};
+    short_head_ = kdense::Matrix{head_.w, head_.scale, rows, short_map_, head_.int8};
     seg_short_ = segments({short_K_});
     kd::fill(base_, std::size_t(GAMMA) * rows, -INFINITY, stream_);
   }
@@ -293,7 +293,20 @@ void Drafter::load(const std::filesystem::path& model_dir) {
   fold_b_ = static_cast<__nv_bfloat16*>(heap_.alloc(std::size_t(V_) * 2));
   const __nv_bfloat16* hw = persist({{mh + "hidden_out.weight", {h, kd::RANK}}});
   const __nv_bfloat16* hb = persist({{mh + "hidden_out.bias", {h}}});
-  kd::fold_head(w_.unembed.w.data, head_.scale, V_, hw, hb, fold_w_, fold_b_, stream_);
+  if (!head_.int8) {
+    kd::fold_head(w_.unembed.w.data, head_.scale, V_, hw, hb, fold_w_, fold_b_, stream_);
+  } else {
+    // [Agent] fold_head reads BF16 or FP8 rows. INT8 rows reach it dequantized (bf16(q * scale), the weights.dequant
+    // value it would compute itself) one slice at a time in `cat` (2 I rows of H), so no extra memory is needed.
+    const int slice = int(2 * I);
+    auto* u = static_cast<__nv_bfloat16*>(cat.p);
+    for (int r = 0; r < V_; r += slice) {
+      const int n = std::min(slice, V_ - r);
+      kdense::dequant_rows(static_cast<const std::int8_t*>(head_.w) + std::size_t(r) * H, head_.scale + r, n, H, u,
+                           stream_, true);
+      kd::fold_head(u, nullptr, n, hw, hb, fold_w_ + std::size_t(r) * kd::RANK, fold_b_ + r, stream_);
+    }
+  }
   CUDA_CHECK(cudaStreamSynchronize(stream_));  // cat is freed on return
 }
 

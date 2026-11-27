@@ -183,11 +183,19 @@ update + attention residual + RMS norm.
   * norm_w[g])`. For the MLP-side gate (G = 1) the host also needs `gated` in FP32: provide an
   optional `out_f32`.
 
-`head(x, w, w_scale, out)` — `x` bf16 `[M, H]`, `w` `[200058, H]` bf16 or fp8 + row scales,
+`head(x, w, w_scale, out)` — `x` bf16 `[M, H]`, `w` `[200058, H]` bf16, or fp8 / int8 + row scales,
 `out[m, v] = 30 * tanh(bf16(w_v · x)/30)` fp32 `[M, 200058]`. Target: DRAM bandwidth (0.92 GB BF16).
 
-FP8 option (all GEMVs above): `fp8_rows(w_bf16) -> (w_fp8, scale)` with `scale[r] = max|w_r| / 448`; the
-serving profile uses it (`--dense-fp8`).
+FP8 option (all GEMVs above): `fp8_rows(w_bf16) -> (w_fp8, scale)` with `scale[r] = max|w_r| / 448`
+(`--dense fp8`, alias `--dense-fp8`).
+
+INT8 option (all GEMVs above, `--dense int8`): `int8_rows(w_bf16) -> (q, scale)` with `scale[r] = max|w_r| / 127`,
+`q = rint(w / scale)` in [-127, 127] (round half to even), value `q * scale`. Each 4-byte word holding elements
+0..3 of a row stores sign-magnitude codes (`m = |q|`, `s = sign << 7`) as bytes `[m0 | s2, m3 | s0, m1 | s3, m2 | s1]`:
+one AND gives elements 0, 1 as BF16 words `±m * 2^-133`, a byte rotation and the same AND gives 2, 3, and one BF16x2
+FMA by `2^127` makes them exactly `q * 2^-6` (the `2^6` is applied with the row scale). The GEMVs' dot products are
+`scale[r] * Σ q x` in FP32 (exact products, same accumulation as BF16 rows). `dequant_rows(q, scale, int8)` gives
+`bf16(q * scale)` (prefill and the drafter's fold).
 
 ## Area `vision` (image tower)
 

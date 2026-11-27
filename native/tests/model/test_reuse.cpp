@@ -25,7 +25,8 @@ int main() {
   RuntimeOptions opt;
   opt.model_dir = dir;
   opt.max_ctx = 8192;  // drafter buckets 1024, 2048, 4096, 8192
-  opt.dense_fp8 = opt.spec = true;
+  opt.dense = DenseFormat::fp8;
+  opt.spec = true;
   opt.kv = KvFormat::fp8;
   opt.prefill_chunk = 512;
   opt.park_mb = 0;  // the checkpoint tests below see no parked conversations

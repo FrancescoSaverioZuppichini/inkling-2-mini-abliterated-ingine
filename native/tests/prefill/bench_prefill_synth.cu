@@ -148,7 +148,7 @@ int main() {
   w.unembed.w = rm(ex.w13.data, DType::FP8_E4M3FN, {UNPADDED_VOCAB, H});  // any 461 MB of E4M3-like bytes
   w.unembed.scale = a.f32({UNPADDED_VOCAB}, 0.f, 1e-3f);
   w.message_queries = a.f32({LOOP_END - LOOP_START, 4, H}, 0.02f);
-  w.dense_fp8 = true;
+  w.dense = DenseFormat::fp8;
   const Ablation abl = load_ablation({});
   State st = make_state(N, KvFormat::fp8);
   INGINE_TEST_CUDA(cudaDeviceSynchronize());

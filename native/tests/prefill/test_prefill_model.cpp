@@ -71,7 +71,7 @@ int main(int argc, char** argv) {
   const std::string abl = std::string(INGINE_GOLDEN_DIR) + "/model/ablation.safetensors";
   if (std::ifstream(abl)) opt.ablation = abl;
   opt.max_ctx = 8192;
-  opt.dense_fp8 = true;
+  opt.dense = DenseFormat::fp8;
   opt.kv = kv_fp8 ? KvFormat::fp8 : KvFormat::bf16;
   Runtime rt(opt);
   const cudaStream_t s = rt.stream();

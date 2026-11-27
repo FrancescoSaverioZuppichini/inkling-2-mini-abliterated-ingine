@@ -45,7 +45,7 @@ std::vector<T> download(const void* p, std::size_t n) {
 
 bool check_layer(const SafetensorsModel& m, int l, cudaStream_t stream) {
   DeviceHeap heap;
-  const Layer layer = load_layer(INGINE_MODEL_DIR, l, true, stream, heap);
+  const Layer layer = load_layer(INGINE_MODEL_DIR, l, DenseFormat::fp8, stream, heap);
   const std::string p = "model.llm.layers." + std::to_string(l) + ".";
   bool ok = true;
   auto expect = [&](bool c, const std::string& what) {

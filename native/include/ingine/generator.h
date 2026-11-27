@@ -98,13 +98,26 @@ struct GenerateStats {
   double vision_seconds = 0;
 };
 
+// Storage of the dense matrices (attention projections, wo, unembedding). bf16: as in the checkpoint; fp8: E4M3
+// rows, int8: INT8 rows (native/KERNELS.md, area `dense`), both with an FP32 scale per row, quantized at load (half
+// the bytes, lossy).
+enum class DenseFormat : std::uint8_t { bf16, fp8, int8 };
+// "bf16" | "fp8" | "int8"; throws std::invalid_argument on anything else.
+inline DenseFormat dense_format_of(const std::string& name) {
+  if (name == "bf16") return DenseFormat::bf16;
+  if (name == "fp8") return DenseFormat::fp8;
+  if (name == "int8") return DenseFormat::int8;
+  throw std::invalid_argument("unknown dense format: " + name);
+}
+
 struct RuntimeOptions {
   std::filesystem::path model_dir, ablation;  // empty ablation: original model
   int max_ctx = 65536;
   // Tokens per prefill chunk. 3072 (the largest the sliding attention takes) reads a long prompt 6-10% faster
   // than 2048 for 0.38 GB more scratch; results differ between chunk sizes only by rounding.
   int prefill_chunk = 3072;
-  bool dense_fp8 = true, spec = false;
+  bool spec = false;
+  DenseFormat dense = DenseFormat::bf16;
   KvFormat kv = KvFormat::bf16;
   // [Agent] Keep the BF16 embedding table (0.86 GiB) in pinned host memory that the GPU reads over PCIe. A step reads
   // only its 1-8 token rows (4.6 KB each), so it costs about a microsecond and frees the memory for context on 24 GB.

@@ -93,7 +93,8 @@ void with_spec_and_small_chunks(const ingine::text::ChatFormat& fmt, const fs::p
   RuntimeOptions opt;
   opt.model_dir = dir;
   opt.max_ctx = 16384;
-  opt.dense_fp8 = opt.spec = true;
+  opt.dense = DenseFormat::fp8;
+  opt.spec = true;
   opt.kv = KvFormat::fp8;
   opt.prefill_chunk = 512;
   opt.park_mb = 2048;
@@ -169,7 +170,7 @@ void plain_with_large_chunks(const ingine::text::ChatFormat& fmt, const fs::path
   RuntimeOptions opt;
   opt.model_dir = dir;
   opt.max_ctx = 16384;
-  opt.dense_fp8 = true;
+  opt.dense = DenseFormat::fp8;
   opt.kv = KvFormat::fp8;
   opt.spec = false;
   opt.prefill_chunk = 3072;

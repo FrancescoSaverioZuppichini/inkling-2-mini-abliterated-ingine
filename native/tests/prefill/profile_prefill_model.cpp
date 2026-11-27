@@ -53,7 +53,7 @@ int main(int argc, char** argv) {
 
   cudaStream_t s;
   INGINE_TEST_CUDA(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
-  const Weights w = load_weights(model_dir, true, false, s);
+  const Weights w = load_weights(model_dir, DenseFormat::fp8, false, s);
   const std::string abl_path = std::string(INGINE_SOURCE_DIR) + "/../ablation/inkling-2-mini-abliterated.safetensors";
   const Ablation abl = load_ablation(std::ifstream(abl_path) ? abl_path : std::string());
   State st = make_state(max_ctx, KvFormat::fp8);

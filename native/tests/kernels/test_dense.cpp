@@ -1,8 +1,8 @@
 // Dense decode kernels (src/kernels/dense) against FP64 oracles of KERNELS.md area `dense`, at the model's
-// shapes with synthetic weights (adapted from the PyTorch engine's test_dense.py: proj BF16/FP8 for several M and
-// both projection layouts, proj_conv with its state update and history, head BF16/FP8, router with FP32 and
+// shapes with synthetic weights (adapted from the PyTorch engine's test_dense.py: proj BF16/FP8/INT8 for several M
+// and both projection layouts, proj_conv with its state update and history, head BF16/FP8/INT8, router with FP32 and
 // BF16 weights, mix over its block/query/optional-tensor variants, message gates G = 1/3 with FP32/BF16
-// forget/gain weights, embed, fp8_rows and dequant_rows).
+// forget/gain weights, embed, fp8_rows, int8_rows and dequant_rows).
 #include "kernels/oracle.h"
 
 #include "kernels/dense/dense.h"
@@ -23,29 +23,55 @@ cudaStream_t g_stream = nullptr;
 
 void sync() { INGINE_TEST_CUDA(cudaStreamSynchronize(g_stream)); }
 
-// A random weight matrix [rows, K] as the kernels take it: BF16 values, or FP8 codes + row scales.
+enum Fmt { BF16, FP8, INT8 };
+const char* fmt_name(Fmt f) { return f == INT8 ? "int8" : f == FP8 ? "fp8" : "bf16"; }
+
+// 4 INT8 codes q[0..3] (|q| <= 127) as one word of the dense.h row layout: bytes [m0 | s2, m3 | s0, m1 | s3, m2 | s1].
+void pack_int8(const int* q, uint8_t* out) {
+  auto ms = [&](int m, int s) { return uint8_t(std::abs(q[m]) | (q[s] < 0 ? 0x80 : 0)); };
+  out[0] = ms(0, 2), out[1] = ms(3, 0), out[2] = ms(1, 3), out[3] = ms(2, 1);
+}
+
+// A random weight matrix [rows, K] as the kernels take it: BF16 values, or FP8 / INT8 codes + row scales.
 struct Weights {
   int rows = 0, K = 0;
-  bool fp8 = false;
+  Fmt fmt = BF16;
   std::vector<double> value;  // effective value per element (code * scale applied at the end, see dot())
-  std::vector<float> scale;   // fp8: per-row scale
-  std::vector<double> code;   // fp8: decoded E4M3 value; bf16: the value
+  std::vector<float> scale;   // fp8 / int8: per-row scale
+  std::vector<double> code;   // fp8: decoded E4M3 value; int8: q; bf16: the value
   std::optional<DeviceArray<uint8_t>> dev;
   std::optional<DeviceArray<float>> dev_scale;
-  dense::Matrix matrix() const { return {dev->get(), fp8 ? dev_scale->get() : nullptr, rows}; }
+  dense::Matrix matrix() const { return {dev->get(), fmt != BF16 ? dev_scale->get() : nullptr, rows, nullptr, fmt == INT8}; }
   double dot(int r, const float* x) const {
     double s = 0;
     const double* c = &code[size_t(r) * K];
     for (int k = 0; k < K; ++k) s += c[k] * double(x[k]);
-    return fp8 ? s * double(scale[r]) : s;
+    return fmt != BF16 ? s * double(scale[r]) : s;
   }
 };
 
-Weights make_weights(Rng& rng, int rows, int K, bool fp8, double sd) {
+Weights make_weights(Rng& rng, int rows, int K, Fmt fmt, double sd) {
   Weights w;
-  w.rows = rows, w.K = K, w.fp8 = fp8;
+  w.rows = rows, w.K = K, w.fmt = fmt;
   w.code.resize(size_t(rows) * K);
-  if (fp8) {
+  if (fmt == INT8) {
+    // uniform codes: every value -127..127 occurs at every word position
+    std::vector<uint8_t> codes(size_t(rows) * K);
+    w.scale.resize(rows);
+    for (int r = 0; r < rows; ++r) {
+      w.scale[r] = float(sd / 64.0 * rng.uniform(0.5, 1.5));
+      for (int k = 0; k < K; k += 4) {
+        int q[4];
+        for (int j = 0; j < 4; ++j) {
+          q[j] = int(rng.uniform() * 255.0) - 127;
+          w.code[size_t(r) * K + k + j] = q[j];
+        }
+        pack_int8(q, &codes[size_t(r) * K + k]);
+      }
+    }
+    w.dev.emplace(codes);
+    w.dev_scale.emplace(w.scale);
+  } else if (fmt == FP8) {
     std::vector<uint8_t> codes(size_t(rows) * K);
     w.scale.resize(rows);
     for (int r = 0; r < rows; ++r) {
@@ -81,10 +107,10 @@ std::vector<int> layout(bool full, bool single) {
   return t;
 }
 
-bool test_proj(Rng& rng, int M, bool fp8, bool full, bool single) {
+bool test_proj(Rng& rng, int M, Fmt fmt, bool full, bool single) {
   const std::vector<int> seg = layout(full, single);
   const int nseg = int(seg.size() / 3), R = seg[seg.size() - 2];
-  const Weights w = make_weights(rng, R, H, fp8, 0.03);
+  const Weights w = make_weights(rng, R, H, fmt, 0.03);
   const std::vector<float> x = randn_bf16(rng, size_t(3) * M * H, 1.0);
   DeviceArray<__nv_bfloat16> dx(to_bf16(x));
   DeviceArray<int> dseg(seg);
@@ -100,14 +126,14 @@ bool test_proj(Rng& rng, int M, bool fp8, bool full, bool single) {
         rnd[size_t(m) * R + r] = rbf(ref[size_t(m) * R + r]);
       }
   char what[96];
-  std::snprintf(what, sizeof what, "proj M=%d %s %s%s", M, fp8 ? "fp8" : "bf16", full ? "full" : "sliding",
+  std::snprintf(what, sizeof what, "proj M=%d %s %s%s", M, fmt_name(fmt), full ? "full" : "sliding",
                 single ? " single-input" : "");
   return Check{what, 1.0 / 128, 1e-6, 0.01}(got, ref, &rnd);
 }
 
-bool test_proj_conv(Rng& rng, int M, bool fp8) {
+bool test_proj_conv(Rng& rng, int M, Fmt fmt) {
   const int K = 3072;
-  const Weights w = make_weights(rng, H, K, fp8, 0.02);
+  const Weights w = make_weights(rng, H, K, fmt, 0.02);
   const std::vector<float> x = randn_bf16(rng, size_t(M) * K, 1.0);
   const std::vector<float> cw = randn(rng, size_t(H) * 4, 0.5);
   const std::vector<float> st0 = randn_bf16(rng, size_t(3) * H, 1.0);
@@ -138,15 +164,15 @@ bool test_proj_conv(Rng& rng, int M, bool fp8) {
     for (int j = 0; j < 3; ++j) rs[size_t(j) * H + c] = ext[M + j];
   }
   char what[64];
-  std::snprintf(what, sizeof what, "proj_conv M=%d %s out", M, fp8 ? "fp8" : "bf16");
+  std::snprintf(what, sizeof what, "proj_conv M=%d %s out", M, fmt_name(fmt));
   ok &= Check{what, 1e-5, 1e-6, 1.0}(o, ro);
   ok &= Check{"proj_conv state", 0, 0, 0}(st, rs);
   return ok;
 }
 
-bool test_head(Rng& rng, int M, bool fp8) {
+bool test_head(Rng& rng, int M, Fmt fmt) {
   const int V = 5000;
-  const Weights w = make_weights(rng, V, H, fp8, 0.05);
+  const Weights w = make_weights(rng, V, H, fmt, 0.05);
   const std::vector<float> x = randn_bf16(rng, size_t(M) * H, 1.0);
   DeviceArray<__nv_bfloat16> dx(to_bf16(x));
   DeviceArray<float> out(size_t(M) * V);
@@ -157,7 +183,7 @@ bool test_head(Rng& rng, int M, bool fp8) {
   for (int m = 0; m < M; ++m)
     for (int v = 0; v < V; ++v) ref[size_t(m) * V + v] = 30.0 * std::tanh(w.dot(v, &x[size_t(m) * H]) / 30.0);
   char what[48];
-  std::snprintf(what, sizeof what, "head M=%d %s", M, fp8 ? "fp8" : "bf16");
+  std::snprintf(what, sizeof what, "head M=%d %s", M, fmt_name(fmt));
   return Check{what, 1.0 / 128, 1e-5, 1.0}(got, ref);
 }
 
@@ -475,6 +501,83 @@ bool test_fp8_rows(Rng& rng) {
   return ok;
 }
 
+// int8_rows against its host definition (scale = amax / 127, q = rint(w / scale), dense.h word layout), bit for bit,
+// on random rows, an all-zero row and a row whose values are exact halves of the step (round half to even); then
+// dequant_rows of those rows (bf16(q * scale)) and of a row holding every code at every word position.
+bool test_int8_rows(Rng& rng) {
+  const int rows = 66, K = H;
+  std::vector<float> w = randn_bf16(rng, size_t(rows) * K, 0.03);
+  for (int k = 0; k < K; ++k) w[size_t(5) * K + k] = 0.f;
+  // row 6: scale exactly 1 (amax 127), every other value x.5 with |x.5| <= 126.5: exact ties
+  for (int k = 0; k < K; ++k) w[size_t(6) * K + k] = k == 0 ? 127.f : float((k % 253) - 126) + 0.5f * (k % 2 ? 1 : -1);
+  // row 7: every code -127..127 (and 0 twice) at each of the 4 word positions, scale 1
+  std::vector<int> all;
+  for (int pos = 0; pos < 4; ++pos)
+    for (int q = -127; q <= 128; ++q) all.push_back(q == 128 ? 0 : q);
+  for (int k = 0; k < K; ++k) w[size_t(7) * K + k] = k < 4 * 256 ? float(all[size_t(k % 4) * 256 + k / 4]) : 0.f;
+  w[size_t(7) * K + K - 1] = 127.f;
+  DeviceArray<__nv_bfloat16> dw(to_bf16(w));
+  DeviceArray<uint8_t> q(size_t(rows) * K);
+  DeviceArray<float> s(rows);
+  DeviceArray<__nv_bfloat16> back(size_t(rows) * K);
+  dense::int8_rows(dw.get(), rows, K, q.get(), s.get(), g_stream);
+  dense::dequant_rows(q.get(), s.get(), rows, K, back.get(), g_stream, true);
+  sync();
+  const auto gq = q.download();
+  const auto gs = s.download();
+  const auto gb = bf16_download(back);
+  size_t bad_scale = 0, bad_code = 0, bad_back = 0;
+  for (int r = 0; r < rows; ++r) {
+    float amax = 0;
+    for (int k = 0; k < K; ++k) amax = std::max(amax, std::fabs(w[size_t(r) * K + k]));
+    const float sc = amax / 127.f;
+    bad_scale += gs[r] != sc;
+    for (int k = 0; k < K; k += 4) {
+      int want[4];
+      for (int j = 0; j < 4; ++j)
+        want[j] = sc > 0 ? int(std::clamp(std::nearbyint(w[size_t(r) * K + k + j] / sc), -127.f, 127.f)) : 0;
+      uint8_t packed[4];
+      pack_int8(want, packed);
+      for (int j = 0; j < 4; ++j) {
+        const size_t i = size_t(r) * K + k + j;
+        bad_code += gq[i] != packed[j];
+        bad_back += gb[i] != round_bf16(float(want[j]) * gs[r]);
+      }
+    }
+  }
+  const bool ok = bad_scale == 0 && bad_code == 0 && bad_back == 0 && gs[7] == 1.f;
+  std::printf("%s int8_rows/dequant_rows: scale mismatches %zu, code mismatches %zu, dequant mismatches %zu (every "
+              "code at every word position in row 7)\n",
+              ok ? "PASS" : "FAIL", bad_scale, bad_code, bad_back);
+  return ok;
+}
+
+// proj over mapped rows (Matrix::row_map, the drafter's shortlist head) of an INT8 matrix: row r is row map[r].
+bool test_proj_gather(Rng& rng, int M) {
+  const int src_rows = 3000, R = 1000;
+  const Weights w = make_weights(rng, src_rows, H, INT8, 0.03);
+  std::vector<int> map(R);
+  for (int r = 0; r < R; ++r) map[r] = int(rng.uniform() * src_rows) % src_rows;
+  const std::vector<float> x = randn_bf16(rng, size_t(3) * M * H, 1.0);
+  DeviceArray<__nv_bfloat16> dx(to_bf16(x));
+  DeviceArray<int> dmap(map), dseg(std::vector<int>{0, R, 0});
+  DeviceArray<float> out(size_t(M) * R);
+  dense::Matrix m = w.matrix();
+  m.rows = R, m.row_map = dmap.get();
+  dense::proj(dx.get(), M, m, dseg.get(), 1, out.get(), true, g_stream);
+  sync();
+  const auto got = out.download();
+  std::vector<double> ref(got.size()), rnd(got.size());
+  for (int r = 0; r < R; ++r)
+    for (int m2 = 0; m2 < M; ++m2) {
+      ref[size_t(m2) * R + r] = w.dot(map[r], &x[size_t(m2) * H]);
+      rnd[size_t(m2) * R + r] = rbf(ref[size_t(m2) * R + r]);
+    }
+  char what[48];
+  std::snprintf(what, sizeof what, "proj M=%d int8 row_map", M);
+  return Check{what, 1.0 / 128, 1e-6, 0.01}(got, ref, &rnd);
+}
+
 // ---- Bitwise lock. mix, message_gates and router are exact: on fixed inputs they must keep giving the bits
 // recorded in kLock (taken from kernels checked byte for byte against the implementation they were ported
 // from). A changed hash means the arithmetic changed (order of a sum, an FMA contraction the compiler chose
@@ -667,18 +770,18 @@ int main() {
   Rng rng(20261120);
   bool ok = true;
   for (int M : {1, 3, 8}) {
-    ok &= test_proj(rng, M, false, false, true);
-    ok &= test_proj(rng, M, true, true, false);
+    ok &= test_proj(rng, M, BF16, false, true);
+    ok &= test_proj(rng, M, FP8, true, false);
   }
-  ok &= test_proj(rng, 2, false, false, false);
-  ok &= test_proj(rng, 5, true, false, true);
+  ok &= test_proj(rng, 2, BF16, false, false);
+  ok &= test_proj(rng, 5, FP8, false, true);
   for (int M : {1, 4}) {
-    ok &= test_proj_conv(rng, M, false);
-    ok &= test_proj_conv(rng, M, true);
+    ok &= test_proj_conv(rng, M, BF16);
+    ok &= test_proj_conv(rng, M, FP8);
   }
   for (int M : {1, 8}) {
-    ok &= test_head(rng, M, false);
-    ok &= test_head(rng, M, true);
+    ok &= test_head(rng, M, BF16);
+    ok &= test_head(rng, M, FP8);
     ok &= test_router(rng, M);
   }
   ok &= test_router(rng, 3);
@@ -710,6 +813,13 @@ int main() {
   ok &= test_gates(rng, 3, 8, true);
   for (int M : {1, 3, 8}) ok &= test_embed(rng, M);
   ok &= test_fp8_rows(rng);
+  // INT8 rows last, so the cases above keep their random inputs
+  for (int M : {1, 3, 8}) ok &= test_proj(rng, M, INT8, true, false);
+  ok &= test_proj(rng, 2, INT8, false, true);
+  for (int M : {1, 4}) ok &= test_proj_conv(rng, M, INT8);
+  for (int M : {1, 8}) ok &= test_head(rng, M, INT8);
+  for (int M : {1, 8}) ok &= test_proj_gather(rng, M);
+  ok &= test_int8_rows(rng);
   ok &= test_bit_lock();
   INGINE_TEST_CUDA(cudaStreamDestroy(g_stream));
   std::printf("%s\n", ok ? "ALL PASS" : "SOME FAILED");
