@@ -344,6 +344,12 @@ constexpr uint64_t kLock86[8][kLocks] = {
     {0xa47adaee3d6c9858ull, 0x4c908e69c14723a0ull, 0xc3e6e87ab0f11d1aull, 0xd21aa07cdf88e873ull, 0xadbf7e6dfd20d38cull, 0x46964f9812bf98f2ull},
 };
 
+// INT8 rows, recorded on sm_86 (RTX 3090); a GPU without a record prints its hashes (INFO).
+constexpr uint64_t kLockInt8_86[8] = {
+    0x7f8373d10f109c6aull, 0x8093a62502235dfeull, 0xaf49e933648c9a2eull, 0xc8309c377ccd0c05ull,
+    0xf8c3ca59653ba78bull, 0x39a500421810ee75ull, 0x74695f72eceebae1ull, 0x06c08aa784e9d205ull,
+};
+
 }  // namespace
 
 int main() {
@@ -396,13 +402,16 @@ int main() {
     ok = ok && same;
   }
   {
-    // [Agent] No INT8 hashes are recorded yet: every GPU prints its own (INFO) until they are.
     LockGen gw{0x10c55000ull};
     const Int8Weight wproj(gw, 8664, H), wo(gw, H, 3072);
+    const uint64_t* lock8 = cc == 86 ? kLockInt8_86 : nullptr;
     for (int M = 1; M <= 8; ++M) {
       LockGen g{0x10c56000ull + uint64_t(M)};
-      std::printf("INFO int8 bit lock M=%d: 0x%016llxull\n", M,
-                  static_cast<unsigned long long>(lock_int8(g, wproj, wo, M)));
+      const uint64_t got8 = lock_int8(g, wproj, wo, M);
+      const bool same = !lock8 || got8 == lock8[M - 1];
+      std::printf("%s int8 bit lock M=%d: 0x%016llxull%s\n", !lock8 ? "INFO" : same ? "PASS" : "FAIL", M,
+                  static_cast<unsigned long long>(got8), same ? "" : " differs from the recorded hash");
+      ok = ok && same;
     }
   }
   INGINE_TEST_CUDA(cudaStreamDestroy(g_stream));

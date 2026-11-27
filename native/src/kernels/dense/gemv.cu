@@ -398,8 +398,9 @@ __global__ void GEMV_MMA_BOUNDS(32 * SPLITK) gemv_mma_kernel(const uint8_t* __re
 
 // BLOCK: threads per block of the M = 1 kernel (0: M = 1 runs the tensor-core kernel too, for K whose
 // whole row per lane would not fit in registers); SPLITK: warps per 16-row block of the M >= 2 kernel;
-// UFP8: steps per load batch of its FP8 and INT8 instantiations.
-template <int K, int BLOCK, int SPLITK, int UFP8, template <int> class Epi, bool GATHER = false, class Make>
+// UFP8: steps per load batch of its FP8 and INT8 instantiations; I8_TC: INT8 rows at M = 1 run the tensor-core kernel.
+template <int K, int BLOCK, int SPLITK, int UFP8, template <int> class Epi, bool GATHER = false, bool I8_TC = false,
+          class Make>
 void launch_gemv(const Matrix& w, int M, bool pdl, cudaStream_t stream, Make make) {
   const int fmt = w.scale == nullptr ? F_BF16 : w.int8 ? F_INT8 : F_FP8;
   require(w.w != nullptr && w.rows > 0, "weight matrix is empty");
@@ -416,7 +417,10 @@ void launch_gemv(const Matrix& w, int M, bool pdl, cudaStream_t stream, Make mak
     if constexpr (MM == 1 && BLOCK > 0) {
       constexpr int B = BLOCK > 0 ? BLOCK : 32;  // (the branch is discarded for BLOCK = 0)
       if (fmt == F_FP8) launch_ex(gemv_kernel<F_FP8, K, 16, B, E, GATHER>, dim3((rows * 16 + B - 1) / B), B, 0, 1, pdl, stream, wp, sc, rows, 0u, epi, rm);
-      else if (fmt == F_INT8) launch_ex(gemv_kernel<F_INT8, K, 16, B, E, GATHER>, dim3((rows * 16 + B - 1) / B), B, 0, 1, pdl, stream, wp, sc, rows, 0u, epi, rm);
+      else if (fmt == F_INT8) {
+        if constexpr (I8_TC) launch_ex(gemv_mma_kernel<F_INT8, K, MM, SPLITK, UFP8, E, GATHER>, dim3((rows + 15) / 16), 32 * SPLITK, 0, 1, pdl, stream, wp, sc, rows, 0u, epi, rm);
+        else launch_ex(gemv_kernel<F_INT8, K, 16, B, E, GATHER>, dim3((rows * 16 + B - 1) / B), B, 0, 1, pdl, stream, wp, sc, rows, 0u, epi, rm);
+      }
       else launch_ex(gemv_kernel<F_BF16, K, 32, B, E, GATHER>, dim3((rows * 32 + B - 1) / B), B, 0, 1, pdl, stream, wp, sc, rows, 0u, epi, rm);
     } else {
       const dim3 blocks((rows + 15) / 16);
@@ -545,8 +549,11 @@ void proj(const __nv_bfloat16* xin, int M, Matrix w, const int* segments, int ns
     constexpr int MM = decltype(mc)::value;
     return ProjEpi<MM>{xin, segments, nseg, R, out};
   };
-  if (w.row_map) launch_gemv<H, 256, PROJ_SPLITK, MMA_U_FP8, ProjEpi, true>(w, M, pdl, stream, make);
-  else launch_gemv<H, 256, PROJ_SPLITK, MMA_U_FP8, ProjEpi>(w, M, pdl, stream, make);
+  // [Agent] INT8 proj at M = 1 on tensor cores: its CUDA-core decode (~4.3 instructions per weight) leaves 2 us of
+  // issue time per call that the DRAM stream does not hide (RTX 3090, real weights: 28.2 -> 26.1 us, 704 -> 760 GB/s);
+  // the tensor-core path needs ~1.4. proj_conv (2,304 rows) and head gain nothing from it (10.4 vs 10.7, 520 vs 520).
+  if (w.row_map) launch_gemv<H, 256, PROJ_SPLITK, MMA_U_FP8, ProjEpi, true, true>(w, M, pdl, stream, make);
+  else launch_gemv<H, 256, PROJ_SPLITK, MMA_U_FP8, ProjEpi, false, true>(w, M, pdl, stream, make);
 }
 
 void proj_conv(const __nv_bfloat16* x, int M, Matrix w, const float* conv_w, float* conv_state, float* out,
