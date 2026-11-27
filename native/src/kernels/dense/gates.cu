@@ -64,32 +64,32 @@ struct GateArgs {
   bool h_shared;
   const float* msg;  // [G, M, H]
   const __nv_bfloat16* w_down;  // [G, 64, 2H]
-  const void* w_forget;         // [G, H, 64] fp32 or bf16
-  const void* w_gain;
+  const __nv_bfloat16* w_forget;  // [G, H, 64]
+  const __nv_bfloat16* w_gain;
   const float* norm_w;  // [G, H]
   __nv_bfloat16* out_bf16;  // [G, M, H]
   float* out_f32;           // [G, M, H] or null
   uint32_t zero;            // 0 (opaque to the compiler: pdl_wait_fenced)
 };
 
-template <int CL, bool FG32>
+template <int CL>
 struct GateCfg {
   static constexpr int RPC = RANK / CL;           // down rows per CTA
   static constexpr int NW = 2 * RPC;              // warps: (row, half)
   static constexpr int NT = 32 * NW;              // threads
   static constexpr int CPC = H / CL;              // channels per CTA (one thread each in the forget/gain phase)
-  static constexpr int FGB = FG32 ? 4 : 2;        // bytes per forget/gain weight
+  static constexpr int FGB = 2;                   // bytes per forget/gain weight
   static constexpr int ROW = RANK * FGB;          // bytes of one forget/gain row
   static constexpr int RS = ROW + 16;             // padded row stride in shared memory (no bank conflicts)
   static constexpr int SLICE = CPC * RS;          // bytes of one padded matrix slice
   static_assert(CPC <= NT && ROW % 16 == 0 && RPC == 4, "uneven split");
   static constexpr int SMEM = 2 * SLICE;
-  static constexpr int XMAX = FG32 ? 1 : 4;       // tokens staged per barrier (one staging buffer each)
+  static constexpr int XMAX = 4;                  // tokens staged per barrier (one staging buffer each)
 };
 
-template <int CL, bool FG32, int M>
-__global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_kernel(GateArgs a) {
-  using C = GateCfg<CL, FG32>;
+template <int CL, int M>
+__global__ void __launch_bounds__(GateCfg<CL>::NT) gates_kernel(GateArgs a) {
+  using C = GateCfg<CL>;
   constexpr int DCH = H / (8 * 32);  // 9 chunks of 8 down weights per lane
   constexpr int XPT = H / C::NT;     // inputs per thread per half when staging x
   constexpr int MQ = (M + 3) / 4;    // 16-byte stores holding M values
@@ -272,13 +272,8 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_kernel(GateArgs a
       const uint4 uf = *reinterpret_cast<const uint4*>(fr + k * 16);
       const uint4 ug = *reinterpret_cast<const uint4*>(gr + k * 16);
       float wf[EPC], wg[EPC];
-      if constexpr (FG32) {
-        wf[0] = __uint_as_float(uf.x); wf[1] = __uint_as_float(uf.y); wf[2] = __uint_as_float(uf.z); wf[3] = __uint_as_float(uf.w);
-        wg[0] = __uint_as_float(ug.x); wg[1] = __uint_as_float(ug.y); wg[2] = __uint_as_float(ug.z); wg[3] = __uint_as_float(ug.w);
-      } else {
-        unpack_bf16x8(uf, wf);
-        unpack_bf16x8(ug, wg);
-      }
+      unpack_bf16x8(uf, wf);
+      unpack_bf16x8(ug, wg);
 #pragma unroll
       for (int m = 0; m < M; ++m) {
 #pragma unroll
@@ -331,12 +326,12 @@ __global__ void __launch_bounds__(GateCfg<CL, FG32>::NT) gates_kernel(GateArgs a
   }
 }
 
-template <int CL, bool FG32>
+template <int CL>
 void launch_gates(int G, int M, const GateArgs& a, bool pdl, cudaStream_t stream) {
-  using C = GateCfg<CL, FG32>;
+  using C = GateCfg<CL>;
   auto go = [&](auto mc) {
     constexpr int MM = decltype(mc)::value;
-    launch_ex(gates_kernel<CL, FG32, MM>, dim3(G * CL), C::NT, C::SMEM, CL, pdl, stream, a);
+    launch_ex(gates_kernel<CL, MM>, dim3(G * CL), C::NT, C::SMEM, CL, pdl, stream, a);
   };
   switch (M) {
     case 1: go(std::integral_constant<int, 1>{}); break;
@@ -354,7 +349,7 @@ void launch_gates(int G, int M, const GateArgs& a, bool pdl, cudaStream_t stream
 }  // namespace
 
 void message_gates(const float* h, bool h_shared, const float* msg, int G, int M, const __nv_bfloat16* w_down,
-                   const void* w_forget, const void* w_gain, bool fg_fp32, const float* norm_w,
+                   const __nv_bfloat16* w_forget, const __nv_bfloat16* w_gain, const float* norm_w,
                    __nv_bfloat16* out_bf16, float* out_f32, bool pdl, cudaStream_t stream) {
   require(G >= 1 && G <= 3 && M >= 1 && M <= 8, "message_gates: G in 1..3, M in 1..8");
   require(h && msg && w_down && w_forget && w_gain && norm_w && out_bf16, "message_gates: null argument");
@@ -369,10 +364,8 @@ void message_gates(const float* h, bool h_shared, const float* msg, int G, int M
   a.out_bf16 = out_bf16;
   a.out_f32 = out_f32;
   a.zero = 0;
-  // 16-CTA clusters (non-portable, verified schedulable on the RTX 5090): the FP32 forget/gain slices of
-  // an 8-CTA split would not fit in shared memory.
-  if (fg_fp32) launch_gates<16, true>(G, M, a, pdl, stream);
-  else launch_gates<16, false>(G, M, a, pdl, stream);
+  // 16-CTA clusters (non-portable, verified schedulable on the RTX 5090)
+  launch_gates<16>(G, M, a, pdl, stream);
 }
 
 }  // namespace ingine::kernels::dense

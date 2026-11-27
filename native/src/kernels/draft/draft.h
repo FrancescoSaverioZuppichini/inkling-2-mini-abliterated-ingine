@@ -152,12 +152,12 @@ void silu_mul(const float* gu, int rows, int inter, __nv_bfloat16* out, cudaStre
 // value and, of those equal to it, the ones with the lowest indices. Order (fixed, not sorted): the elements
 // above it by ascending index, then the ties by ascending index. cand_val fp32 [rows, 1024]; cand_idx int32
 // [rows, 1024] = the element's index, or map[index] (a shortlist head's row -> token id) if map is not null;
-// cand_row (optional) int32 [rows, 1024] = the element's index.
+// cand_row int32 [rows, 1024] = the element's index.
 // A radix select over many CTAs per row; ws: topk_workspace_bytes(rows, V) bytes, zeroed before the first
 // call (every call leaves its histograms zeroed).
 std::size_t topk_workspace_bytes(int rows, int V);
 void topk_candidates(const float* base, int rows, int V, const std::int32_t* map, float* cand_val,
-                     std::int32_t* cand_idx, void* ws, cudaStream_t stream, std::int32_t* cand_row = nullptr);
+                     std::int32_t* cand_idx, std::int32_t* cand_row, void* ws, cudaStream_t stream);
 
 // part[i, r] = sum_{c >= 512} rnn_w[r, c] z_i[c] in fp32, z_i[512:] = (h[i], f_rnn): the step-independent
 // part of the rnn projection. rnn_w bf16 [768, 5120], h bf16 [GAMMA, H], f_rnn bf16 [H], part fp32 [7, 768].

@@ -62,15 +62,10 @@ std::vector<float> host_f32(const SafetensorsModel& m, const std::string& name) 
 
 class Loader {
  public:
-  Loader(const SafetensorsModel& m, DeviceUploader& up, cudaStream_t stream, std::vector<DeviceBuffer>& storage,
-         DeviceHeap* heap = nullptr)
-      : m_(m), up_(up), stream_(stream), storage_(storage), heap_(heap) {}
+  Loader(const SafetensorsModel& m, DeviceUploader& up, cudaStream_t stream, DeviceHeap& heap)
+      : m_(m), up_(up), stream_(stream), heap_(heap) {}
 
-  void* alloc(std::size_t bytes) {
-    if (heap_) return heap_->alloc(bytes);
-    storage_.emplace_back(bytes);
-    return storage_.back().p;
-  }
+  void* alloc(std::size_t bytes) { return heap_.alloc(bytes); }
 
   Tensor upload_f32(const std::vector<float>& host, std::initializer_list<std::int32_t> shape) {
     void* d = alloc(host.size() * 4);
@@ -119,8 +114,7 @@ class Loader {
   const SafetensorsModel& m_;
   DeviceUploader& up_;
   cudaStream_t stream_;
-  std::vector<DeviceBuffer>& storage_;
-  DeviceHeap* heap_;
+  DeviceHeap& heap_;
   std::vector<UploadRequest> pending_;
 };
 
@@ -225,7 +219,7 @@ Layer load_layer_into(Loader& ld, int l, ExpertFormat fmt, bool dense_fp8) {
   layer.attn_conv = ld.f32(p + "attn_sconv.weight", {H, CONV_K});
   layer.mlp_conv = ld.f32(p + "mlp_sconv.weight", {H, CONV_K});
   layer.router_bias = ld.f32(p + "mlp.gate.bias", {EXPERTS});
-  layer.router_bf16 = ld.upload_bf16(host_f32(m, p + "mlp.gate.weight"), {EXPERTS, H});  // exact
+  layer.router = ld.upload_bf16(host_f32(m, p + "mlp.gate.weight"), {EXPERTS, H});  // exact
   if (l > 0) {
     const std::string qn = "model.llm.attn_res.attn_queries." + std::to_string(l - 1);
     const std::int32_t nq = std::int32_t(m.at(qn)->numel() / H);
@@ -268,11 +262,11 @@ Layer load_layer_into(Loader& ld, int l, ExpertFormat fmt, bool dense_fp8) {
     };
     const int D2 = 2 * H;
     layer.qkv_gate_down = ld.upload_bf16(stack(down, 3), {3, GATE_RANK, D2});  // exact (BF16 checkpoint)
-    layer.qkv_gate_forget16 = ld.upload_bf16(stack(forget, 3), {3, H, GATE_RANK});
-    layer.qkv_gate_gain16 = ld.upload_bf16(stack(gain, 3), {3, H, GATE_RANK});
+    layer.qkv_gate_forget = ld.upload_bf16(stack(forget, 3), {3, H, GATE_RANK});
+    layer.qkv_gate_gain = ld.upload_bf16(stack(gain, 3), {3, H, GATE_RANK});
     layer.mlp1_gate_down = ld.upload_bf16(down[3], {1, GATE_RANK, D2});
-    layer.mlp1_gate_forget16 = ld.upload_bf16(forget[3], {1, H, GATE_RANK});
-    layer.mlp1_gate_gain16 = ld.upload_bf16(gain[3], {1, H, GATE_RANK});
+    layer.mlp1_gate_forget = ld.upload_bf16(forget[3], {1, H, GATE_RANK});
+    layer.mlp1_gate_gain = ld.upload_bf16(gain[3], {1, H, GATE_RANK});
     auto at = [](const Tensor& stack, int g, DType dt, std::int32_t a, std::int32_t b) {
       const std::size_t es = dt == DType::FP32 ? 4 : 2;
       return rm(static_cast<char*>(stack.data) + std::size_t(g) * a * b * es, dt, {a, b});
@@ -328,7 +322,7 @@ Weights load_weights(const fs::path& model_dir, bool dense_fp8, bool embed_host,
   Weights w;
   w.dense_fp8 = dense_fp8;
   w.expert_formats = expert_formats(model_dir);
-  Loader ld(m, up, stream, w.storage, &w.heap);
+  Loader ld(m, up, stream, w.heap);
   const int H = HIDDEN;
   for (int l = 0; l < LAYERS; ++l) w.layers.push_back(load_layer_into(ld, l, w.expert_formats[l], dense_fp8));
 
@@ -379,12 +373,11 @@ Weights load_weights(const fs::path& model_dir, bool dense_fp8, bool embed_host,
   return w;
 }
 
-Layer load_layer(const fs::path& model_dir, int l, bool dense_fp8, cudaStream_t stream,
-                 std::vector<DeviceBuffer>& storage) {
+Layer load_layer(const fs::path& model_dir, int l, bool dense_fp8, cudaStream_t stream, DeviceHeap& heap) {
   if (l < 0 || l >= LAYERS) throw std::invalid_argument("load_layer: layer out of range");
   const SafetensorsModel m(model_dir);
   DeviceUploader up;
-  Loader ld(m, up, stream, storage);
+  Loader ld(m, up, stream, heap);
   Layer layer = load_layer_into(ld, l, expert_formats(model_dir)[l], dense_fp8);
   CUDA_CHECK(cudaStreamSynchronize(stream));
   return layer;

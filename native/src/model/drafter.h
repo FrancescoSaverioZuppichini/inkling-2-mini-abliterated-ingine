@@ -124,9 +124,8 @@ class Drafter {
 
   int vocab() const { return V_; }
 
-  // Scratch of large commits (prompt chunks): commit_scratch_bytes() of device memory the caller lends, live only
-  // while a commit of more than BLOCK rows runs (ordered on the drafter's stream). Without it the drafter allocates
-  // its own at the first large commit.
+  // Scratch of large commits (prompt chunks): commit_scratch_bytes() of device memory the caller lends before the
+  // first commit of more than BLOCK rows, live only while such a commit runs (ordered on the drafter's stream).
   std::size_t commit_scratch_bytes() const;
   void lend_commit_scratch(void* p);
 
@@ -152,7 +151,6 @@ class Drafter {
     std::int32_t* ctx_pos;                // local layers: int32 [WINDOW]; null for the global layer
   };
 
-  void* alloc(std::size_t bytes);
   void load(const std::filesystem::path& model_dir);
   void run_draft(int bucket);
   void run_layers(int bucket);                                                  // a draft after its input rows
@@ -179,8 +177,8 @@ class Drafter {
   std::array<DraftLayer, 3> layers_{};
   const __nv_bfloat16* alpha_ = nullptr;  // bf16 [4, 4] softmax(fuse_weight)
   const __nv_bfloat16 *final_norm_ = nullptr, *mask_embed_ = nullptr, *f_norm_ = nullptr;
-  const __nv_bfloat16 *w1_ = nullptr, *rnn_w_ = nullptr, *rnn_b_ = nullptr;  // w1_: mapped host memory
-  MappedHostBuffer w1_host_;              // markov_w1, all rows
+  const __nv_bfloat16 *rnn_w_ = nullptr, *rnn_b_ = nullptr;
+  MappedHostBuffer w1_host_;              // markov_w1, all rows (mapped host memory)
   __nv_bfloat16* w1_rows_ = nullptr;      // markov_w1 rows of the shortlist head's rows (device)
   void put_w1_rows(std::span<const std::int32_t> ids, int row);
   __nv_bfloat16 *fold_w_ = nullptr, *fold_b_ = nullptr;
@@ -210,6 +208,7 @@ class Drafter {
   int *seg_qkv_ = nullptr, *seg_gate_up_ = nullptr, *seg_short_ = nullptr, *seg_kv_ = nullptr;
   // commit scratch: large commits (cuBLASLt) and the small commit (dense proj over the three layers)
   __nv_bfloat16 *warm_feats_ = nullptr, *ctx_c_ = nullptr, *ctx_kv_ = nullptr, *commit_xin_ = nullptr;
+  void* gemm_ws_ = nullptr;  // in the lent commit scratch
   float* commit_kv_ = nullptr;
 
   AcceptScratch accept_{};

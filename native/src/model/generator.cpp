@@ -76,7 +76,7 @@ class EngineGenerator final : public Generator {
     checkpoint_logits_ = checkpoint_drafter_ + (drafter_ ? carved(drafter_->checkpoint_bytes()) : 0);
     // [Agent] The checkpoint holds data only between the end of one prefill and the restore at the start of the next;
     // while the prompt's chunks run it is dead (the restore was queued before them, the save after them). The chunk
-    // taps and the drafter's large-commit scratch live exactly then, so they share its memory: 81 MiB at chunk 2048.
+    // taps and the drafter's large-commit scratch live exactly then, so they share its memory.
     const std::size_t taps_bytes = drafter_ ? carved(std::size_t(options.prefill_chunk) * NUM_TAPS * HIDDEN * 2) : 0;
     const std::size_t chunk_bytes = drafter_ ? taps_bytes + drafter_->commit_scratch_bytes() : 0;
     checkpoint_ = DeviceBuffer(std::max(checkpoint_logits_ + logits_.bytes, chunk_bytes));

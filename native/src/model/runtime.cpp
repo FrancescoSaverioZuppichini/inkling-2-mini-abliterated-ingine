@@ -62,17 +62,13 @@ void GraphExec::launch(cudaStream_t stream) const {
   CUDA_CHECK(cudaGraphLaunch(exec_, stream));
 }
 
-namespace {
-// [Agent] The driver reserves cudaLimitStackSize (1 KiB by default) of local memory for every thread the GPU can hold
-// (1,536 x 82 SMs on an RTX 3090: 123 MiB) whether a kernel uses it or not. Our kernels need at most 144 bytes of
-// stack and recurse nowhere, and the driver grows local memory at launch for any kernel whose frame is larger, keeping
-// the larger size. A zero limit therefore holds only what the kernels really use; values and outputs do not change.
-void trim_stack_reserve() { CUDA_CHECK(cudaDeviceSetLimit(cudaLimitStackSize, 0)); }
-}  // namespace
-
 Runtime::Runtime(const RuntimeOptions& options) : options_(options) {
   if (options.max_ctx < 16) throw std::invalid_argument("max_ctx must be at least 16");
-  trim_stack_reserve();
+  // [Agent] The driver reserves cudaLimitStackSize (1 KiB by default) of local memory for every thread the GPU can
+  // hold (1,536 x 82 SMs on an RTX 3090: 123 MiB) whether a kernel uses it or not. No kernel here recurses, and the
+  // driver grows local memory at launch for any kernel whose frame is larger, keeping the larger size: a zero limit
+  // holds only what the kernels use. Values do not change.
+  CUDA_CHECK(cudaDeviceSetLimit(cudaLimitStackSize, 0));
   CUDA_CHECK(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
   weights_ = load_weights(options.model_dir, options.dense_fp8, options.embed_host, stream_);
   ablation_ = load_ablation(options.ablation);
@@ -82,7 +78,7 @@ Runtime::Runtime(const RuntimeOptions& options) : options_(options) {
 Runtime::Runtime(const RuntimeOptions& options, Weights weights, Ablation ablation)
     : options_(options), weights_(std::move(weights)), ablation_(std::move(ablation)) {
   if (options.max_ctx < 16) throw std::invalid_argument("max_ctx must be at least 16");
-  trim_stack_reserve();
+  CUDA_CHECK(cudaDeviceSetLimit(cudaLimitStackSize, 0));  // see the constructor above
   CUDA_CHECK(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
   init();
 }

@@ -44,8 +44,8 @@ std::vector<T> download(const void* p, std::size_t n) {
 }
 
 bool check_layer(const SafetensorsModel& m, int l, cudaStream_t stream) {
-  std::vector<DeviceBuffer> storage;
-  const Layer layer = load_layer(INGINE_MODEL_DIR, l, true, stream, storage);
+  DeviceHeap heap;
+  const Layer layer = load_layer(INGINE_MODEL_DIR, l, true, stream, heap);
   const std::string p = "model.llm.layers." + std::to_string(l) + ".";
   bool ok = true;
   auto expect = [&](bool c, const std::string& what) {
@@ -93,6 +93,13 @@ bool check_layer(const SafetensorsModel& m, int l, cudaStream_t stream) {
     const auto have = download<float>(t.data, want.size());
     expect(t.numel() == std::int64_t(want.size()) && have == want, name + " (fp32)");
   };
+  auto same_bf16 = [&](const void* d, const std::string& name) {
+    const auto want = host_values(m, name);
+    const auto have = download<__nv_bfloat16>(d, want.size());
+    bool eq = true;
+    for (std::size_t i = 0; i < want.size(); ++i) eq &= bf16_to_float(have[i]) == want[i];
+    expect(eq, name + " (bf16)");
+  };
   same_f32(layer.router_bias, p + "mlp.gate.bias");
   same_f32(layer.mlp_query, "model.llm.attn_res.mlp_queries." + std::to_string(l));
   same_f32(layer.attn_query, "model.llm.attn_res.attn_queries." + std::to_string(l - 1));
@@ -109,29 +116,13 @@ bool check_layer(const SafetensorsModel& m, int l, cudaStream_t stream) {
   } else {
     same_f32(layer.k_conv, p + "attn.k_sconv.weight");
   }
-  {
-    const auto want = host_values(m, p + "mlp.gate.weight");
-    const auto have = download<__nv_bfloat16>(layer.router_bf16.data, want.size());
-    bool eq = true;
-    for (std::size_t i = 0; i < want.size(); ++i) eq &= bf16_to_float(have[i]) == want[i];
-    expect(eq, "router_bf16 holds the checkpoint values");
-  }
+  same_bf16(layer.router.data, p + "mlp.gate.weight");
   if (layer.loop) {
-    auto same_bf16 = [&](const void* d, const std::string& name) {
-      const auto want = host_values(m, name);
-      const auto have = download<__nv_bfloat16>(d, want.size());
-      bool eq = true;
-      for (std::size_t i = 0; i < want.size(); ++i) eq &= bf16_to_float(have[i]) == want[i];
-      expect(eq, name + " (bf16)");
-    };
-    same_bf16(static_cast<const char*>(layer.qkv_gate_forget16.data) + std::size_t(H) * GATE_RANK * 2,
+    same_bf16(static_cast<const char*>(layer.qkv_gate_forget.data) + std::size_t(H) * GATE_RANK * 2,
               p + "controllers.k.forget_weight");
-    same_bf16(layer.mlp1_gate_gain16.data, p + "controllers.mlp.gain_weight");
-    const auto want = host_values(m, p + "controllers.v.down_weight");
-    const auto have = download<__nv_bfloat16>(layer.v_gate_down.data, want.size());
-    bool eq = true;
-    for (std::size_t i = 0; i < want.size(); ++i) eq &= bf16_to_float(have[i]) == want[i];
-    expect(eq && layer.v_gate_down.data == static_cast<char*>(layer.qkv_gate_down.data) + std::size_t(2) * 64 * 2 * H * 2,
+    same_bf16(layer.mlp1_gate_gain.data, p + "controllers.mlp.gain_weight");
+    same_bf16(layer.v_gate_down.data, p + "controllers.v.down_weight");
+    expect(layer.v_gate_down.data == static_cast<char*>(layer.qkv_gate_down.data) + std::size_t(2) * 64 * 2 * H * 2,
            "v_gate_down is gate 2 of the qkv stack");
   }
   // experts: raw bytes, NVFP4 factors = amax / denominator

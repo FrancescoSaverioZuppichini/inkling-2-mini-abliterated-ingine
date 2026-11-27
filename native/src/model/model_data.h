@@ -169,15 +169,15 @@ struct Layer {
   Tensor k_conv, v_conv;      // sliding: fp32 [1024, 4] conv1d order (tap 3 = current token)
   Tensor attn_conv, mlp_conv;  // fp32 [H, 4]
   Tensor router_bias;  // fp32 [128]
-  Tensor router_bf16;  // bf16 [128, H] (the checkpoint values)
+  Tensor router;       // bf16 [128, H] (the checkpoint values)
   Tensor attn_query;   // fp32 [Q, H] (Q = 3 full, 1 sliding), layers > 0
   Tensor mlp_query;    // fp32 [1, H]
 
   // loop layers: message gates. Stacks the kernels take, with per-gate views into them.
   Tensor qkv_gate_down;                      // bf16 [3, 64, 2H]
-  Tensor qkv_gate_forget16, qkv_gate_gain16; // bf16 [3, H, 64]
+  Tensor qkv_gate_forget, qkv_gate_gain;     // bf16 [3, H, 64]
   Tensor mlp1_gate_down;                     // bf16 [1, 64, 2H] (= mlp_gate_down)
-  Tensor mlp1_gate_forget16, mlp1_gate_gain16; // bf16 [1, H, 64]
+  Tensor mlp1_gate_forget, mlp1_gate_gain;   // bf16 [1, H, 64]
   Tensor q_gate_down, k_gate_down, v_gate_down, mlp_gate_down;          // bf16 [64, 2H] views
 
   // stacked norm weights (fast._stack_layer_params)
@@ -201,7 +201,6 @@ struct Weights {
   bool dense_fp8 = false;     // wproj (+ views), wo and unembed are FP8 rows
 
   DeviceHeap heap;                    // device memory behind the views (one packed range)
-  std::vector<DeviceBuffer> storage;  // device allocations behind the views made outside the heap
   MappedHostBuffer embed_host;        // the embedding table when it is kept in host memory
 };
 

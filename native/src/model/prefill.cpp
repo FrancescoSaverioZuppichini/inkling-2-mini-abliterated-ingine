@@ -225,7 +225,7 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
       mix(blocks, base, write, r_prev, w_prev, partial_out, queries, nq, nullptr, nullptr, mixf_);
       pk::GateRows rows;
       for (int g = 0; g < 3; ++g) rows.h[g] = mixf_ + (layer.full ? g : 0) * slab, rows.msg[g] = msgs_ + g * slab;
-      gates(rows, 3, layer.qkv_gate_down, layer.qkv_gate_forget16, layer.qkv_gate_gain16, f32p(layer.attn_norm3),
+      gates(rows, 3, layer.qkv_gate_down, layer.qkv_gate_forget, layer.qkv_gate_gain, f32p(layer.attn_norm3),
             xin_);
     } else {
       mix(blocks, base, write, r_prev, w_prev, partial_out, l > 0 ? queries : nullptr, l > 0 ? nq : 1,
@@ -339,7 +339,7 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
           nullptr, mixm_);
       pk::GateRows rows;
       rows.h[0] = mixm_, rows.msg[0] = msgs_ + 3 * slab;
-      gates(rows, 1, layer.mlp1_gate_down, layer.mlp1_gate_forget16, layer.mlp1_gate_gain16, f32p(layer.mlp_norm1),
+      gates(rows, 1, layer.mlp1_gate_down, layer.mlp1_gate_forget, layer.mlp1_gate_gain, f32p(layer.mlp_norm1),
             xm_);
     } else {
       mix(mlp_blocks, mbase, y_, attn_dirs + std::size_t(v) * H, attn_w + 4 * std::size_t(v), part_, f32p(layer.mlp_query), 1,
@@ -347,7 +347,7 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
     }
 
     // ---- routed experts (model._moe_grouped) + post-MLP conv
-    gemm_->run(xm_, H, bf16p(layer.router_bf16), H, router_logits_, EXPERTS, true, T, EXPERTS, H, s);
+    gemm_->run(xm_, H, bf16p(layer.router), H, router_logits_, EXPERTS, true, T, EXPERTS, H, s);
     CUDA_CHECK(cudaMemsetAsync(counts_, 0, EXPERTS * sizeof(int), s));
     pk::moe_topk(router_logits_, f32p(layer.router_bias), T, idx_, wts_, counts_, s);
     const pk::MoeWork work{counts_, tiles_n_, tiles_, pair_token_, pair_dst_};

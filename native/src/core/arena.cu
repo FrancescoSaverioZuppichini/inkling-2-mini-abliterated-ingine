@@ -31,10 +31,6 @@ void log_cuda_error(const char* op, cudaError_t err) noexcept {
 
 bool is_power_of_two(std::size_t value) { return value != 0 && (value & (value - 1)) == 0; }
 
-void cuda_throw_if(cudaError_t err) {
-    if (err != cudaSuccess) throw std::runtime_error(cuda_error_message("DeviceHeap", err));
-}
-
 std::uintptr_t checked_add_uintptr(std::uintptr_t a, std::size_t b) {
     if (b > std::numeric_limits<std::uintptr_t>::max() - a) {
         throw std::overflow_error("arena address arithmetic overflow");
@@ -232,15 +228,18 @@ void* DeviceHeap::alloc(std::size_t bytes, std::size_t align) {
     if (bytes == 0) throw std::invalid_argument("DeviceHeap allocation must be nonzero");
     if (!is_power_of_two(align)) throw std::invalid_argument("DeviceHeap alignment must be a power of two");
     if (base_ == 0) {
-        cuda_throw_if(cudaFree(nullptr));  // the runtime's primary context is the current one
-        cuda_throw_if(cudaGetDevice(&device_));
-        CUmemAllocationProp prop{};
-        prop.type          = CU_MEM_ALLOCATION_TYPE_PINNED;
-        prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-        prop.location.id   = device_;
+        CUdevice dev = 0;
+        cu_check(cuCtxGetDevice(&dev), "current device");  // the runtime's context, current since its first call
+        device_ = int(dev);
+    }
+    CUmemAllocationProp prop{};
+    prop.type          = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id   = device_;
+    if (base_ == 0) {
         cu_check(cuMemGetAllocationGranularity(&gran_, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM), "granularity");
         std::size_t free = 0, total = 0;
-        cuda_throw_if(cudaMemGetInfo(&free, &total));
+        cu_check(cuMemGetInfo(&free, &total), "memory info");
         reserved_ = (total + gran_ - 1) / gran_ * gran_;  // address space only: never more than the card holds
         CUdeviceptr p = 0;
         cu_check(cuMemAddressReserve(&p, reserved_, gran_, 0, 0), "address reserve");
@@ -250,10 +249,6 @@ void* DeviceHeap::alloc(std::size_t bytes, std::size_t align) {
     if (end > reserved_) throw std::bad_alloc();
     if (end > mapped_) {
         const std::size_t size = (end - mapped_ + gran_ - 1) / gran_ * gran_;
-        CUmemAllocationProp prop{};
-        prop.type          = CU_MEM_ALLOCATION_TYPE_PINNED;
-        prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-        prop.location.id   = device_;
         CUmemGenericAllocationHandle h = 0;
         cu_check(cuMemCreate(&h, size, &prop, 0), "physical allocation");
         if (CUresult r = cuMemMap(CUdeviceptr(base_ + mapped_), size, 0, h, 0); r != CUDA_SUCCESS) {

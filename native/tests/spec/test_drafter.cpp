@@ -44,6 +44,25 @@ struct DraftOut {
   }
 };
 
+void* upload(ingine::DeviceHeap& heap, const void* host, std::size_t bytes) {
+  void* d = heap.alloc(bytes);
+  INGINE_TEST_CUDA(cudaMemcpy(d, host, bytes, cudaMemcpyHostToDevice));
+  return d;
+}
+
+// the synthetic target's unembedding as FP8 rows + scales (dense_fp8), from BF16 rows [V, H]
+void fp8_unembed(model::Weights& w, const std::vector<__nv_bfloat16>& rows, int V) {
+  DeviceBuffer u16(rows.size() * 2);
+  u16.copy_from_host(rows.data(), rows.size() * 2);
+  void* q = w.heap.alloc(rows.size());
+  auto* sc = static_cast<float*>(w.heap.alloc(std::size_t(V) * 4));
+  ingine::kernels::dense::fp8_rows(static_cast<const __nv_bfloat16*>(u16.p), V, H, q, sc, nullptr);
+  INGINE_TEST_CUDA(cudaDeviceSynchronize());
+  w.unembed.w = model::rm(q, DType::FP8_E4M3FN, {V, H});
+  w.unembed.scale = model::rm(sc, DType::FP32, {V});
+  w.dense_fp8 = true;
+}
+
 DraftOut fetch(const model::Drafter::Draft& d, cudaStream_t s) {
   INGINE_TEST_CUDA(cudaStreamSynchronize(s));
   DraftOut o{std::vector<int32_t>(7), std::vector<float>(size_t(7) * V), std::vector<float>(7)};
@@ -92,28 +111,14 @@ int bench(const std::filesystem::path& dir, cudaStream_t stream) {
     }
   };
   model::Weights w;
-  w.storage.reserve(4);
   {
     std::vector<__nv_bfloat16> host(std::size_t(BV) * H);
     fill(host);
-    auto& e = w.storage.emplace_back(host.size() * 2);
-    e.copy_from_host(host.data(), host.size() * 2);
     std::vector<float> en(H, 1.f);
-    auto& n = w.storage.emplace_back(en.size() * 4);
-    n.copy_from_host(en.data(), en.size() * 4);
+    w.embed = model::rm(upload(w.heap, host.data(), host.size() * 2), DType::BF16, {BV, H});
+    w.embed_norm = model::rm(upload(w.heap, en.data(), en.size() * 4), DType::FP32, {H});
     fill(host);
-    DeviceBuffer u16(host.size() * 2);
-    u16.copy_from_host(host.data(), host.size() * 2);
-    auto& q = w.storage.emplace_back(host.size());
-    auto& sc = w.storage.emplace_back(std::size_t(BV) * 4);
-    ingine::kernels::dense::fp8_rows(static_cast<const __nv_bfloat16*>(u16.p), BV, H, q.p, static_cast<float*>(sc.p),
-                                     nullptr);
-    INGINE_TEST_CUDA(cudaDeviceSynchronize());
-    w.embed = model::rm(w.storage[0].p, DType::BF16, {BV, H});
-    w.embed_norm = model::rm(w.storage[1].p, DType::FP32, {H});
-    w.unembed.w = model::rm(w.storage[2].p, DType::FP8_E4M3FN, {BV, H});
-    w.unembed.scale = model::rm(w.storage[3].p, DType::FP32, {BV});
-    w.dense_fp8 = true;
+    fp8_unembed(w, host, BV);
   }
   std::vector<__nv_bfloat16> feats(std::size_t(CHUNK) * 4 * H);
   fill(feats);
@@ -123,6 +128,8 @@ int bench(const std::filesystem::path& dir, cudaStream_t stream) {
   DeviceArray<int32_t> d_m(std::vector<int32_t>{8}), d_acc(std::vector<int32_t>{2}), d_next(std::vector<int32_t>{99});
 
   model::Drafter d(dir, w, BCTX, stream);
+  DeviceBuffer scratch(d.commit_scratch_bytes());  // prompt commits run in lent memory, as in generator.cpp
+  d.lend_commit_scratch(scratch.p);
   d.capture();
   ingine::kernels::draft::RoundInputs in;
   in.nwidths = 1;
@@ -207,23 +214,9 @@ int main() {
     for (auto& x : unembed) x = float_to_bf16(float(r.normal() * 0.05));
     std::vector<float> en(H);
     for (auto& x : en) x = float(r.uniform(0.5, 1.5));
-    w.storage.reserve(4);  // references below stay valid
-    auto& e = w.storage.emplace_back(embed.size() * 2);
-    e.copy_from_host(embed.data(), embed.size() * 2);
-    auto& n = w.storage.emplace_back(en.size() * 4);
-    n.copy_from_host(en.data(), en.size() * 4);
-    DeviceBuffer u16(unembed.size() * 2);
-    u16.copy_from_host(unembed.data(), unembed.size() * 2);
-    auto& q = w.storage.emplace_back(unembed.size());
-    auto& sc = w.storage.emplace_back(size_t(V) * 4);
-    ingine::kernels::dense::fp8_rows(static_cast<const __nv_bfloat16*>(u16.p), V, H, q.p, static_cast<float*>(sc.p),
-                                     nullptr);
-    INGINE_TEST_CUDA(cudaDeviceSynchronize());
-    w.embed = model::rm(w.storage[0].p, DType::BF16, {V, H});
-    w.embed_norm = model::rm(w.storage[1].p, DType::FP32, {H});
-    w.unembed.w = model::rm(w.storage[2].p, DType::FP8_E4M3FN, {V, H});
-    w.unembed.scale = model::rm(w.storage[3].p, DType::FP32, {V});
-    w.dense_fp8 = true;
+    w.embed = model::rm(upload(w.heap, embed.data(), embed.size() * 2), DType::BF16, {V, H});
+    w.embed_norm = model::rm(upload(w.heap, en.data(), en.size() * 4), DType::FP32, {H});
+    fp8_unembed(w, unembed, V);
   }
 
   const int rows = 300;
@@ -248,6 +241,8 @@ int main() {
 
   {
     model::Drafter d(dir, w, MAX_CTX, stream, SHORT);
+    DeviceBuffer scratch(d.commit_scratch_bytes());
+    d.lend_commit_scratch(scratch.p);
     const int anchor = 17;
     // A: one eager commit of all rows; B: rows - 5 rows, then 5 rows (a commit graph once captured)
     auto commit_a = [&] { d.commit(fp, rows, 0); };

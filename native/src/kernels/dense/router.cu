@@ -43,14 +43,14 @@ constexpr l2::Evict WEIGHT_L2 = l2::Evict::none;
 // every call.
 __device__ float g_router_logits[8][EXPERTS];
 
-template <int CL, bool WF32, int M>
+template <int CL, int M>
 __global__ void __launch_bounds__(32 * EXPERTS / CL) router_kernel(const __nv_bfloat16* __restrict__ x,
-                                                                   const void* __restrict__ w,
+                                                                   const __nv_bfloat16* __restrict__ w,
                                                                    const float* __restrict__ bias,
                                                                    int* __restrict__ idx, float* __restrict__ wts,
                                                                    uint32_t zero) {
   constexpr int RPC = EXPERTS / CL, NT = 32 * RPC;
-  constexpr int EPC = WF32 ? 4 : 8;  // weights per 16-byte chunk
+  constexpr int EPC = 8;  // weights per 16-byte chunk
   constexpr int CH = H / (EPC * 32);
   __shared__ __align__(16) __nv_bfloat16 xs[M][H];
   __shared__ __align__(16) float logits[EXPERTS];  // token `rank`'s logits (CTAs rank < M)
@@ -80,7 +80,7 @@ __global__ void __launch_bounds__(32 * EXPERTS / CL) router_kernel(const __nv_bf
   const int row = rank * RPC + warp;
 
   // weights and bias (constants) before the PDL wait, activations after it
-  const uint8_t* wr = reinterpret_cast<const uint8_t*>(w) + size_t(row) * H * (WF32 ? 4 : 2);
+  const uint8_t* wr = reinterpret_cast<const uint8_t*>(w + size_t(row) * H);
   uint4 wv[CH];
   const std::uint64_t wpol = l2::policy<WEIGHT_L2>();
 #pragma unroll
@@ -101,20 +101,10 @@ __global__ void __launch_bounds__(32 * EXPERTS / CL) router_kernel(const __nv_bf
   for (int i = 0; i < CH; ++i) {
     const int col = (i * 32 + lane) * EPC;
     float wf[EPC], xf[EPC];
-    if constexpr (WF32) {
-      wf[0] = __uint_as_float(wv[i].x); wf[1] = __uint_as_float(wv[i].y);
-      wf[2] = __uint_as_float(wv[i].z); wf[3] = __uint_as_float(wv[i].w);
-    } else {
-      unpack_bf16x8(wv[i], wf);
-    }
+    unpack_bf16x8(wv[i], wf);
 #pragma unroll
     for (int m = 0; m < M; ++m) {
-      if constexpr (WF32) {
-        const uint2 u = *reinterpret_cast<const uint2*>(&xs[m][col]);
-        xf[0] = bf_lo(u.x); xf[1] = bf_hi(u.x); xf[2] = bf_lo(u.y); xf[3] = bf_hi(u.y);
-      } else {
-        unpack_bf16x8(*reinterpret_cast<const uint4*>(&xs[m][col]), xf);
-      }
+      unpack_bf16x8(*reinterpret_cast<const uint4*>(&xs[m][col]), xf);
       float a = acc[m];
 #pragma unroll
       for (int j = 0; j < EPC; ++j) a = fmaf(wf[j], xf[j], a);
@@ -186,12 +176,12 @@ __global__ void __launch_bounds__(32 * EXPERTS / CL) router_kernel(const __nv_bf
   }
 }
 
-template <int CL, bool WF32>
-void launch_router(int M, const __nv_bfloat16* x, const void* w, const float* bias, int* idx, float* wts, bool pdl,
-                   cudaStream_t stream) {
+template <int CL>
+void launch_router(int M, const __nv_bfloat16* x, const __nv_bfloat16* w, const float* bias, int* idx, float* wts,
+                   bool pdl, cudaStream_t stream) {
   auto go = [&](auto mc) {
     constexpr int MM = decltype(mc)::value;
-    launch_ex(router_kernel<CL, WF32, MM>, dim3(CL), 32 * EXPERTS / CL, 0, CL, pdl, stream, x, w, bias, idx, wts,
+    launch_ex(router_kernel<CL, MM>, dim3(CL), 32 * EXPERTS / CL, 0, CL, pdl, stream, x, w, bias, idx, wts,
               0u);
   };
   switch (M) {
@@ -211,7 +201,7 @@ void launch_router(int M, const __nv_bfloat16* x, const void* w, const float* bi
 int router_cluster_size() {
   if (!device_has_clusters()) return 16;  // one cooperative grid of 16 CTAs: no GPC constraint
   static const int cl = [] {
-    auto k = router_kernel<16, true, 8>;
+    auto k = router_kernel<16, 8>;
     if (cudaFuncSetAttribute(k, cudaFuncAttributeNonPortableClusterSizeAllowed, 1) != cudaSuccess) {
       (void)cudaGetLastError();
       return 8;
@@ -232,17 +222,11 @@ int router_cluster_size() {
 
 }  // namespace
 
-void router(const __nv_bfloat16* x, int M, const void* w, bool w_fp32, const float* bias, int* idx, float* wts,
-            bool pdl, cudaStream_t stream) {
+void router(const __nv_bfloat16* x, int M, const __nv_bfloat16* w, const float* bias, int* idx, float* wts, bool pdl,
+            cudaStream_t stream) {
   require(x && w && bias && idx && wts, "router: null argument");
-  const bool c16 = router_cluster_size() == 16;
-  if (w_fp32) {
-    if (c16) launch_router<16, true>(M, x, w, bias, idx, wts, pdl, stream);
-    else launch_router<8, true>(M, x, w, bias, idx, wts, pdl, stream);
-  } else {
-    if (c16) launch_router<16, false>(M, x, w, bias, idx, wts, pdl, stream);
-    else launch_router<8, false>(M, x, w, bias, idx, wts, pdl, stream);
-  }
+  if (router_cluster_size() == 16) launch_router<16>(M, x, w, bias, idx, wts, pdl, stream);
+  else launch_router<8>(M, x, w, bias, idx, wts, pdl, stream);
 }
 
 }  // namespace ingine::kernels::dense

@@ -619,13 +619,16 @@ void test_topk(Rng& r) {
         base[size_t(i) * V + x] = bfr(float(v));
       }
     DeviceArray<float> d_base(base), d_val(size_t(rows) * kd::CANDIDATES);
-    DeviceArray<int32_t> d_idx(size_t(rows) * kd::CANDIDATES), d_mapped(size_t(rows) * kd::CANDIDATES);
+    DeviceArray<int32_t> d_idx(size_t(rows) * kd::CANDIDATES), d_mapped(size_t(rows) * kd::CANDIDATES),
+        d_row(size_t(rows) * kd::CANDIDATES);
     DeviceArray<uint8_t> ws(kd::topk_workspace_bytes(rows, V));
     std::vector<int32_t> map(V);  // element -> token id, as a shortlist head's rows
     for (int x = 0; x < V; ++x) map[x] = 7 * x + 3;
     DeviceArray<int32_t> d_map(map);
-    kd::topk_candidates(d_base.get(), rows, V, nullptr, d_val.get(), d_idx.get(), ws.get(), nullptr);
-    kd::topk_candidates(d_base.get(), rows, V, d_map.get(), d_val.get(), d_mapped.get(), ws.get(), nullptr);
+    kd::topk_candidates(d_base.get(), rows, V, nullptr, d_val.get(), d_idx.get(), d_row.get(), ws.get(), nullptr);
+    const auto row = d_row.download();  // the plain call's rows; the mapped call overwrites them with the same
+    kd::topk_candidates(d_base.get(), rows, V, d_map.get(), d_val.get(), d_mapped.get(), d_row.get(), ws.get(),
+                        nullptr);
     INGINE_TEST_CUDA(cudaDeviceSynchronize());
     const auto val = d_val.download();
     const auto idx = d_idx.download();
@@ -634,7 +637,7 @@ void test_topk(Rng& r) {
       const auto ref = topk_ref(base.data() + size_t(i) * V, V);
       bool ok = int(ref.size()) == kd::CANDIDATES;
       for (int k = 0; ok && k < kd::CANDIDATES; ++k) {
-        ok &= idx[size_t(i) * kd::CANDIDATES + k] == ref[k];
+        ok &= idx[size_t(i) * kd::CANDIDATES + k] == ref[k] && row[size_t(i) * kd::CANDIDATES + k] == ref[k];
         ok &= mapped[size_t(i) * kd::CANDIDATES + k] == map[ref[k]];
         ok &= val[size_t(i) * kd::CANDIDATES + k] == base[size_t(i) * V + ref[k]];
       }
@@ -716,7 +719,9 @@ void test_markov(Rng& r) {
   DeviceArray<unsigned long long> d_picks(kd::GAMMA);
   DeviceArray<kd::DraftParams> p(1);
   DeviceArray<uint8_t> topk_ws(kd::topk_workspace_bytes(kd::GAMMA, V));
-  kd::topk_candidates(d_base.get(), kd::GAMMA, V, nullptr, d_val.get(), d_idx.get(), topk_ws.get(), nullptr);
+  DeviceArray<int32_t> d_row(size_t(kd::GAMMA) * kd::CANDIDATES);
+  kd::topk_candidates(d_base.get(), kd::GAMMA, V, nullptr, d_val.get(), d_idx.get(), d_row.get(), topk_ws.get(),
+                      nullptr);
   kd::markov_pre(d_rnn_w.get(), d_h.get(), d_f.get(), d_part.get(), nullptr);
   INGINE_TEST_CUDA(cudaDeviceSynchronize());
   const auto cand_val = d_val.download();

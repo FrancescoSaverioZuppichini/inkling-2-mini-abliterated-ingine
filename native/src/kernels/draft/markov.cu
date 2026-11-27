@@ -221,7 +221,7 @@ __global__ void __launch_bounds__(GATHER_THREADS) topk_gather_kernel(TopkRowWs* 
   const size_t at = size_t(blockIdx.x) * CANDIDATES + tid;
   cand_val[at] = it.val;
   cand_idx[at] = map != nullptr ? map[it.idx] : it.idx;
-  if (cand_row != nullptr) cand_row[at] = it.idx;
+  cand_row[at] = it.idx;
 }
 
 // ---- rnn projection ------------------------------------------------------------------------------------
@@ -414,7 +414,7 @@ std::size_t topk_workspace_bytes(int rows, int V) {
 }
 
 void topk_candidates(const float* base, int rows, int V, const std::int32_t* map, float* cand_val,
-                     std::int32_t* cand_idx, void* ws, cudaStream_t stream, std::int32_t* cand_row) {
+                     std::int32_t* cand_idx, std::int32_t* cand_row, void* ws, cudaStream_t stream) {
   if (V < CANDIDATES) throw std::invalid_argument("topk_candidates: V must be at least 1024");
   if (rows <= 0) return;
   auto* w = static_cast<TopkRowWs*>(ws);

@@ -42,12 +42,9 @@ __global__ void k_fp8(uint8_t* p, size_t n, uint32_t seed) {
 }
 
 struct Alloc {
-  std::vector<DeviceBuffer>& storage;
+  DeviceHeap& heap;
   uint32_t seed = 1;
-  void* raw(size_t bytes) {
-    storage.emplace_back(bytes);
-    return storage.back().p;
-  }
+  void* raw(size_t bytes) { return heap.alloc(bytes); }
   Tensor f32(std::initializer_list<int> shape, float scale, float offset = 0.f) {
     size_t n = 1;
     for (int d : shape) n *= size_t(d);
@@ -89,16 +86,16 @@ Layer make_layer(Alloc& a, bool full, const Experts& ex) {
   L.v_conv = a.f32({KV_DIM, CONV_K}, 0.1f);
   L.attn_conv = a.f32({H, CONV_K}, 0.1f);
   L.mlp_conv = a.f32({H, CONV_K}, 0.1f);
-  L.router_bf16 = a.bf16({EXPERTS, H}, 0.02f);
+  L.router = a.bf16({EXPERTS, H}, 0.02f);
   L.router_bias = a.f32({EXPERTS}, 0.f);
   L.attn_query = a.f32({full ? 3 : 1, H}, 0.02f);
   L.mlp_query = a.f32({1, H}, 0.02f);
   L.qkv_gate_down = a.bf16({3, GATE_RANK, 2 * H}, 0.02f);
-  L.qkv_gate_forget16 = a.bf16({3, H, GATE_RANK}, 0.05f);
-  L.qkv_gate_gain16 = a.bf16({3, H, GATE_RANK}, 0.05f);
+  L.qkv_gate_forget = a.bf16({3, H, GATE_RANK}, 0.05f);
+  L.qkv_gate_gain = a.bf16({3, H, GATE_RANK}, 0.05f);
   L.mlp1_gate_down = a.bf16({1, GATE_RANK, 2 * H}, 0.02f);
-  L.mlp1_gate_forget16 = a.bf16({1, H, GATE_RANK}, 0.05f);
-  L.mlp1_gate_gain16 = a.bf16({1, H, GATE_RANK}, 0.05f);
+  L.mlp1_gate_forget = a.bf16({1, H, GATE_RANK}, 0.05f);
+  L.mlp1_gate_gain = a.bf16({1, H, GATE_RANK}, 0.05f);
   L.attn_norm3 = a.f32({3, H}, 0.f, 1.f);
   L.attn_norm_mix = full ? L.attn_norm3 : a.f32({1, H}, 0.f, 1.f);
   L.mlp_norm1 = a.f32({1, H}, 0.f, 1.f);
@@ -119,7 +116,7 @@ int main() {
   cudaStream_t s;
   INGINE_TEST_CUDA(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
   Weights w;
-  Alloc a{w.storage};
+  Alloc a{w.heap};
   Experts ex;
   ex.fmt = ExpertFormat::NVFP4;
   {

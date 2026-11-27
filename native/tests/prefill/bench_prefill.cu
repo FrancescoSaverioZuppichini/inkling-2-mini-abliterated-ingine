@@ -98,11 +98,11 @@ int main(int argc, char** argv) {
   std::vector<int> Ts = {64, 256, 1024, 2048};
   if (const char* ts = std::getenv("INGINE_BENCH_T")) Ts = {std::atoi(ts)};  // one chunk size (profiling)
 
-  std::vector<DeviceBuffer> storage;
+  DeviceHeap heap;
   std::vector<Layer> nv;  // NVFP4 layers (sliding 1, 2, 3 and full 5)
-  for (int l : {1, 2, 3, 5}) nv.push_back(load_layer(model_dir, l, true, s, storage));
+  for (int l : {1, 2, 3, 5}) nv.push_back(load_layer(model_dir, l, true, s, heap));
   std::vector<Layer> mx;
-  if (want("moe")) mx.push_back(load_layer(model_dir, 20, true, s, storage));
+  if (want("moe")) mx.push_back(load_layer(model_dir, 20, true, s, heap));
   INGINE_TEST_CUDA(cudaStreamSynchronize(s));
   pk::Gemm gemm;
 
@@ -118,7 +118,7 @@ int main(int argc, char** argv) {
     auto* act = dalloc<uint16_t>(size_t(maxT) * 8 * 1152);
     auto* down = dalloc<uint16_t>(size_t(maxT) * 8 * H);
     auto route = [&](const Layer& L, int T) {
-      gemm.run(bf(x), H, bf(L.router_bf16.data), H, logits, 128, true, T, 128, H, s);
+      gemm.run(bf(x), H, bf(L.router.data), H, logits, 128, true, T, 128, H, s);
       cudaMemsetAsync(w.counts, 0, 512, s);
       pk::moe_topk(logits, static_cast<const float*>(L.router_bias.data), T, idx, wts, w.counts, s);
       pk::moe_route(idx, T, w, s);
