@@ -396,9 +396,29 @@ __global__ void GEMV_MMA_BOUNDS(32 * SPLITK) gemv_mma_kernel(const uint8_t* __re
 
 // ---- launch helpers -----------------------------------------------------------------------------------
 
+// [Agent] INT8 rows at M = 1 decode on CUDA cores at ~4.3 instructions per weight. That hides behind the DRAM stream
+// only where the GPU issues enough warp instructions per byte DRAM delivers (4 schedulers x SMs x clock / bandwidth):
+// RTX 4090 1.28, where the CUDA-core kernel wins (proj 22.5 vs 23.6 us per call); RTX 3090 0.59, where the tensor-core
+// kernel (~1.4 instructions per weight) wins (proj 28.2 -> 26.1 us, decode +0.5..+0.7 %). Real weights, E1 on both.
+bool int8_m1_tensor_cores() {
+  static const bool tc = [] {
+    int dev = 0, sms = 0, clk_khz = 0, mem_khz = 0, bus_bits = 0;
+    CUDA_CHECK(cudaGetDevice(&dev));
+    CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
+    CUDA_CHECK(cudaDeviceGetAttribute(&clk_khz, cudaDevAttrClockRate, dev));
+    CUDA_CHECK(cudaDeviceGetAttribute(&mem_khz, cudaDevAttrMemoryClockRate, dev));
+    CUDA_CHECK(cudaDeviceGetAttribute(&bus_bits, cudaDevAttrGlobalMemoryBusWidth, dev));
+    const double issue_per_s = 4.0 * sms * clk_khz * 1e3, bytes_per_s = 2.0 * mem_khz * 1e3 * bus_bits / 8;
+    return issue_per_s < bytes_per_s;
+  }();
+  return tc;
+}
+
+
 // BLOCK: threads per block of the M = 1 kernel (0: M = 1 runs the tensor-core kernel too, for K whose
 // whole row per lane would not fit in registers); SPLITK: warps per 16-row block of the M >= 2 kernel;
-// UFP8: steps per load batch of its FP8 and INT8 instantiations; I8_TC: INT8 rows at M = 1 run the tensor-core kernel.
+// UFP8: steps per load batch of its FP8 and INT8 instantiations; I8_TC: INT8 rows at M = 1 may run the tensor-core
+// kernel (int8_m1_tensor_cores).
 template <int K, int BLOCK, int SPLITK, int UFP8, template <int> class Epi, bool GATHER = false, bool I8_TC = false,
           class Make>
 void launch_gemv(const Matrix& w, int M, bool pdl, cudaStream_t stream, Make make) {
@@ -418,7 +438,7 @@ void launch_gemv(const Matrix& w, int M, bool pdl, cudaStream_t stream, Make mak
       constexpr int B = BLOCK > 0 ? BLOCK : 32;  // (the branch is discarded for BLOCK = 0)
       if (fmt == F_FP8) launch_ex(gemv_kernel<F_FP8, K, 16, B, E, GATHER>, dim3((rows * 16 + B - 1) / B), B, 0, 1, pdl, stream, wp, sc, rows, 0u, epi, rm);
       else if (fmt == F_INT8) {
-        if constexpr (I8_TC) launch_ex(gemv_mma_kernel<F_INT8, K, MM, SPLITK, UFP8, E, GATHER>, dim3((rows + 15) / 16), 32 * SPLITK, 0, 1, pdl, stream, wp, sc, rows, 0u, epi, rm);
+        if (I8_TC && int8_m1_tensor_cores()) launch_ex(gemv_mma_kernel<F_INT8, K, MM, SPLITK, UFP8, E, GATHER>, dim3((rows + 15) / 16), 32 * SPLITK, 0, 1, pdl, stream, wp, sc, rows, 0u, epi, rm);
         else launch_ex(gemv_kernel<F_INT8, K, 16, B, E, GATHER>, dim3((rows * 16 + B - 1) / B), B, 0, 1, pdl, stream, wp, sc, rows, 0u, epi, rm);
       }
       else launch_ex(gemv_kernel<F_BF16, K, 32, B, E, GATHER>, dim3((rows * 32 + B - 1) / B), B, 0, 1, pdl, stream, wp, sc, rows, 0u, epi, rm);
@@ -549,9 +569,8 @@ void proj(const __nv_bfloat16* xin, int M, Matrix w, const int* segments, int ns
     constexpr int MM = decltype(mc)::value;
     return ProjEpi<MM>{xin, segments, nseg, R, out};
   };
-  // [Agent] INT8 proj at M = 1 on tensor cores: its CUDA-core decode (~4.3 instructions per weight) leaves 2 us of
-  // issue time per call that the DRAM stream does not hide (RTX 3090, real weights: 28.2 -> 26.1 us, 704 -> 760 GB/s);
-  // the tensor-core path needs ~1.4. proj_conv (2,304 rows) and head gain nothing from it (10.4 vs 10.7, 520 vs 520).
+  // [Agent] INT8 proj at M = 1 may run on tensor cores (int8_m1_tensor_cores: the RTX 3090 yes, the RTX 4090 no).
+  // proj_conv (2,304 rows) and head gain nothing from them on either GPU (3090: 10.4 vs 10.7, 520 vs 520 us).
   if (w.row_map) launch_gemv<H, 256, PROJ_SPLITK, MMA_U_FP8, ProjEpi, true, true>(w, M, pdl, stream, make);
   else launch_gemv<H, 256, PROJ_SPLITK, MMA_U_FP8, ProjEpi, false, true>(w, M, pdl, stream, make);
 }
