@@ -218,7 +218,7 @@ __global__ void __launch_bounds__(NT, 1) wgemm_kernel(const GemmArgs g) {
   // ks / R from weight slot `slot`, part = ks % R (a template constant at every call). NVFP4 scales: the step's 4
   // scale codes per row, raw (they index the table); MXFP8: the 4 k16 groups' power-of-two factors.
   using Scales = std::conditional_t<FMT == FMT_NVFP4, uint32_t[2], float[2][4]>;
-  auto scales_of = [&](int ks, unsigned slot, int part, Scales& sc) {
+  auto scales_of = [&](int ks, unsigned slot, int part, Scales& sc) __attribute__((always_inline)) {
 #pragma unroll
     for (int nt = 0; nt < 2; ++nt) {
       const int row = warp * 16 + nt * 8 + (lane >> 2);
@@ -231,7 +231,7 @@ __global__ void __launch_bounds__(NT, 1) wgemm_kernel(const GemmArgs g) {
       }
     }
   };
-  auto decode = [&](unsigned slot, int part, int kk, const Scales& sc, unsigned (&b)[BK / 16][2][2]) {
+  auto decode = [&](unsigned slot, int part, int kk, const Scales& sc, unsigned (&b)[BK / 16][2][2]) __attribute__((always_inline)) {
     const unsigned char* ws = w_smem + slot;
     const int kc = part * BK + kk * 16;  // first element of the k16 group inside the chunk
 #pragma unroll
@@ -276,12 +276,16 @@ __global__ void __launch_bounds__(NT, 1) wgemm_kernel(const GemmArgs g) {
   for (int kk = 0; kk < BK / 16; ++kk) a_off[kk] = 2 * swz<KCH>(lane & 15, kk * 2 + (lane >> 4));
   unsigned a_rd = 0, a_wr = (AS - 1) * C::A_BYTES;  // stage of step ks; stage step ks + AS - 1 loads into
   unsigned w_rd = 0, w_wr = (C::WS - 1) * C::W_BYTES;  // slot of chunk ks / R; slot of chunk ks / R + WS - 1
-  auto kloop = [&](auto mt_c) {
+  // [Agent] The K-loop lambdas are force-inlined: for the MXFP8 kernels sm_86's larger software FP8 decode pushed
+  // them past the inliner's size limit, the fragment arrays passed by reference then lived in an 800-byte stack
+  // frame (local-memory loads and stores in every step); 41215d7 measured ~2x slower MoE GEMMs on the RTX 3090.
+  // sm_89 code is unchanged (same SASS).
+  auto kloop = [&](auto mt_c) __attribute__((always_inline)) {
     constexpr int MT = decltype(mt_c)::value;
     // par = ks % 2. first = step 0: its own fragments are decoded right after the barrier that publishes chunk 0.
     // tail = the last AS - 1 steps, which load no activations.
     auto step = [&](int ks, auto par_c, auto dec_c, auto first_c, auto tail_c, unsigned (&bc)[BK / 16][2][2],
-                    unsigned (&bn)[BK / 16][2][2]) {
+                    unsigned (&bn)[BK / 16][2][2]) __attribute__((always_inline)) {
       constexpr int part = decltype(par_c)::value % C::R, part_n = (decltype(par_c)::value + 1) % C::R;
       constexpr bool DEC = decltype(dec_c)::value;
       cp_wait<AS - 2>();
