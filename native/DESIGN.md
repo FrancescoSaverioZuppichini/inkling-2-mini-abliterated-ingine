@@ -250,9 +250,9 @@ taken right after that prefill (target state, drafter context, last logits; one 
 max_ctx 262144) is restored and only the rest is prefilled. That is the agent-loop case: the next request
 re-renders the previous answer (canonical tool-call JSON, retokenised text), which differs from the generated
 tokens right after the previous prompt. A conversation displaced by another one is parked: its checkpoint and
-its full-attention rows [0, n) are copied aside on the device (about 18 KB per token + 220 MB, within
-`RuntimeOptions::park_mb`, least recently used evicted, all released when a device allocation fails) and
-restored when a later prompt starts with its prompt. Otherwise the state is reset. The server logs the path
+its full-attention rows [0, n) are copied into pinned host memory (one arena of `RuntimeOptions::park_host_mb`,
+default a quarter of system RAM, at most 32 GiB; first fit, least recently used evicted; about 18 KB per token at
+FP8 + 220 MB) and copied back when a later prompt starts with its prompt. Otherwise the state is reset. The server logs the path
 per request (`<id>: reuse=extend|checkpoint|parked|none reused=N prefilled=M prefill=<seconds>`).
 
 Third-party CMake targets: `nlohmann_json::nlohmann_json`, `httplib::httplib`, `spdlog::spdlog`, `ingine_utf8proc`,

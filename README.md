@@ -125,7 +125,7 @@ Settings come from the profile in [runtime-manifest.json](runtime-manifest.json)
 | `INGINE_ABLATION` | `$INGINE_MODEL_DIR/inkling-2-mini-abliterated.safetensors` | abliteration file; a relative path is taken relative to the install folder; empty serves the original model (model id `inkling-2-mini`) |
 | `INGINE_CTX` | 262144 | context length; lower it to leave GPU memory to other programs |
 | `HOST`, `PORT` | 127.0.0.1, 8003 | bind address and port |
-| `INGINE_EXTRA_ARGS` | empty | further server arguments, e.g. `--top-p 0.95` (sampling for requests that set none, also `--temperature`, `--top-k`), `--park-mb 0` (see below), `--spec-threshold 0.9` |
+| `INGINE_EXTRA_ARGS` | empty | further server arguments, e.g. `--top-p 0.95` (sampling for requests that set none, also `--temperature`, `--top-k`), `--park-host-mb 0` (see below), `--spec-threshold 0.9` |
 | `INGINE_START_TIMEOUT` | 300 | seconds `ingine start` waits for the server to report ready |
 
 ```bash
@@ -145,8 +145,8 @@ authentication**: keep the server on loopback. Requests run one at a time; up to
 further ones get HTTP 503. `GET /health` and `GET /v1/models` report the state.
 
 A follow-up request only reads what is new in its conversation. Conversations that take turns (subagents, a
-second client) are kept warm in spare GPU memory, by default up to 3 GiB and never the last 4 GiB that are free
-after start-up (`--park-mb N` sets the budget in MiB, `0` turns it off); they are dropped when memory runs short.
+second client) are kept warm in pinned host RAM, by default a quarter of system RAM, at most 32 GiB
+(`--park-host-mb N` sets it in MiB, `0` turns it off); the least recently used is dropped when it is full.
 
 `POST /v1/chat/completions` takes:
 
