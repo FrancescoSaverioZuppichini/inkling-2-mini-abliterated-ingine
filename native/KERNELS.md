@@ -93,23 +93,38 @@ log_scaling, workspace, out)`
   * Cache: full layers write position p at `k_cache[p]`; sliding layers write slot `p % 1024` and set
     `kpos[slot] = p` (`kpos` int64 `[1024]`, -1 = empty).
   * Cache formats (`DecodeArgs::kv`): `k_cache`/`v_cache` `[rows, 8, 128]` are both BF16, or, on full layers
-    only, both float8_e4m3fn (`fp8`: no scale), or both int4 (below). The kernel dispatches on the format; the
-    call signature is the same.
+    only, both float8_e4m3fn (`fp8`: no scale), or a low-bit format (below). The kernel dispatches on the
+    format; the call signature is the same.
     FP8 rule: the BF16 key/value above is rounded to E4M3, nearest even, saturated to ±448 (= torch
     `x.clamp(-448, 448).to(torch.float8_e4m3fn)`; real keys have norm ≤ 22.627 and values are RMS-normed,
     so saturation does not occur in practice). Every read of a cached entry, the call's own new keys/values
     included, uses that E4M3 value. Sliding rings are BF16 only (any other ring is rejected).
-  * int4 (full layers, `attn_lb.cu`; lossy, 4.06 bits per value, 1,040 bytes per position and visit, 8,320 for all 8 visits):
+  * Low-bit formats (full layers, `attn_lb.cu`, layouts and code rules in `kv_format.h`; lossy):
     - Rotation: `x'' = H D x` for keys, values and q, with `H` the unnormalised 128-point Walsh-Hadamard matrix
-      (`H H = 128 I`) and `D` a fixed ±1 diagonal (`kv_format.h::sign_of`).
-    - Codes: n in 0..15 stands for the level `(n - 7.5) * 0.3352` on a unit-RMS row, n = clamp(floor(x / 0.3352)
-      + 8, 0, 15). Keys: x = `k'' / |k|` (the BF16 key above), plus one FP16 least-squares scale per key and head
-      `s = (k'' · c) / (c · c)` with c = n - 7.5, so `k'' ≈ s c`. Values: x = `v'' / √128`, no scale.
-    - Layout: blocks of 16 positions x 1 KV head, `[visit][block][head]`, K 1,056 bytes (codes in mma operand
-      order + 16 FP16 scales), V 1,024 bytes (`kv_format.h`); `cache_bytes()` gives the bytes per visit.
-    - Reads: `s_j = s · (q''_f16 · c_j) / (128 √128) + bias`, q'' rounded to FP16; P rounded to FP16 for P V;
-      the output `D H (Σ p c 0.3352) / (l √128)`, then BF16 and the gate as above. The call's new keys/values are
-      encoded first and attended as stored; positions ≥ p0 + M may hold any bytes.
+      (`H H = 128 I`) and `D` a fixed ±1 diagonal (`kv_format.h::sign_of`). Every format codes `k''` and `v''`.
+    - A format is a key code and a value code:
+
+      | format | keys | values | bits per value | bytes per position, 8 visits |
+      |---|---|---|---:|---:|
+      | int8 | int8 | int8 | 8.13 | 16,640 |
+      | k8v4 | int8 | int4 | 6.06 | 12,416 |
+      | fp4 | fp4 | fp4 | 4.50 | 9,216 |
+      | int4 | int4 | int4 | 4.06 | 8,320 |
+
+    - int4 codes: n in 0..15 stands for the level `(n - 7.5) * 0.3352` on a unit-RMS row, n = clamp(floor(x /
+      0.3352) + 8, 0, 15). Keys: x = `k'' / |k|` (the BF16 key above), plus one FP16 least-squares scale per key and
+      head `s = (k'' · c) / (c · c)` with c = n - 7.5, so `k'' ≈ s c`. Values: x = `v'' / √128`, no scale.
+    - int8 codes: one FP16 scale per row `s = fp16(max|x''| / 127)`, c = clamp(rint(x'' / s), ±127), `x'' ≈ s c`.
+      Values are read as the FP16 product `fp16(c s)` (the scale capped at 2.0 so stale bytes decode finite).
+    - fp4 codes: E2M1 (0, ±0.5, ±1, ±1.5, ±2, ±3, ±4, ±6) times one scale per row and 16 dims, `s = max|x''| / 6`
+      rounded to 3 mantissa bits (stored as FP16 bits 14..7 of `s * 1024`), code = nearest level of `x'' / s`, ties
+      to even.
+    - Layout: blocks of 16 positions x 1 KV head, `[visit][block][head]`, codes in mma operand order then the
+      block's scales (`kv_format.h`); `cache_bytes()` gives the bytes per visit.
+    - Reads: `s_j = (q''_f16 · k''_j) / (128 √128) + bias`, q'' rounded to FP16 (key scales applied in FP32 after the
+      dot product, fp4 scales inside the FP16 operand, exactly); P rounded to FP16 for P V; the output `D H (Σ p v'')
+      / (128 l)`, then BF16 and the gate as above. The call's new keys/values are encoded first and attended as
+      stored; positions ≥ p0 + M may hold any bytes.
     - Prefill (`prefill_attend`) packs the chunk's BF16 rows (`pack_rows`) and attends every key from the cache
       with the same rules.
   * Scores over cached keys j (positions `kp`, distance `d = p - kp`): valid if `0 ≤ d` and, for sliding
