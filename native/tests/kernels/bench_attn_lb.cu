@@ -1,6 +1,6 @@
 // Full-attention decode timing: today's FP8 kernel vs the low-bit kernel, one visit (8 KV heads), synthetic caches
 // at production depth. Exits 77 (skip) unless INGINE_BENCH=1. Args: depths in tokens (default 229376 507904).
-// Per (format, depth, M): 2 warm-ups, then calls interleaved A/B over the formats, median of 15; prints us, the
+// Per (format, depth, M): 2 warm-ups, then the formats in a random order per repeat, median of 15 with min / max; prints us, the
 // cache bytes the call reads and GB/s. The kill metric of S4-08 E1 is int4 GB/s / fp8 GB/s at the same depth.
 #include "kernels/attn/attn.h"
 
@@ -14,6 +14,8 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
+#include <numeric>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -117,8 +119,14 @@ int main(int argc, char** argv) {
             const std::int64_t p0 = L - M;
             INGINE_TEST_CUDA(cudaMemcpy(pos, &p0, 8, cudaMemcpyHostToDevice));
             std::vector<std::vector<float>> t(arms.size());
-            for (int rep = 0; rep < 17; ++rep)
-                for (size_t ai = 0; ai < arms.size(); ++ai) {
+            std::mt19937 rng(unsigned(L * 16 + M));
+            for (int rep = 0; rep < 17; ++rep) {
+                // [Agent] Arms in a fresh random order every repeat (after the 2 warm-ups), so a slow drift of clocks or
+                // temperature lands on both arms alike.
+                std::vector<size_t> order(arms.size());
+                std::iota(order.begin(), order.end(), size_t(0));
+                std::shuffle(order.begin(), order.end(), rng);
+                for (size_t ai : order) {
                     const Arm& a = arms[ai];
                     if (a.fp8 && L > 300000) continue;  // FP8 at 500K is not a configuration (does not fit)
                     attn::DecodeArgs d;
@@ -134,6 +142,7 @@ int main(int argc, char** argv) {
                     INGINE_TEST_CUDA(cudaEventElapsedTime(&ms, e0, e1));
                     if (rep >= 2) t[ai].push_back(ms * 1000.f);
                 }
+            }
             for (size_t ai = 0; ai < arms.size(); ++ai) {
                 if (t[ai].empty()) continue;
                 std::sort(t[ai].begin(), t[ai].end());
