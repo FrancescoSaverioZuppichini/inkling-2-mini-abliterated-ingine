@@ -139,7 +139,7 @@ int main(int argc, char** argv) {
   std::string model_dir = default_model_dir(), backend = "fast", ablation, effort = "low", forced, forced_trace;
   int max_ctx = 32768, tokens = 512, runs = 3, long_prompt = 0, forced_items = 0, forced_skip = 0, forced_free = -1;
   bool dense_fp8 = false, kv_fp8 = false, spec = false;
-  std::string kv_cache;
+  std::string kv_cache = "bf16";
   double spec_threshold = 0.8, temperature = 0.0;
 
   ingine::serve::ArgParser ap("ingine-bench",
@@ -152,8 +152,12 @@ int main(int argc, char** argv) {
   ap.option("--runs", "", "", &runs);
   ap.option("--effort", "", "", &effort);
   ap.flag("--dense-fp8", "", &dense_fp8);
-  ap.flag("--kv-fp8", "FP8 full-attention KV caches", &kv_fp8);
-  ap.option("--kv-cache", "{bf16,fp8,int4}", "full-attention KV cache format", &kv_cache, {"bf16", "fp8", "int4"});
+  ap.flag("--kv-fp8", "same as --kv-cache fp8", &kv_fp8);
+  ap.option("--kv-cache", "{bf16,fp8,int4}",
+            "full-attention KV caches: bf16 (default), fp8 (half the memory), int4 (4.06 bits, rotated, lossy: 500K "
+            "positions on 24 GB)",
+            &kv_cache, {"bf16", "fp8", "int4"});
+  ap.exclusive({"--kv-fp8", "--kv-cache"}, false);
   ap.flag("--spec", "DSpark speculative decoding", &spec);
   ap.option("--spec-threshold", "", "verify the leading drafts whose draft probability exceeds this (0 = always all 7)",
             &spec_threshold);
@@ -178,8 +182,7 @@ int main(int argc, char** argv) {
     options.ablation = ablation;
     options.max_ctx = max_ctx;
     options.dense_fp8 = dense_fp8;
-    options.kv_fp8 = kv_fp8 || kv_cache == "fp8";
-    if (!kv_cache.empty()) options.kv_cache = kv_cache == "bf16" ? 0 : kv_cache == "fp8" ? 1 : 2;
+    options.kv = ingine::model::kv_format_of(kv_fp8 ? "fp8" : kv_cache);
     options.spec = spec;
     options.spec_threshold = float(spec_threshold);
     auto gen = ingine::model::make_generator(options);

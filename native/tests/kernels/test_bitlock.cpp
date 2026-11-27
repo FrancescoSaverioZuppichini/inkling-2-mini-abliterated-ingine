@@ -259,7 +259,6 @@ uint64_t lock_attn_sliding(LockGen& g, int M) {
     a.conv_v_state = cv.get();
     a.k_cache = k.get();
     a.v_cache = v.get();
-    a.cache_fp8 = false;
     a.cache_rows = WIN;
     a.kpos = dkpos.get();
     a.pos = dpos.get();

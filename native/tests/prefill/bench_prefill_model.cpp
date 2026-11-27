@@ -36,7 +36,7 @@ int main() {
   if (std::ifstream(abl)) opt.ablation = abl;
   opt.max_ctx = 262144;
   opt.dense_fp8 = true;
-  opt.kv_fp8 = true;
+  opt.kv = KvFormat::fp8;
   Runtime rt(opt);
   const cudaStream_t s = rt.stream();
   const int chunk = 2048;

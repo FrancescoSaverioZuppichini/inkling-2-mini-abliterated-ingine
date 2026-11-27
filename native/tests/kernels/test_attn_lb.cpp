@@ -2,9 +2,9 @@
 // oracle reads back the codes and scales the kernels wrote (pack_rows for old rows, the decode kernel for the call's
 // own rows) and attends them in double, with the query rotated and rounded to FP16 as the kernel does. So the check
 // isolates the reader's arithmetic from the format's loss. Separately: the call's new rows against a host encode of
-// the oracle's keys / values (rare boundary flips allowed), conv states, stale rows after p0 + M (random bytes,
-// NaN scales included: output bits must not move), and, as information, the format's error against attention over
-// the unquantized BF16 rows. Full layers, p0 = 0 / 3000 / 4637 / 9005, M = 1..8. Synthetic layer parameters.
+// the oracle's keys / values (rare boundary flips allowed), conv states, and stale rows after p0 + M (random bytes,
+// NaN scales included: output bits must not move). Full layers, p0 = 0 / 3000 / 4637 / 9005, M = 1..8; prefill
+// T = 77 and 300. Synthetic layer parameters.
 #include "kernels/oracle.h"
 
 #include "kernels/attn/attn.h"
@@ -38,16 +38,20 @@ void clip_rows(std::vector<double>& x, int rows, int n, double t) {
   }
 }
 
-// H D x (unnormalised Hadamard after the fixed signs), double
-std::vector<double> rot(const double* x) {
-  std::vector<double> y(D);
-  for (int d = 0; d < D; ++d) y[d] = x[d] * kvf::sign_of(d);
+// unnormalised Walsh-Hadamard transform in place (H H = 128 I)
+void fwht(std::vector<double>& y) {
   for (int h = 1; h < D; h <<= 1)
     for (int i = 0; i < D; ++i)
       if (!(i & h)) {
         const double a = y[i], b = y[i + h];
         y[i] = a + b, y[i + h] = a - b;
       }
+}
+// H D x
+std::vector<double> rot(const double* x) {
+  std::vector<double> y(D);
+  for (int d = 0; d < D; ++d) y[d] = x[d] * kvf::sign_of(d);
+  fwht(y);
   return y;
 }
 
@@ -103,11 +107,31 @@ void encode(const double* x, bool key, int* codes, double* scale) {
   if (scale) *scale = num / den;
 }
 
-struct Stats {
-  double se = 0, sr = 0;
-};
+// FP64 attention of one query row (rotated, FP16 as the kernel) over keys 0..p of KV head g of the dequantized cache,
+// sink logit in the denominator, bias(distance) added; the output back in model space (D H o / sqrt(128)).
+template <class Bias>
+std::vector<double> attend(const Deq& q, const double* qr, int g, int p, double sink, Bias&& bias) {
+  std::vector<double> s(p + 1), o(D, 0.0);
+  double mx = sink;
+  for (int j = 0; j <= p; ++j) {
+    double d = 0;
+    for (int e = 0; e < D; ++e) d += qr[e] * q.k[(size_t(j) * HKV + g) * D + e];
+    s[j] = d / 128.0 / std::sqrt(128.0) + bias(p - j);
+    mx = std::max(mx, s[j]);
+  }
+  double den = std::exp(sink - mx);
+  for (int j = 0; j <= p; ++j) {
+    const double e = std::exp(s[j] - mx);
+    den += e;
+    for (int d = 0; d < D; ++d) o[d] += e * q.v[(size_t(j) * HKV + g) * D + d];
+  }
+  for (auto& x : o) x /= den;
+  fwht(o);
+  for (int d = 0; d < D; ++d) o[d] *= kvf::sign_of(d) / std::sqrt(128.0);
+  return o;
+}
 
-bool run(Rng& rng, int M, int p0, Stats& st) {
+bool run(Rng& rng, int M, int p0) {
   // ---- inputs (as test_attn.cpp)
   std::vector<float> proj(size_t(M) * R);
   for (int m = 0; m < M; ++m)
@@ -143,7 +167,7 @@ bool run(Rng& rng, int M, int p0, Stats& st) {
   DeviceArray<__nv_bfloat16> drk(to_bf16(rk)), drv(to_bf16(rv));
   DeviceArray<uint8_t> dk(attn::cache_bytes(attn::KvFormat::int4, CAP, false)),
       dv(attn::cache_bytes(attn::KvFormat::int4, CAP, true));
-  attn::pack_rows(attn::KvFormat::int4, drk.get(), drv.get(), CAP, 0, dk.get(), dv.get(), g_stream);
+  attn::pack_rows(drk.get(), drv.get(), CAP, 0, dk.get(), dv.get(), g_stream);
   INGINE_TEST_CUDA(cudaStreamSynchronize(g_stream));
 
   DeviceArray<float> dproj(proj), dqs(q_scale), drs(r_scale), drp(rel_proj), dkc(kconv), dvc(vconv), dck(ck0), dcv(cv0);
@@ -163,7 +187,7 @@ bool run(Rng& rng, int M, int p0, Stats& st) {
   const Deq q = dequant(kb, vb, CAP);
 
   // ---- oracle: q (rotated, FP16 as the kernel) and rel
-  std::vector<double> qr(size_t(M) * HQ * D), rl(size_t(M) * HQ * EXT), qplain(size_t(M) * HQ * D);
+  std::vector<double> qr(size_t(M) * HQ * D), rl(size_t(M) * HQ * EXT);
   for (int m = 0; m < M; ++m) {
     const int p = p0 + m;
     const double tau = 1.0 + 0.1 * std::log(std::max((p + 1) / 8192.0, 1.0));
@@ -176,10 +200,7 @@ bool run(Rng& rng, int M, int p0, Stats& st) {
     for (auto& v : rm) v = rbf(rbf(v) * tau);
     for (int h = 0; h < HQ; ++h) {
       const std::vector<double> y = rot(&qm[size_t(h) * D]);
-      for (int d = 0; d < D; ++d) {
-        qr[(size_t(m) * HQ + h) * D + d] = f16(y[d]);
-        qplain[(size_t(m) * HQ + h) * D + d] = qm[size_t(h) * D + d];
-      }
+      for (int d = 0; d < D; ++d) qr[(size_t(m) * HQ + h) * D + d] = f16(y[d]);
       for (int d = 0; d < EXT; ++d) {
         double s = 0;
         for (int j = 0; j < DREL; ++j) s += rm[h * DREL + j] * rbf(rel_proj[size_t(j) * EXT + d]);
@@ -239,61 +260,20 @@ bool run(Rng& rng, int M, int p0, Stats& st) {
               rows_ok ? "PASS" : "FAIL", p0, M, kdiff, ncodes, vdiff, kbig, sbad);
 
   // ---- oracle attention over the dequantized cache (rows < p0 + M, as the kernel wrote them)
-  std::vector<double> exact(size_t(M) * HQ * D), spec(exact.size()), plain(exact.size());
-  for (int m = 0; m < M; ++m) {
-    const int p = p0 + m;
+  std::vector<double> exact(size_t(M) * HQ * D), spec(exact.size());
+  for (int m = 0; m < M; ++m)
     for (int h = 0; h < HQ; ++h) {
-      const int g = h / 3;
-      const double* qh = &qr[(size_t(m) * HQ + h) * D];
-      const double* qp = &qplain[(size_t(m) * HQ + h) * D];
-      const double sink = proj[size_t(m) * R + OFF_SINK + h];
-      std::vector<double> s(p + 1), sp(p + 1);
-      double mx = sink, mxp = sink;
-      for (int j = 0; j <= p; ++j) {
-        const size_t i = (size_t(j) * HKV + g) * D;
-        double d = 0, dp = 0;
-        for (int e = 0; e < D; ++e) d += qh[e] * q.k[i + e];
-        // unquantized reference: old rows from the packed BF16 rows, the call's rows from the oracle
-        for (int e = 0; e < D; ++e) dp += qp[e] * (j < p0 ? double(rk[i + e]) : nk[(size_t(j - p0) * HKV + g) * D + e]);
-        const double bias = p - j < EXT ? rl[(size_t(m) * HQ + h) * EXT + (p - j)] : 0.0;
-        s[j] = d / 128.0 / std::sqrt(128.0) + bias;
-        sp[j] = dp / std::sqrt(128.0) + bias;
-        mx = std::max(mx, s[j]), mxp = std::max(mxp, sp[j]);
-      }
-      double den = std::exp(sink - mx), denp = std::exp(sink - mxp);
-      std::vector<double> o(D, 0.0), op(D, 0.0);
-      for (int j = 0; j <= p; ++j) {
-        const size_t i = (size_t(j) * HKV + g) * D;
-        const double e = std::exp(s[j] - mx), ep = std::exp(sp[j] - mxp);
-        den += e, denp += ep;
-        for (int d = 0; d < D; ++d) {
-          o[d] += e * q.v[i + d];
-          op[d] += ep * (j < p0 ? double(rv[i + d]) : nv[(size_t(j - p0) * HKV + g) * D + d]);
-        }
-      }
-      // undo the value rotation: v = D H x / sqrt(128)
-      std::vector<double> y(D);
-      for (int d = 0; d < D; ++d) y[d] = o[d] / den;
-      for (int hh = 1; hh < D; hh <<= 1)
-        for (int i = 0; i < D; ++i)
-          if (!(i & hh)) {
-            const double a0 = y[i], b0 = y[i + hh];
-            y[i] = a0 + b0, y[i + hh] = a0 - b0;
-          }
+      const std::vector<double> o = attend(q, &qr[(size_t(m) * HQ + h) * D], h / 3, p0 + m, proj[size_t(m) * R + OFF_SINK + h],
+                                           [&](int d) { return d < EXT ? rl[(size_t(m) * HQ + h) * EXT + d] : 0.0; });
       for (int d = 0; d < D; ++d) {
         const size_t i = (size_t(m) * HQ + h) * D + d;
         const double gate = 1.0 / (1.0 + std::exp(-double(proj[size_t(m) * R + OFF_GATE + h * D + d])));
-        const double od = y[d] * kvf::sign_of(d) / std::sqrt(128.0);
-        exact[i] = od * gate;
-        spec[i] = rbf(rbf(od) * gate);
-        plain[i] = op[d] / denp * gate;
+        exact[i] = o[d] * gate, spec[i] = rbf(rbf(o[d]) * gate);
       }
     }
-  }
   const std::string n = "int4 p0=" + std::to_string(p0) + " M=" + std::to_string(M);
   const std::vector<float> got = bf16_download(out);
   bool ok = rows_ok && Check{(n + " out").c_str(), 1.0 / 128, 2e-3, 0.05}(got, exact, &spec);
-  for (size_t i = 0; i < got.size(); ++i) st.se += (got[i] - plain[i]) * (got[i] - plain[i]), st.sr += plain[i] * plain[i];
   std::vector<double> sk(want_ck.begin(), want_ck.end()), sv(want_cv.begin(), want_cv.end());
   ok &= Check{(n + " conv_k state").c_str(), 0, 0, 0}(dck.download(), sk);
   ok &= Check{(n + " conv_v state").c_str(), 0, 0, 0}(dcv.download(), sv);
@@ -351,11 +331,11 @@ bool run_prefill(Rng& rng, int pos0, int T) {
                      pj = randn_bf16(rng, size_t(T) * R, 1.0);
   DeviceArray<__nv_bfloat16> drk(to_bf16(rk)), drv(to_bf16(rv)), dq(to_bf16(qv)), drel(to_bf16(rel)), dpj(to_bf16(pj));
   DeviceArray<uint8_t> dk(attn::cache_bytes(attn::KvFormat::int4, L, false)), dv(attn::cache_bytes(attn::KvFormat::int4, L, true));
-  attn::pack_rows(attn::KvFormat::int4, drk.get(), drv.get(), L, 0, dk.get(), dv.get(), g_stream);
+  attn::pack_rows(drk.get(), drv.get(), L, 0, dk.get(), dv.get(), g_stream);
   DeviceArray<__nv_bfloat16> out(size_t(T) * HQ * D);
   attn::PrefillArgs a;
   a.q = dq.get(), a.rel = drel.get(), a.proj = dpj.get(), a.ld = R, a.T = T, a.pos0 = pos0;
-  a.k_cache = dk.get(), a.v_cache = dv.get(), a.kv = attn::KvFormat::int4, a.out = out.get();
+  a.k_cache = dk.get(), a.v_cache = dv.get(), a.out = out.get();
   attn::prefill_attend(a, g_stream);
   INGINE_TEST_CUDA(cudaStreamSynchronize(g_stream));
   const Deq q = dequant(dk.download(), dv.download(), L);
@@ -363,39 +343,16 @@ bool run_prefill(Rng& rng, int pos0, int T) {
   std::vector<double> exact(size_t(T) * HQ * D), spec(exact.size());
   for (int t = 0; t < T; ++t)
     for (int h = 0; h < HQ; ++h) {
-      const int g = h / 3, p = pos0 + t;
       std::vector<double> qd(D);
       for (int d = 0; d < D; ++d) qd[d] = qv[(size_t(t) * HQ + h) * D + d];
       std::vector<double> qr = rot(qd.data());
       for (auto& x : qr) x = f16(x);
-      const double sink = pj[size_t(t) * R + SINK + h];
-      std::vector<double> sc(p + 1);
-      double mx = sink;
-      for (int j = 0; j <= p; ++j) {
-        double d = 0;
-        for (int e = 0; e < D; ++e) d += qr[e] * q.k[(size_t(j) * HKV + g) * D + e];
-        sc[j] = d / 128.0 / std::sqrt(128.0) + (p - j < EXT ? double(rel[(size_t(t) * HQ + h) * EXT + (p - j)]) : 0.0);
-        mx = std::max(mx, sc[j]);
-      }
-      double den = std::exp(sink - mx);
-      std::vector<double> o(D, 0.0);
-      for (int j = 0; j <= p; ++j) {
-        const double e = std::exp(sc[j] - mx);
-        den += e;
-        for (int d = 0; d < D; ++d) o[d] += e * q.v[(size_t(j) * HKV + g) * D + d];
-      }
-      for (int d = 0; d < D; ++d) o[d] /= den;
-      for (int hh = 1; hh < D; hh <<= 1)
-        for (int i = 0; i < D; ++i)
-          if (!(i & hh)) {
-            const double a0 = o[i], b0 = o[i + hh];
-            o[i] = a0 + b0, o[i + hh] = a0 - b0;
-          }
+      const std::vector<double> o = attend(q, qr.data(), h / 3, pos0 + t, pj[size_t(t) * R + SINK + h],
+                                           [&](int d) { return d < EXT ? double(rel[(size_t(t) * HQ + h) * EXT + d]) : 0.0; });
       for (int d = 0; d < D; ++d) {
         const size_t i = (size_t(t) * HQ + h) * D + d;
         const double gate = 1.0 / (1.0 + std::exp(-double(pj[size_t(t) * R + GATE + h * D + d])));
-        const double od = o[d] * kvf::sign_of(d) / std::sqrt(128.0);
-        exact[i] = od * gate, spec[i] = rbf(rbf(od) * gate);
+        exact[i] = o[d] * gate, spec[i] = rbf(rbf(o[d]) * gate);
       }
     }
   const std::string n = "int4 prefill pos0=" + std::to_string(pos0) + " T=" + std::to_string(T);
@@ -409,14 +366,11 @@ int main() {
   INGINE_TEST_CUDA(cudaStreamCreateWithFlags(&g_stream, cudaStreamNonBlocking));
   Rng rng(4243);
   bool ok = true;
-  Stats st;
   for (int p0 : {0, 3000, 9005})
-    for (int M : {1, 2, 3, 8}) ok &= run(rng, M, p0, st);
-  for (int M = 1; M <= 8; ++M) ok &= run(rng, M, 4637, st);
+    for (int M : {1, 2, 3, 8}) ok &= run(rng, M, p0);
+  for (int M = 1; M <= 8; ++M) ok &= run(rng, M, 4637);
   ok &= run_prefill(rng, 0, 77);
   ok &= run_prefill(rng, 1500, 300);
-  std::printf("INFO int4 format error vs attention over the unquantized BF16 rows: relative RMS %.4f\n",
-              std::sqrt(st.se / st.sr));
   INGINE_TEST_CUDA(cudaStreamDestroy(g_stream));
   std::printf("%s\n", ok ? "ALL PASS" : "SOME FAILED");
   return ok ? 0 : 1;

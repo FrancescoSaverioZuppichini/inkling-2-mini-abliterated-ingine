@@ -14,6 +14,17 @@
 
 namespace ingine::model {
 
+// Format of the full-attention KV caches. bf16: [rows, 8, 128] BF16; fp8: the same in E4M3 without scale (half the
+// bytes); int4: 4.06 bits per value in 16-position blocks (rotated, lossy; native/KERNELS.md, area `attn`).
+enum class KvFormat : std::uint8_t { bf16, fp8, int4 };
+// "bf16" | "fp8" | "int4"; throws std::invalid_argument on anything else.
+inline KvFormat kv_format_of(const std::string& name) {
+  if (name == "bf16") return KvFormat::bf16;
+  if (name == "fp8") return KvFormat::fp8;
+  if (name == "int4") return KvFormat::int4;
+  throw std::invalid_argument("unknown KV cache format: " + name);
+}
+
 struct Sampling {
   float temperature = 1.0f;  // 0 => greedy
   float top_p = 1.0f;
@@ -89,9 +100,8 @@ struct RuntimeOptions {
   // Tokens per prefill chunk. 3072 (the largest the sliding attention takes) reads a long prompt 6-10% faster
   // than 2048 for 0.38 GB more scratch; results differ between chunk sizes only by rounding.
   int prefill_chunk = 3072;
-  bool dense_fp8 = true, kv_fp8 = false, spec = false;
-  // Full-attention cache format (kernels::attn::KvFormat: 0 bf16, 1 fp8, 2 int4); -1: kv_fp8 decides.
-  int kv_cache = -1;
+  bool dense_fp8 = true, spec = false;
+  KvFormat kv = KvFormat::bf16;
   // [Agent] Keep the BF16 embedding table (0.86 GiB) in pinned host memory that the GPU reads over PCIe. A step reads
   // only its 1-8 token rows (4.6 KB each), so it costs about a microsecond and frees the memory for context on 24 GB.
   bool embed_host = false;

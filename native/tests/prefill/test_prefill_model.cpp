@@ -72,7 +72,7 @@ int main(int argc, char** argv) {
   if (std::ifstream(abl)) opt.ablation = abl;
   opt.max_ctx = 8192;
   opt.dense_fp8 = true;
-  opt.kv_fp8 = kv_fp8;
+  opt.kv = kv_fp8 ? KvFormat::fp8 : KvFormat::bf16;
   Runtime rt(opt);
   const cudaStream_t s = rt.stream();
   Prefiller pre(rt.weights(), rt.ablation(), 2048, s);

@@ -153,7 +153,7 @@ int main() {
   w.message_queries = a.f32({LOOP_END - LOOP_START, 4, H}, 0.02f);
   w.dense_fp8 = true;
   const Ablation abl = load_ablation({});
-  State st = make_state(N, true);
+  State st = make_state(N, KvFormat::fp8);
   INGINE_TEST_CUDA(cudaDeviceSynchronize());
 
   Prefiller pre(w, abl, chunk, s);

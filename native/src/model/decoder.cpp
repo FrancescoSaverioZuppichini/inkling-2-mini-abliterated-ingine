@@ -186,8 +186,7 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
       a.v_conv = f32p(layer.v_static);
       a.k_cache = st.k_full_at(fi).data;
       a.v_cache = st.v_full_at(fi).data;
-      a.cache_fp8 = st.kv_fp8;
-      a.kv = attn::KvFormat(st.kv_format);
+      a.kv = st.kv;
       a.cache_rows = st.max_ctx;
       a.kpos = nullptr;
       a.window = 0;
@@ -198,7 +197,6 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
       a.v_conv = f32p(layer.v_conv);
       a.k_cache = st.k_ring_at(ri).data;
       a.v_cache = st.v_ring_at(ri).data;
-      a.cache_fp8 = false;
       a.cache_rows = WINDOW;
       a.kpos = st.ring_pos_at(ri);
       a.window = WINDOW;

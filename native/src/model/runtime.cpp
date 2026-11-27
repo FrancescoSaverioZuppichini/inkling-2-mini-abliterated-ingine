@@ -89,7 +89,7 @@ Runtime::Runtime(const RuntimeOptions& options, Weights weights, Ablation ablati
 
 void Runtime::init() {
   const RuntimeOptions& options = options_;
-  state_ = make_state(options.max_ctx, options.kv_fp8, options.kv_cache);
+  state_ = make_state(options.max_ctx, options.kv);
   decoder_ = std::make_unique<Decoder>(weights_, ablation_, state_, true);
   pos_ = DeviceBuffer(sizeof(std::int64_t));
   pos_.fill(0);
@@ -275,18 +275,17 @@ std::size_t Runtime::full_rows_bytes(int n) const {
   if (n < 0 || n > options_.max_ctx)
     throw std::invalid_argument("full_rows_bytes: n = " + std::to_string(n) + " outside [0, max_ctx = " +
                                 std::to_string(options_.max_ctx) + "]");
-  const auto f = kernels::attn::KvFormat(state_.kv_format);
-  return std::size_t(NUM_FULL_VISITS) * (kernels::attn::cache_bytes(f, n, false) + kernels::attn::cache_bytes(f, n, true));
+  return std::size_t(NUM_FULL_VISITS) *
+         (kernels::attn::cache_bytes(state_.kv, n, false) + kernels::attn::cache_bytes(state_.kv, n, true));
 }
 
 // one 2D copy per cache: NUM_FULL_VISITS rows of n positions, pitch max_ctx positions in the cache, packed in
 // the parked copy (k visits, then v visits)
 void Runtime::save_full_rows(void* dst, int n) {
   if (n == 0) return;
-  const auto f = kernels::attn::KvFormat(state_.kv_format);
   char* p = static_cast<char*>(dst);
   for (const Tensor* t : {&state_.k_full, &state_.v_full}) {
-    const std::size_t width = kernels::attn::cache_bytes(f, n, t == &state_.v_full), pitch = t->bytes() / NUM_FULL_VISITS;
+    const std::size_t width = kernels::attn::cache_bytes(state_.kv, n, t == &state_.v_full), pitch = t->bytes() / NUM_FULL_VISITS;
     CUDA_CHECK(cudaMemcpy2DAsync(p, width, t->data, pitch, width, NUM_FULL_VISITS, cudaMemcpyDefault, stream_));
     p += width * NUM_FULL_VISITS;
   }
@@ -294,10 +293,9 @@ void Runtime::save_full_rows(void* dst, int n) {
 
 void Runtime::restore_full_rows(const void* src, int n) {
   if (n == 0) return;
-  const auto f = kernels::attn::KvFormat(state_.kv_format);
   const char* p = static_cast<const char*>(src);
   for (const Tensor* t : {&state_.k_full, &state_.v_full}) {
-    const std::size_t width = kernels::attn::cache_bytes(f, n, t == &state_.v_full), pitch = t->bytes() / NUM_FULL_VISITS;
+    const std::size_t width = kernels::attn::cache_bytes(state_.kv, n, t == &state_.v_full), pitch = t->bytes() / NUM_FULL_VISITS;
     CUDA_CHECK(cudaMemcpy2DAsync(t->data, pitch, p, width, width, NUM_FULL_VISITS, cudaMemcpyDefault, stream_));
     p += width * NUM_FULL_VISITS;
   }

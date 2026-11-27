@@ -23,7 +23,7 @@ inline constexpr int BLK = 16, D = 128, HKV = 8;
 
 // ---- rotation: x -> H D x, D a fixed +-1 diagonal, H the unnormalised 128-point Walsh-Hadamard matrix (H H = 128 I).
 // [Agent] One fixed sign pattern for every visit and head (splitmix64 of a constant), so writer, reader and oracle
-// agree without a table in memory. S4-09 checks the pattern on real dumps (AXELRAM saw bad patterns hurt).
+// agree without a table in memory.
 KVF_HD constexpr std::uint64_t splitmix(std::uint64_t x) {
   x += 0x9E3779B97F4A7C15ull;
   x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
@@ -67,7 +67,6 @@ KVF_HD constexpr int code_of(float x) {  // x in units of the unit-RMS row
   if (t < 0.f && float(int(t)) == t) n += 1;  // t a negative integer: floor(t) = t
   return n < 0 ? 0 : n > 15 ? 15 : n;
 }
-KVF_HD constexpr float level_of(int n) { return (float(n) - 7.5f) * STEP; }
 }  // namespace int4
 
 }  // namespace ingine::kernels::attn::kvf

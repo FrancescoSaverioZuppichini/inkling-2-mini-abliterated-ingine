@@ -52,7 +52,7 @@ int main() {
   o.model_dir = dir;
   o.max_ctx = 8192;
   o.dense_fp8 = true;
-  o.kv_fp8 = true;
+  o.kv = ingine::model::KvFormat::fp8;
   const int tokens = 160;
   std::vector<std::int32_t> greedy_out, out;
   {

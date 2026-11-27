@@ -231,7 +231,7 @@ bool run(bool kv_fp8) {
   RuntimeOptions opt;
   opt.max_ctx = 2048;
   opt.spec = true;
-  opt.kv_fp8 = kv_fp8;
+  opt.kv = kv_fp8 ? KvFormat::fp8 : KvFormat::bf16;
   cudaStream_t s0;
   INGINE_TEST_CUDA(cudaStreamCreate(&s0));
   Weights w = synthetic_weights(s0);
@@ -546,7 +546,7 @@ bool run(bool kv_fp8) {
 bool run_generator() {
   RuntimeOptions opt;
   opt.max_ctx = 2048;
-  opt.kv_fp8 = true;
+  opt.kv = KvFormat::fp8;
   opt.prefill_chunk = 64;
   cudaStream_t s0;
   INGINE_TEST_CUDA(cudaStreamCreate(&s0));
@@ -727,7 +727,7 @@ bool run_ablation_layouts() {
   auto tokens = [&](const std::filesystem::path& ablation) {
     RuntimeOptions opt;
     opt.max_ctx = 2048;
-    opt.kv_fp8 = true;
+    opt.kv = KvFormat::fp8;
     opt.prefill_chunk = 64;
     cudaStream_t s0;
     INGINE_TEST_CUDA(cudaStreamCreate(&s0));

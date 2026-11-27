@@ -268,24 +268,24 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
     ap.q = q_, ap.rel = rel16_;
     pk::AttnParams at;
     at.q = q_, at.T = T, at.pos0 = pos0, at.rel = rel_, at.proj = proj_, at.ld = R, at.out = attn_out_;
-    const auto kvf = kernels::attn::KvFormat(st.kv_format);
-    const bool low_bit = layer.full && kernels::attn::low_bit(kvf);
+    const bool low_bit = layer.full && kernels::attn::low_bit(st.kv);
     if (low_bit) {
-      // [Agent] Low-bit caches: attn_prep writes the chunk's BF16 rows into the sliding-ring scratch (free during a
+      // [Agent] int4 caches: attn_prep writes the chunk's BF16 rows into the sliding-ring scratch (free during a
       // full visit) and pack_rows encodes them into the cache, so every key, the chunk's own included, is attended
       // from the cache exactly as decode will read it.
       ap.k_out = krows_, ap.v_out = vrows_, ap.out_fp8 = false;
       pk::attn_prep(ap, s);
-      kernels::attn::pack_rows(kvf, krows_, vrows_, T, pos0, st.k_full_at(FULL_INDEX[v]).data,
+      kernels::attn::pack_rows(krows_, vrows_, T, pos0, st.k_full_at(FULL_INDEX[v]).data,
                                st.v_full_at(FULL_INDEX[v]).data, s);
     } else if (layer.full) {
       const int fi = FULL_INDEX[v];
-      const std::size_t es = st.kv_fp8 ? 1 : 2, off = std::size_t(pos0) * KV_DIM * es;
+      const bool fp8 = st.kv == KvFormat::fp8;
+      const std::size_t off = std::size_t(pos0) * KV_DIM * (fp8 ? 1 : 2);
       void* kc = st.k_full_at(fi).data;
       void* vc = st.v_full_at(fi).data;
-      ap.k_out = static_cast<char*>(kc) + off, ap.v_out = static_cast<char*>(vc) + off, ap.out_fp8 = st.kv_fp8;
+      ap.k_out = static_cast<char*>(kc) + off, ap.v_out = static_cast<char*>(vc) + off, ap.out_fp8 = fp8;
       pk::attn_prep(ap, s);
-      at.k = kc, at.v = vc, at.kv_fp8 = st.kv_fp8, at.kpos = nullptr, at.bounds = nullptr, at.L = pos0 + T;
+      at.k = kc, at.v = vc, at.kv_fp8 = fp8, at.kpos = nullptr, at.bounds = nullptr, at.L = pos0 + T;
       at.window = 0;
     } else {
       const int ri = RING_INDEX[v];
@@ -306,15 +306,13 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
     pk::conv_state_update(st.conv_v_at(v), proj_ + SEG_BEGIN[SEG_V], R, T, KV_DIM, s);
     // [Agent] Full visits stay one launch: their bias covers only the last 1024 keys, and splitting them would leave
     // a half-empty wave per part.
-    if (low_bit) {
+    if (layer.full || !split_sliding_) {
       pk::rel_logits(rel16_, f32p(layer.rel_proj), T, rel_, s);
-      kernels::attn::PrefillArgs la;
-      la.q = q_, la.rel = rel_, la.proj = proj_, la.ld = R, la.T = T, la.pos0 = pos0, la.kv = kvf, la.out = attn_out_;
-      la.k_cache = st.k_full_at(FULL_INDEX[v]).data, la.v_cache = st.v_full_at(FULL_INDEX[v]).data;
-      kernels::attn::prefill_attend(la, s);
-    } else if (layer.full || !split_sliding_) {
-      pk::rel_logits(rel16_, f32p(layer.rel_proj), T, rel_, s);
-      pk::attention(at, s);
+      if (low_bit)
+        kernels::attn::prefill_attend({q_, rel_, proj_, R, T, pos0, st.k_full_at(FULL_INDEX[v]).data,
+                                       st.v_full_at(FULL_INDEX[v]).data, attn_out_}, s);
+      else
+        pk::attention(at, s);
     } else {
       for (int t0 = 0; t0 < T; t0 += kSlideRows) {
         const int n = std::min(kSlideRows, T - t0);

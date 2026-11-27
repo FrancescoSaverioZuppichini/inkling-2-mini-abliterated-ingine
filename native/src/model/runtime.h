@@ -42,7 +42,7 @@ Weights load_weights(const std::filesystem::path& model_dir, bool dense_fp8, boo
 Layer load_layer(const std::filesystem::path& model_dir, int l, bool dense_fp8, cudaStream_t stream,
                  std::vector<DeviceBuffer>& storage);
 Ablation load_ablation(const std::filesystem::path& path);  // empty path: Ablation.none()
-State make_state(int max_ctx, bool kv_fp8, int kv_format = -1);  // kv_format -1: kv_fp8 decides
+State make_state(int max_ctx, KvFormat kv);
 Buffers make_buffers(int m);
 
 // model.State.reset: ring_pos = -1, conv states = 0, length = 0 (caches keep their contents).
