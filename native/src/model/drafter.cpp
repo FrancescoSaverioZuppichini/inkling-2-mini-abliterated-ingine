@@ -186,36 +186,27 @@ Drafter::~Drafter() {
 
 void Drafter::load(const std::filesystem::path& model_dir) {
   SafetensorsFile f(model_dir / "mtp.safetensors");
-  // Whole data region on the device, then the persistent (aligned, derived) tensors from it.
-  const std::uint64_t base = f.data_offset();
-  DeviceBuffer raw(f.file_size() - base);
-  {
-    std::vector<UploadRequest> reqs;
-    for (const SafetensorsTensor& t : f.tensors())
-      reqs.push_back(upload_request(f, t, static_cast<std::byte*>(raw.p) + (t.offset - base)));
-    DeviceUploader up(UploadOptions{std::size_t(16) << 20, 4, 4});
-    up.upload(reqs, stream_);
-  }
-  auto src = [&](const std::string& name, std::initializer_list<std::int64_t> shape) {
+  // [Agent] Every tensor is uploaded straight into its persistent buffer (or into the BF16 staging of an FP8
+  // conversion), never through a device copy of the whole file: that copy (606 MiB) was live next to the target's
+  // weights and KV at startup and set the server's peak once the steady state shrank below it.
+  DeviceUploader up(UploadOptions{std::size_t(16) << 20, 4, 4});
+  auto request = [&](const std::string& name, const std::vector<std::int64_t>& shape, void* dst) {
     const SafetensorsTensor& t = f.at(name);
-    if (t.dtype != "BF16") throw std::runtime_error("mtp.safetensors: " + name + " is not BF16");
-    if (!std::equal(t.shape.begin(), t.shape.end(), shape.begin(), shape.end()))
-      throw std::runtime_error("mtp.safetensors: unexpected shape of " + name);
-    return static_cast<const std::byte*>(raw.p) + (t.offset - base);
+    if (t.dtype != "BF16" || t.shape != shape) throw std::runtime_error("mtp.safetensors: unexpected " + name);
+    return upload_request(f, t, dst);
   };
-  // Copies tensors (concatenated along rows) into one new aligned device buffer.
+  // Uploads tensors (concatenated along rows) into one new aligned device buffer.
   auto persist = [&](std::initializer_list<std::pair<std::string, std::vector<std::int64_t>>> parts) {
     std::size_t bytes = 0;
     for (const auto& [name, shape] : parts) bytes += f.at(name).bytes;
     auto* dst = static_cast<std::byte*>(alloc(bytes));
+    std::vector<UploadRequest> reqs;
     std::size_t off = 0;
     for (const auto& [name, shape] : parts) {
-      const SafetensorsTensor& t = f.at(name);
-      if (t.dtype != "BF16" || t.shape != shape) throw std::runtime_error("mtp.safetensors: unexpected " + name);
-      CUDA_CHECK(cudaMemcpyAsync(dst + off, static_cast<const std::byte*>(raw.p) + (t.offset - base), t.bytes,
-                                 cudaMemcpyDeviceToDevice, stream_));
-      off += t.bytes;
+      reqs.push_back(request(name, shape, dst + off));
+      off += f.at(name).bytes;
     }
+    up.upload(reqs, stream_);
     return reinterpret_cast<__nv_bfloat16*>(dst);
   };
   const std::int64_t h = H;
@@ -246,12 +237,12 @@ void Drafter::load(const std::filesystem::path& model_dir) {
   DeviceBuffer cat(std::size_t(2) * I * h * 2);
   auto fp8 = [&](std::initializer_list<std::pair<std::string, std::int64_t>> parts, std::int64_t K = H) {
     std::int64_t rows = 0;
+    std::vector<UploadRequest> reqs;
     for (const auto& [name, r] : parts) {
-      const std::byte* s = src(name, {r, K});
-      CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(cat.p) + rows * K * 2, s, std::size_t(r * K * 2),
-                                 cudaMemcpyDeviceToDevice, stream_));
+      reqs.push_back(request(name, {r, K}, static_cast<std::byte*>(cat.p) + rows * K * 2));
       rows += r;
     }
+    up.upload(reqs, stream_);  // queued after the previous conversion's read of cat
     void* q = alloc(std::size_t(rows * K));
     auto* scale = static_cast<float*>(alloc(std::size_t(rows) * 4));
     kdense::fp8_rows(static_cast<const __nv_bfloat16*>(cat.p), int(rows), int(K), q, scale, stream_);
@@ -310,7 +301,7 @@ void Drafter::load(const std::filesystem::path& model_dir) {
   const __nv_bfloat16* hw = persist({{mh + "hidden_out.weight", {h, kd::RANK}}});
   const __nv_bfloat16* hb = persist({{mh + "hidden_out.bias", {h}}});
   kd::fold_head(w_.unembed.w.data, head_.scale, V_, hw, hb, fold_w_, fold_b_, stream_);
-  CUDA_CHECK(cudaStreamSynchronize(stream_));  // raw and cat are freed on return
+  CUDA_CHECK(cudaStreamSynchronize(stream_));  // cat is freed on return
 }
 
 void Drafter::reset() {
