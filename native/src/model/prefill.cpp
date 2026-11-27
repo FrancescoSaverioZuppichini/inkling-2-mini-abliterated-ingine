@@ -65,8 +65,8 @@ Prefiller::Prefiller(const Weights& w, const Ablation& abl, int max_chunk, cudaS
   B0_ = f32(C * H), B1_ = f32(C * H);
   for (int p = 0; p < PASSES; ++p) B2_[p] = f32(C * H), E_[p] = f32(C * H);
   hid_ = f32(C * H), part_ = f32(C * H), y_ = f32(C * H), y2_ = f32(C * H);
-  xin_ = bf16(3 * C * H), xm_ = bf16(C * H), xf_ = bf16(C * H);
-  mixf_ = f32(3 * C * H), msgs_ = f32(4 * C * H), mixm_ = f32(C * H);
+  xin_ = bf16(3 * C * H), xf_ = bf16(C * H);
+  mixf_ = f32(3 * C * H), msgs_ = f32(4 * C * H);
   proj_ = bf16(C * PROJ_ROWS_FULL);
   q_ = bf16(C * HEADS * HEAD_DIM), rel16_ = bf16(C * HEADS * D_REL), rel_ = bf16(C * HEADS * REL_EXTENT);
   // [Agent] idle() ends here: the gathered sliding rows past ring + chunk are read (masked) without being written in
@@ -75,22 +75,33 @@ Prefiller::Prefiller(const Weights& w, const Ablation& abl, int max_chunk, cudaS
   krows_ = bf16(std::size_t(kpos_rows_) * KV_DIM), vrows_ = bf16(std::size_t(kpos_rows_) * KV_DIM);
   kpos_ = i32(kpos_rows_);
   bounds_ = static_cast<int4*>(alloc(std::size_t(kpos_rows_ / pk::kAttnKeyTile) * sizeof(int4)));
-  attn_out_ = bf16(C * HEADS * HEAD_DIM), wo_out_ = bf16(C * H);
   g16_ = bf16(C * GATE_RANK);
-  // message-gate scratch lives in buffers dead while the gates run: gin_ in rel_ (written by rel_logits after
-  // the attention-side gates, dead before the MLP-side gate), fpre_/gpre_ in down_ (written by the experts after
-  // both gates)
-  static_assert(3 * 2 * HIDDEN * 2 <= HEADS * REL_EXTENT * 2 && 2 * HIDDEN * 4 <= TOP_K * HIDDEN * 2);
   router_logits_ = f32(C * EXPERTS), wts_ = f32(C * TOP_K);
   idx_ = i32(C * TOP_K);
   counts_ = i32(EXPERTS), tiles_n_ = i32(1), pair_token_ = i32(C * TOP_K), pair_dst_ = i32(C * TOP_K);
   tiles_ = static_cast<int4*>(alloc(std::size_t(pk::moe_tiles_capacity(max_chunk)) * sizeof(int4)));
-  act_ = bf16(C * TOP_K * INTER), down_ = bf16(C * TOP_K * H), moe_sum_ = bf16(C * H);
-  gin_ = rel_;
-  fpre_ = reinterpret_cast<float*>(down_), gpre_ = fpre_ + C * H;
-  wscratch_ = w.dense != DenseFormat::bf16
-                  ? bf16(std::max(std::size_t(PROJ_ROWS_FULL) * H, std::size_t(H) * HEADS * HEAD_DIM))
-                  : nullptr;
+  act_ = bf16(C * TOP_K * INTER);
+  // [Agent] Buffers packed by lifetime. A visit runs: attention-side gates -> projections -> attention -> wo -> MLP mix
+  // -> MLP gate -> experts. Each buffer below lives inside one whose data is dead for its whole span:
+  //   mixf_ (attention-side gate inputs, read by those gates only) holds attn_out_ (attention -> wo), then mixm_ (MLP
+  //     mix -> MLP gate), xm_ (-> experts) and moe_sum_ (combine -> conv), side by side;
+  //   q_ (read last by attention) holds wo_out_ (wo -> conv);
+  //   rel_ holds gin_ (gate inputs, both gates), the bias (rel_logits -> attention), the dequantized weight rows of the
+  //     projections (before rel_logits) and of wo (after attention), and down_ (expert down -> combine);
+  //   act_ (expert gate/up -> down) holds fpre_/gpre_ while a gate runs.
+  // Kernels read and write the same values as with one buffer each: only addresses move (-167 MiB at chunk 2048 with
+  // a quantized dense format, -129 MiB with BF16).
+  static_assert(HEADS * HEAD_DIM * 2 <= HIDDEN * 4 && 2 * HIDDEN * 2 <= HIDDEN * 4 && HIDDEN <= HEADS * HEAD_DIM);
+  static_assert(3 * 2 * HIDDEN * 2 <= HEADS * REL_EXTENT * 2 && TOP_K * HIDDEN * 2 <= HEADS * REL_EXTENT * 2 &&
+                2 * HIDDEN * 4 <= TOP_K * INTER * 2);
+  attn_out_ = reinterpret_cast<__nv_bfloat16*>(mixf_ + 2 * C * H);
+  mixm_ = mixf_;
+  xm_ = reinterpret_cast<__nv_bfloat16*>(mixf_ + C * H), moe_sum_ = xm_ + C * H;
+  wo_out_ = q_;
+  gin_ = rel_, down_ = rel_;
+  fpre_ = reinterpret_cast<float*>(act_), gpre_ = fpre_ + C * H;
+  const std::size_t wrows = std::max(std::size_t(PROJ_ROWS_FULL) * H, std::size_t(H) * HEADS * HEAD_DIM);
+  wscratch_ = w.dense == DenseFormat::bf16 ? nullptr : wrows <= C * HEADS * REL_EXTENT ? rel_ : bf16(wrows);
   ids_ = static_cast<std::int64_t*>(alloc(C * 8));
   CUDA_CHECK(cudaMemset(B0_, 0, heap_.used()));  // e.g. gathered sliding rows past ring + chunk: never keys, kept finite
 
