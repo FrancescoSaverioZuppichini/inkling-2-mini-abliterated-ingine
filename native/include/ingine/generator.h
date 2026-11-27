@@ -118,7 +118,7 @@ struct RuntimeOptions {
   int prefill_chunk = 3072;
   bool spec = false;
   DenseFormat dense = DenseFormat::bf16;
-  KvFormat kv = KvFormat::bf16;
+  KvFormat kv = KvFormat::int8;
   // [Agent] Keep the BF16 embedding table (0.86 GiB) in pinned host memory that the GPU reads over PCIe. A step reads
   // only its 1-8 token rows (4.6 KB each), so it costs about a microsecond and frees the memory for context on 24 GB.
   bool embed_host = false;

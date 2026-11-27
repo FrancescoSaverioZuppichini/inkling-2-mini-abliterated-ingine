@@ -70,7 +70,7 @@ int main(int argc, char** argv) {
   bool engine = false, fake = false, dense_fp8 = false, kv_fp8 = false, spec = false, no_vision = false;
   bool embed_host = false;
   std::string dense = "bf16";
-  std::string kv_cache = "bf16";
+  std::string kv_cache = "int8";
   int image_max_tokens = 4096, max_images = 16, max_image_tokens = 32768;
   double spec_threshold = 0.8, fake_delay = 0.02;
   // sampling defaults; negative: from generation_config.json
@@ -96,7 +96,7 @@ int main(int argc, char** argv) {
   ap.flag("--spec", "DSpark speculative decoding (mtp.safetensors drafter)", &spec);
   ap.flag("--kv-fp8", "same as --kv-cache fp8", &kv_fp8);
   ap.option("--kv-cache", "{bf16,fp8,int8,k8v4,int4,fp4}",
-            "full-attention KV caches: bf16 (default), fp8 (half the memory), int8 (8.13 bits, rotated), k8v4 (6.06 "
+            "full-attention KV caches: int8 (default; 8.13 bits, rotated), bf16 (exact), fp8 (8 bits; the 5090's hardware path), k8v4 (6.06 "
             "bits: int8 keys, 4-bit values), int4 (4.06 bits, lossy: 500K positions on 24 GB), fp4 (4.5 bits, lossy)",
             &kv_cache, {"bf16", "fp8", "int8", "k8v4", "int4", "fp4"});
   ap.exclusive({"--kv-fp8", "--kv-cache"}, false);
