@@ -39,9 +39,9 @@ KVF_HD constexpr std::uint64_t splitmix(std::uint64_t x) {
 inline constexpr std::uint64_t SIGN_LO = splitmix(0x5348'4144'4b56'0001ull), SIGN_HI = splitmix(0x5348'4144'4b56'0002ull);
 KVF_HD constexpr float sign_of(int d) { return ((d < 64 ? SIGN_LO : SIGN_HI) >> (d & 63)) & 1 ? -1.f : 1.f; }
 
-// ---- bit-exact scalar helpers (S4-13). [Agent] Every rounding step of the int8 and fp4 codes is one IEEE operation
+// ---- bit-exact scalar helpers. [Agent] Every rounding step of the int8 and fp4 codes is one IEEE operation
 // or integer bit work, never an a * b + c the compiler could contract, so the GPU encoder writes the bytes the host
-// oracle writes (f2h equals cvt.rn.f16.f32 on all 2^32 inputs, S4-13 hold 1).
+// oracle writes (f2h equals cvt.rn.f16.f32 on all 2^32 inputs).
 KVF_HD std::uint32_t f2u(float x) {
 #if defined(__CUDA_ARCH__)
   return __float_as_uint(x);

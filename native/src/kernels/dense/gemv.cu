@@ -68,14 +68,13 @@ constexpr int F_BF16 = 0, F_FP8 = 1, F_INT8 = 2;
 // subnormals (the sm_86 E4M3 decode in fp8x.cuh relies on the same). 2.5 instructions per pair against 5 for E4M3
 // on sm_86; the 2^6 moves into the row scale, a power of two, so every product and sum keeps its bits.
 constexpr float INT8_UNIT = 64.f;
-__device__ __forceinline__ uint32_t i8_pair_bf16x2(uint32_t b) {
+// elements 0, 1 (lo) and 2, 3 (hi) of an INT8 word as BF16x2, value q * 2^-6
+__device__ __forceinline__ uint32_t i8_lo_bf16x2(uint32_t b) {
   uint32_t r;
   asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(r) : "r"(b & 0x807f807fu), "r"(0x7f007f00u), "r"(0x80008000u));
   return r;
 }
-// elements 0, 1 (lo) and 2, 3 (hi) of an INT8 word as BF16x2, value q * 2^-6
-__device__ __forceinline__ uint32_t i8_lo_bf16x2(uint32_t w) { return i8_pair_bf16x2(w); }
-__device__ __forceinline__ uint32_t i8_hi_bf16x2(uint32_t w) { return i8_pair_bf16x2(__funnelshift_l(w, w, 8)); }
+__device__ __forceinline__ uint32_t i8_hi_bf16x2(uint32_t w) { return i8_lo_bf16x2(__funnelshift_l(w, w, 8)); }
 
 __device__ __forceinline__ void unpack_i8x16(const uint4& v, float* f) {
   const uint32_t ws[4] = {v.x, v.y, v.z, v.w};
@@ -397,9 +396,8 @@ __global__ void GEMV_MMA_BOUNDS(32 * SPLITK) gemv_mma_kernel(const uint8_t* __re
 // ---- launch helpers -----------------------------------------------------------------------------------
 
 // [Agent] INT8 rows at M = 1 decode on CUDA cores at ~4.3 instructions per weight. That hides behind the DRAM stream
-// only where the GPU issues enough warp instructions per byte DRAM delivers (4 schedulers x SMs x clock / bandwidth):
-// RTX 4090 1.28, where the CUDA-core kernel wins (proj 22.5 vs 23.6 us per call); RTX 3090 0.59, where the tensor-core
-// kernel (~1.4 instructions per weight) wins (proj 28.2 -> 26.1 us, decode +0.5..+0.7 %). Real weights, E1 on both.
+// only where the GPU issues at least one warp instruction per byte DRAM delivers (4 schedulers x SMs x clock /
+// bandwidth: ~1.3 on an RTX 4090, ~0.6 on an RTX 3090); below that the tensor-core kernel (~1.4 per weight) wins.
 bool int8_m1_tensor_cores() {
   static const bool tc = [] {
     int dev = 0, sms = 0, clk_khz = 0, mem_khz = 0, bus_bits = 0;

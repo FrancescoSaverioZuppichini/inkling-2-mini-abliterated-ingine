@@ -7,8 +7,7 @@ namespace {
 
 // [Agent] A CTA owns one KV head and 128 query rows (token, head of the GQA group), each warp 16 of them (two 8-row
 // tiles, accumulators for all 128 dims); all 8 warps walk the same key blocks, staged with cp.async 4 blocks at a time.
-// The per-warp version issued 2.5x the FP8 kernel's instructions for the same MMAs and left the tensor pipe idle half
-// the time (S5-06 E1), so:
+// Decoding per warp would issue ~2.5x the FP8 kernel's instructions for the same MMAs, so:
 // * each staged block is decoded once per CTA, not once per warp: warp w turns block w / 2's keys (even w) or values
 //   (odd w) into the FP16 MMA fragments every warp needs, one 16-byte fragment per lane (conflict-free shared loads
 //   and stores); the next stage is decoded between this stage's score MMAs and its softmax, so that ALU work overlaps

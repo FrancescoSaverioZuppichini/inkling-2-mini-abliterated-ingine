@@ -121,7 +121,8 @@ struct GenerateStats { int prompt_tokens = 0, reused_tokens = 0, generated_token
 struct RuntimeOptions {
   std::filesystem::path model_dir, ablation;      // empty ablation: original model
   int max_ctx = 65536; int prefill_chunk = 2048;
-  bool dense_fp8 = true, spec = false; float spec_threshold = 0.8f;
+  bool spec = false; float spec_threshold = 0.8f;
+  DenseFormat dense = DenseFormat::bf16;          // dense weights: bf16 | fp8 | int8 (--dense; --dense-fp8 = fp8); was bool dense_fp8 = true
   KvFormat kv = KvFormat::bf16;                   // full-attention caches: bf16 | fp8 | int8 | k8v4 | int4 | fp4 (--kv-cache, --kv-fp8 = fp8)
 };
 class Generator {

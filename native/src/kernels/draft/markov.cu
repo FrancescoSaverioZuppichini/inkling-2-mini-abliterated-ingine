@@ -3,6 +3,7 @@
 // the draft outputs. PDL launches (see block.cu).
 #include "kernels/draft/draft.h"
 #include "kernels/draft/draft_device.cuh"
+#include "kernels/dense/int8_rows.cuh"
 
 #include <stdexcept>
 
@@ -333,16 +334,6 @@ __global__ void __launch_bounds__(256) markov_step_kernel(int i, const __nv_bflo
     state[size_t(i + 1) * RANK + j] = __float2bfloat16_rn(__fadd_rn(gs, oc));
     latent[j] = __float2bfloat16_rn(tanhf(raw[2]));
   }
-}
-
-// [Agent] One 4-byte word of dense int8_rows as 4 floats: sign-magnitude codes stored as bytes
-// [m0 | s2, m3 | s0, m1 | s3, m2 | s1] (m = |q|, s = sign << 7; kernels/dense/dense.h).
-__device__ __forceinline__ void int8_word(uint32_t w, float* f) {
-  auto q = [w](int mb, int sb) {
-    const float m = float((w >> (8 * mb)) & 0x7fu);
-    return (w >> (8 * sb + 7)) & 1u ? -m : m;
-  };
-  f[0] = q(0, 1), f[1] = q(2, 3), f[2] = q(3, 0), f[3] = q(1, 2);
 }
 
 // warp per candidate; I8: fold_w holds INT8 rows with row scales fold_s
