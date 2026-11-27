@@ -145,7 +145,7 @@ authentication**: keep the server on loopback. Requests run one at a time; up to
 further ones get HTTP 503. `GET /health` and `GET /v1/models` report the state.
 
 A follow-up request only reads what is new in its conversation. Conversations that take turns (subagents, a
-second client) are kept warm in pinned host RAM, by default a quarter of system RAM, at most 32 GiB
+second client) are kept warm in pinned host RAM, by default room for two conversations at `--max-ctx` and at least a quarter of system RAM (at most 32 GiB, never over half)
 (`--park-host-mb N` sets it in MiB, `0` turns it off); the least recently used is dropped when it is full.
 
 `POST /v1/chat/completions` takes:

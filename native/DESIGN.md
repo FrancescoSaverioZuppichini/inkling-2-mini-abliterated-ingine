@@ -251,7 +251,7 @@ max_ctx 262144) is restored and only the rest is prefilled. That is the agent-lo
 re-renders the previous answer (canonical tool-call JSON, retokenised text), which differs from the generated
 tokens right after the previous prompt. A conversation displaced by another one is parked: its checkpoint and
 its full-attention rows [0, n) are copied into pinned host memory (one arena of `RuntimeOptions::park_host_mb`,
-default a quarter of system RAM, at most 32 GiB; first fit, least recently used evicted; about 18 KB per token at
+default room for two conversations at max_ctx, at least a quarter of RAM up to 32 GiB, never over half; an explicit size that cannot be pinned fails start-up; first fit, least recently used evicted; about 18 KB per token at
 FP8 + 220 MB) and copied back when a later prompt starts with its prompt. Otherwise the state is reset. The server logs the path
 per request (`<id>: reuse=extend|checkpoint|parked|none reused=N prefilled=M prefill=<seconds>`).
 
