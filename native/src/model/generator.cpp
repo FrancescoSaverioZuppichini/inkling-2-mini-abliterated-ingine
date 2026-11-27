@@ -395,7 +395,6 @@ class EngineGenerator final : public Generator {
     std::size_t off = 0, bytes = 0;
     std::uint64_t used = 0;
   };
-  static constexpr std::size_t kNoGap = SIZE_MAX;
   static constexpr std::size_t kMinParked = 256;  // shorter prompts are cheaper to prefill than to keep
 
   // the layout of a parked copy of n tokens: {offset, bytes} of each drafter region, logits, full rows
@@ -424,8 +423,8 @@ class EngineGenerator final : public Generator {
     return "one conversation of up to " + thousands(long(size > base ? (size - base) / per_token : 0)) + " tokens";
   }
 
-  // the lowest arena offset with `bytes` free between the parked copies, or kNoGap
-  std::size_t park_gap(std::size_t bytes) const {
+  // the lowest arena offset with `bytes` free between the parked copies, if any
+  std::optional<std::size_t> park_gap(std::size_t bytes) const {
     std::vector<std::pair<std::size_t, std::size_t>> taken;
     for (const Parked& p : parked_) taken.emplace_back(p.off, p.bytes);
     std::sort(taken.begin(), taken.end());
@@ -434,7 +433,8 @@ class EngineGenerator final : public Generator {
       if (off - at >= bytes) return at;
       at = off + len;
     }
-    return park_arena_->size() - at >= bytes ? at : kNoGap;
+    if (park_arena_->size() - at >= bytes) return at;
+    return std::nullopt;
   }
 
   // the parked conversation whose prompt is the longest prefix of `ids`, if longer than `live` (and kMinParked)
@@ -465,8 +465,8 @@ class EngineGenerator final : public Generator {
     });
     const ParkLayout l = park_layout(int(n));
     if (l.bytes > park_arena_->size()) return;  // larger than the whole arena: evicting the others would not help
-    std::size_t at = park_gap(l.bytes);
-    while (at == kNoGap) {  // least recently used first, adjacent or not: a fragmented arena can lose a few for one park
+    std::optional<std::size_t> at = park_gap(l.bytes);
+    while (!at) {  // least recently used first, adjacent or not: a fragmented arena can lose a few for one park
       auto lru = parked_.end();
       for (auto it = parked_.begin(); it != parked_.end(); ++it)
         if (!kept(*it) && (lru == parked_.end() || it->used < lru->used)) lru = it;
@@ -475,8 +475,8 @@ class EngineGenerator final : public Generator {
       at = park_gap(l.bytes);
     }
     Parked p;
-    p.off = at, p.bytes = l.bytes;
-    char* d = static_cast<char*>(park_arena_->data()) + at;
+    p.off = *at, p.bytes = l.bytes;
+    char* d = static_cast<char*>(park_arena_->data()) + *at;
     const char* c = checkpoint_;
     const cudaStream_t s = rt_.stream();
     CUDA_CHECK(cudaMemcpyAsync(d, c, checkpoint_drafter_, cudaMemcpyDefault, s));

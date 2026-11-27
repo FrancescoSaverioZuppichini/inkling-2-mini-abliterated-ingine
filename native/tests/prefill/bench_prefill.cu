@@ -172,10 +172,10 @@ int main(int argc, char** argv) {
       const float t = time_ms([&](int r) {
         const Layer& L = nv[r % 3];  // sliding layers: single-input projection
         kernels::dense::dequant_rows(L.wproj.w.data, static_cast<const float*>(L.wproj.scale.data), PROJ_ROWS_SLIDING, H,
-                                     reinterpret_cast<__nv_bfloat16*>(scratch), s);
+                                     reinterpret_cast<__nv_bfloat16*>(scratch), s, kernels::dense::Format::fp8);
         gemm.run(bf(x), H, bf(scratch), H, proj, PROJ_ROWS_SLIDING, false, T, PROJ_ROWS_SLIDING, H, s);
         kernels::dense::dequant_rows(L.wo.w.data, static_cast<const float*>(L.wo.scale.data), H, 3072,
-                                     reinterpret_cast<__nv_bfloat16*>(scratch), s);
+                                     reinterpret_cast<__nv_bfloat16*>(scratch), s, kernels::dense::Format::fp8);
         gemm.run(bf(attn), 3072, bf(scratch), 3072, wo_out, H, false, T, H, 3072, s);
       });
       const double flop = 2.0 * T * H * (PROJ_ROWS_SLIDING + 3072), bytes = double(H) * (PROJ_ROWS_SLIDING + 3072);

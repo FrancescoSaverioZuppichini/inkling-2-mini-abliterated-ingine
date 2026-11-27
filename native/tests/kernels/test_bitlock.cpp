@@ -86,7 +86,7 @@ struct DenseWeight {
     return c;
   }
   dense::Matrix matrix(bool f8) const {
-    return f8 ? dense::Matrix{fp8.get(), scale.get(), rows} : dense::Matrix{bf16.get(), nullptr, rows};
+    return f8 ? dense::Matrix{fp8.get(), scale.get(), rows, nullptr, dense::Format::fp8} : dense::Matrix{bf16.get(), nullptr, rows};
   }
 };
 
@@ -158,7 +158,7 @@ struct Int8Weight {
   DeviceArray<float> scale;
   Int8Weight(LockGen& g, int rows_, int K)
       : rows(rows_), q(g.bytes(size_t(rows_) * K)), scale(g.vec(size_t(rows_), 1e-4f, 4e-4f)) {}
-  dense::Matrix matrix() const { return dense::Matrix{q.get(), scale.get(), rows, nullptr, true}; }
+  dense::Matrix matrix() const { return dense::Matrix{q.get(), scale.get(), rows, nullptr, dense::Format::int8}; }
 };
 
 uint64_t lock_int8(LockGen& g, const Int8Weight& wproj, const Int8Weight& wo, int M) {

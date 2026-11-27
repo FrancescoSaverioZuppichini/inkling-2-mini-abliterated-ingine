@@ -167,7 +167,7 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
   // B rows of a Dense matrix as BF16: the matrix itself, or its FP8 / INT8 rows dequantized (weights.dequant)
   auto bf16_rows = [&](const Dense& d) -> const __nv_bfloat16* {
     if (!d.quantized()) return bf16p(d.w);
-    dense::dequant_rows(d.w.data, f32p(d.scale), d.rows(), d.cols(), wscratch_, s, d.int8());
+    dense::dequant_rows(d.w.data, f32p(d.scale), d.rows(), d.cols(), wscratch_, s, d.format());
     return wscratch_;
   };
   // message_gate for G gates: h_g, msg_g fp32 [T, H] -> out bf16 [G, T, H] = bf16(rms_norm(gated) * norm_w[g])
@@ -382,7 +382,7 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
                                  std::size_t(H) * 2, std::size_t(H) * 2, T, cudaMemcpyDeviceToDevice, s));
   // [Agent] INT8 rows: the decode head GEMV (q . x times the row scale); head_logits reads BF16 and FP8 rows.
   if (w.unembed.int8()) {
-    const dense::Matrix head{w.unembed.w.data, f32p(w.unembed.scale), UNPADDED_VOCAB, nullptr, true};
+    const dense::Matrix head{w.unembed.w.data, f32p(w.unembed.scale), UNPADDED_VOCAB, nullptr, dense::Format::int8};
     dense::head(xf_ + std::size_t(T - 1) * H, 1, head, logits, false, s);
   } else {
     pk::head_logits(xf_ + std::size_t(T - 1) * H, w.unembed.w.data, f32p(w.unembed.scale), UNPADDED_VOCAB, logits, s);

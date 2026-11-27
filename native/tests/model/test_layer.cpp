@@ -64,7 +64,7 @@ bool check_layer(const SafetensorsModel& m, int l, cudaStream_t stream) {
   // FP8 rows: dequantized wproj reproduces the BF16 checkpoint within E4M3 precision
   DeviceBuffer deq(std::size_t(R) * H * 2);
   kernels::dense::dequant_rows(layer.wproj.w.data, static_cast<const float*>(layer.wproj.scale.data), R, H,
-                               static_cast<__nv_bfloat16*>(deq.p), stream);
+                               static_cast<__nv_bfloat16*>(deq.p), stream, kernels::dense::Format::fp8);
   INGINE_TEST_CUDA(cudaStreamSynchronize(stream));
   const auto got = download<__nv_bfloat16>(deq.p, std::size_t(R) * H);
   const auto scale = download<float>(layer.wproj.scale.data, R);

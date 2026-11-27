@@ -452,12 +452,12 @@ void markov_logits(int i, const void* fold_w, const float* fold_s, const __nv_bf
                    const std::int32_t* cand_idx, const __nv_bfloat16* latent, const DraftParams* p,
                    float* cand_logits, unsigned long long* picks, cudaStream_t stream) {
   if (i < 0 || i >= GAMMA) throw std::invalid_argument("markov_logits: step out of range");
-  if (fold_s)
-    launch_pdl(markov_logits_kernel<true>, dim3(CANDIDATES * 32 / 256), dim3(256), stream, i, fold_w, fold_s, fold_b,
-               cand_val, cand_idx, latent, p, cand_logits, picks);
-  else
-    launch_pdl(markov_logits_kernel<false>, dim3(CANDIDATES * 32 / 256), dim3(256), stream, i, fold_w, fold_s, fold_b,
-               cand_val, cand_idx, latent, p, cand_logits, picks);
+  auto launch = [&](auto kernel) {
+    launch_pdl(kernel, dim3(CANDIDATES * 32 / 256), dim3(256), stream, i, fold_w, fold_s, fold_b, cand_val, cand_idx, latent,
+               p, cand_logits, picks);
+  };
+  if (fold_s) launch(markov_logits_kernel<true>);
+  else launch(markov_logits_kernel<false>);
 }
 
 void markov_finish(const std::int32_t* cand_idx, const float* cand_logits, const unsigned long long* picks,

@@ -57,7 +57,7 @@ Drafter::Drafter(const std::filesystem::path& model_dir, const Weights& w, int m
     : w_(w), stream_(stream), ctx_(std::min(max_ctx, DRAFT_CTX)) {
   if (max_ctx < 2 * BLOCK) throw std::invalid_argument("Drafter: max_ctx must hold two blocks");
   head_ = {w.unembed.w.data, static_cast<const float*>(w.unembed.scale.data),
-           w.unembed.rows(), nullptr, w.unembed.int8()};
+           w.unembed.rows(), nullptr, w.unembed.format()};
   V_ = w.unembed.rows();
   load(model_dir);
 
@@ -138,7 +138,7 @@ Drafter::Drafter(const std::filesystem::path& model_dir, const Weights& w, int m
     CUDA_CHECK(cudaMemcpyAsync(short_map_, list.data(), list.size() * 4, cudaMemcpyHostToDevice, stream_));
     w1_rows_ = bf16s(std::size_t(rows) * kd::RANK);
     put_w1_rows(list, 0);
-    short_head_ = kdense::Matrix{head_.w, head_.scale, rows, short_map_, head_.int8};
+    short_head_ = kdense::Matrix{head_.w, head_.scale, rows, short_map_, head_.format};
     seg_short_ = segments({short_K_});
     kd::fill(base_, std::size_t(GAMMA) * rows, -INFINITY, stream_);
   }
@@ -240,7 +240,7 @@ void Drafter::load(const std::filesystem::path& model_dir) {
     void* q = heap_.alloc(std::size_t(rows * K));
     auto* scale = static_cast<float*>(heap_.alloc(std::size_t(rows) * 4));
     kdense::fp8_rows(static_cast<const __nv_bfloat16*>(cat.p), int(rows), int(K), q, scale, stream_);
-    return kdense::Matrix{q, scale, int(rows)};
+    return kdense::Matrix{q, scale, int(rows), nullptr, kdense::Format::fp8};
   };
 
   // the three layers' context k/v projections: BF16 for large commits (cuBLASLt), and one FP8-row matrix of
@@ -250,7 +250,7 @@ void Drafter::load(const std::filesystem::path& model_dir) {
     const std::vector<std::int64_t> shape{kd::KV_DIM, h};
     // [Agent] With INT8 dense weights (the 500K profile) the 27 MiB BF16 copy is not kept: a large commit dequantizes
     // the layer's FP8 rows into the commit scratch first (9 MiB, ~13 us per 1024-row piece and layer).
-    if (!head_.int8) {
+    if (head_.format != kdense::Format::int8) {
       const __nv_bfloat16* all = persist({{kv(0, "k"), shape}, {kv(0, "v"), shape}, {kv(1, "k"), shape},
                                           {kv(1, "v"), shape}, {kv(2, "k"), shape}, {kv(2, "v"), shape}});
       for (int l = 0; l < 3; ++l) layers_[l].wkv_ctx = all + std::size_t(l) * 2 * kd::KV_DIM * H;
@@ -296,7 +296,7 @@ void Drafter::load(const std::filesystem::path& model_dir) {
   fold_b_ = static_cast<__nv_bfloat16*>(heap_.alloc(std::size_t(V_) * 2));
   const __nv_bfloat16* hw = persist({{mh + "hidden_out.weight", {h, kd::RANK}}});
   const __nv_bfloat16* hb = persist({{mh + "hidden_out.bias", {h}}});
-  if (!head_.int8) {
+  if (head_.format != kdense::Format::int8) {
     fold_w_ = heap_.alloc(std::size_t(V_) * kd::RANK * 2);
     kd::fold_head(w_.unembed.w.data, head_.scale, V_, hw, hb, static_cast<__nv_bfloat16*>(fold_w_), fold_b_, stream_);
   } else {
@@ -312,7 +312,7 @@ void Drafter::load(const std::filesystem::path& model_dir) {
     for (int r = 0; r < V_; r += UNEMBED_SLICE) {
       const int n = std::min(UNEMBED_SLICE, V_ - r);
       kdense::dequant_rows(static_cast<const std::int8_t*>(head_.w) + std::size_t(r) * H, head_.scale + r, n, H, u,
-                           stream_, true);
+                           stream_, kdense::Format::int8);
       kd::fold_head(u, nullptr, n, hw, hb, f16, fold_b_ + r, stream_);
       kdense::int8_rows(f16, n, kd::RANK, static_cast<std::uint8_t*>(fold_w_) + std::size_t(r) * kd::RANK, fold_s_ + r,
                         stream_);
@@ -466,7 +466,7 @@ constexpr std::size_t WKV_TMP_BYTES = std::size_t(2) * kd::KV_DIM * H * 2;  // o
 }
 
 std::size_t Drafter::commit_scratch_bytes() const {
-  return CTX_C_BYTES + CTX_KV_BYTES + kd::Bf16Gemm::kWorkspaceBytes + (head_.int8 ? WKV_TMP_BYTES : 0);
+  return CTX_C_BYTES + CTX_KV_BYTES + kd::Bf16Gemm::kWorkspaceBytes + (head_.format == kdense::Format::int8 ? WKV_TMP_BYTES : 0);
 }
 
 void Drafter::lend_commit_scratch(void* p) {
@@ -474,7 +474,7 @@ void Drafter::lend_commit_scratch(void* p) {
   ctx_c_ = reinterpret_cast<__nv_bfloat16*>(b);
   ctx_kv_ = reinterpret_cast<__nv_bfloat16*>(b + CTX_C_BYTES);
   gemm_ws_ = b + CTX_C_BYTES + CTX_KV_BYTES;
-  wkv_tmp_ = head_.int8 ? reinterpret_cast<__nv_bfloat16*>(b + CTX_C_BYTES + CTX_KV_BYTES + kd::Bf16Gemm::kWorkspaceBytes)
+  wkv_tmp_ = head_.format == kdense::Format::int8 ? reinterpret_cast<__nv_bfloat16*>(b + CTX_C_BYTES + CTX_KV_BYTES + kd::Bf16Gemm::kWorkspaceBytes)
                         : nullptr;
 }
 
@@ -486,7 +486,7 @@ void Drafter::run_commit(const __nv_bfloat16* feats, int n, int row0, bool last_
     if (!wkv) {  // INT8 dense: this layer's FP8 rows of wkv_all_ as BF16 (weights.dequant)
       const std::size_t r0 = std::size_t(l) * 2 * kd::KV_DIM;
       kdense::dequant_rows(static_cast<const std::uint8_t*>(wkv_all_.w) + r0 * H, wkv_all_.scale + r0, 2 * kd::KV_DIM, H,
-                           wkv_tmp_, stream_);
+                           wkv_tmp_, stream_, kdense::Format::fp8);
       wkv = wkv_tmp_;
     }
     gemm_.run(ctx_c_, n, wkv, 2 * kd::KV_DIM, H, ctx_kv_, gemm_ws_, stream_);

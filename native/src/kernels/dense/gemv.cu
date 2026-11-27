@@ -60,6 +60,7 @@ constexpr l2::Evict WEIGHT_L2 = l2::Evict::first;
 
 // Weight formats of a Matrix: BF16 rows, FP8 E4M3 rows + row scale, INT8 rows + row scale.
 constexpr int F_BF16 = 0, F_FP8 = 1, F_INT8 = 2;
+static_assert(int(Format::bf16) == F_BF16 && int(Format::fp8) == F_FP8 && int(Format::int8) == F_INT8);
 
 // [Agent] INT8 rows (layout in dense.h) are sign-magnitude codes placed so that one AND turns elements 0 and 1 of a
 // 4-byte word into two BF16 words with the sign at bit 15 and |q| in the low mantissa bits, and a byte rotation plus
@@ -413,14 +414,14 @@ bool int8_m1_tensor_cores() {
 
 // BLOCK: threads per block of the M = 1 kernel (0: M = 1 runs the tensor-core kernel too, for K whose
 // whole row per lane would not fit in registers); SPLITK: warps per 16-row block of the M >= 2 kernel;
-// UFP8: steps per load batch of its FP8 and INT8 instantiations; I8_TC: INT8 rows at M = 1 may run the tensor-core
+// UQ: steps per load batch of its FP8 and INT8 instantiations; I8_TC: INT8 rows at M = 1 may run the tensor-core
 // kernel (int8_m1_tensor_cores).
-template <int K, int BLOCK, int SPLITK, int UFP8, template <int> class Epi, bool GATHER = false, bool I8_TC = false,
+template <int K, int BLOCK, int SPLITK, int UQ, template <int> class Epi, bool GATHER = false, bool I8_TC = false,
           class Make>
 void launch_gemv(const Matrix& w, int M, bool pdl, cudaStream_t stream, Make make) {
-  const int fmt = w.scale == nullptr ? F_BF16 : w.int8 ? F_INT8 : F_FP8;
+  const int fmt = int(w.format);
   require(w.w != nullptr && w.rows > 0, "weight matrix is empty");
-  require(!w.int8 || w.scale != nullptr, "INT8 rows need their row scales");
+  require((w.format == Format::bf16) == (w.scale == nullptr), "FP8 and INT8 rows carry row scales, BF16 rows none");
   require(GATHER == (w.row_map != nullptr), "row_map: only proj reads mapped rows");
   const int* rm = w.row_map;
   const int rows = w.rows;
@@ -434,14 +435,14 @@ void launch_gemv(const Matrix& w, int M, bool pdl, cudaStream_t stream, Make mak
       constexpr int B = BLOCK > 0 ? BLOCK : 32;  // (the branch is discarded for BLOCK = 0)
       if (fmt == F_FP8) launch_ex(gemv_kernel<F_FP8, K, 16, B, E, GATHER>, dim3((rows * 16 + B - 1) / B), B, 0, 1, pdl, stream, wp, sc, rows, 0u, epi, rm);
       else if (fmt == F_INT8) {
-        if (I8_TC && int8_m1_tensor_cores()) launch_ex(gemv_mma_kernel<F_INT8, K, MM, SPLITK, UFP8, E, GATHER>, dim3((rows + 15) / 16), 32 * SPLITK, 0, 1, pdl, stream, wp, sc, rows, 0u, epi, rm);
+        if (I8_TC && int8_m1_tensor_cores()) launch_ex(gemv_mma_kernel<F_INT8, K, MM, SPLITK, UQ, E, GATHER>, dim3((rows + 15) / 16), 32 * SPLITK, 0, 1, pdl, stream, wp, sc, rows, 0u, epi, rm);
         else launch_ex(gemv_kernel<F_INT8, K, 16, B, E, GATHER>, dim3((rows * 16 + B - 1) / B), B, 0, 1, pdl, stream, wp, sc, rows, 0u, epi, rm);
       }
       else launch_ex(gemv_kernel<F_BF16, K, 32, B, E, GATHER>, dim3((rows * 32 + B - 1) / B), B, 0, 1, pdl, stream, wp, sc, rows, 0u, epi, rm);
     } else {
       const dim3 blocks((rows + 15) / 16);
-      if (fmt == F_FP8) launch_ex(gemv_mma_kernel<F_FP8, K, MM, SPLITK, UFP8, E, GATHER>, blocks, 32 * SPLITK, 0, 1, pdl, stream, wp, sc, rows, 0u, epi, rm);
-      else if (fmt == F_INT8) launch_ex(gemv_mma_kernel<F_INT8, K, MM, SPLITK, UFP8, E, GATHER>, blocks, 32 * SPLITK, 0, 1, pdl, stream, wp, sc, rows, 0u, epi, rm);
+      if (fmt == F_FP8) launch_ex(gemv_mma_kernel<F_FP8, K, MM, SPLITK, UQ, E, GATHER>, blocks, 32 * SPLITK, 0, 1, pdl, stream, wp, sc, rows, 0u, epi, rm);
+      else if (fmt == F_INT8) launch_ex(gemv_mma_kernel<F_INT8, K, MM, SPLITK, UQ, E, GATHER>, blocks, 32 * SPLITK, 0, 1, pdl, stream, wp, sc, rows, 0u, epi, rm);
       else launch_ex(gemv_mma_kernel<F_BF16, K, MM, SPLITK, MMA_U_BF16, E, GATHER>, blocks, 32 * SPLITK, 0, 1, pdl, stream, wp, sc, rows, 0u, epi, rm);
     }
   };
@@ -620,11 +621,10 @@ void int8_rows(const __nv_bfloat16* w, int rows, int K, void* q, float* scale, c
   CUDA_CHECK(cudaGetLastError());
 }
 
-void dequant_rows(const void* q, const float* scale, int rows, int K, __nv_bfloat16* out, cudaStream_t stream,
-                  bool int8) {
+void dequant_rows(const void* q, const float* scale, int rows, int K, __nv_bfloat16* out, cudaStream_t stream, Format f) {
   require(rows >= 0 && K > 0 && K % 16 == 0, "dequant_rows: K must be a multiple of 16");
   const long long total16 = (long long)rows * K / 16;
-  if (total16 > 0 && int8)
+  if (total16 > 0 && f == Format::int8)
     dequant_int8_rows_kernel<<<unsigned((total16 + 255) / 256), 256, 0, stream>>>(static_cast<const uint4*>(q), scale,
                                                                                     K, total16, out);
   else if (total16 > 0)

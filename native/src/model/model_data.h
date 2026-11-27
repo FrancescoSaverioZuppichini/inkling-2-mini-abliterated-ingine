@@ -11,6 +11,7 @@
 #include "core/host_memory.h"
 #include "core/tensor.h"
 #include "ingine/generator.h"
+#include "kernels/dense/dense.h"
 
 #include <array>
 #include <cstdint>
@@ -132,6 +133,9 @@ struct Dense {
   bool quantized() const { return scale.data != nullptr; }
   bool fp8() const { return w.dtype == DType::FP8_E4M3FN; }
   bool int8() const { return w.dtype == DType::I8; }
+  kernels::dense::Format format() const {
+    return !quantized() ? kernels::dense::Format::bf16 : int8() ? kernels::dense::Format::int8 : kernels::dense::Format::fp8;
+  }
   int rows() const { return w.ne[1]; }
   int cols() const { return w.ne[0]; }
 };

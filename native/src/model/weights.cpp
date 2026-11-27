@@ -149,7 +149,7 @@ std::array<ExpertFormat, LAYERS> expert_formats(const fs::path& model_dir) {
 }
 
 // Storage for the FP8 or INT8 rows + FP32 row scales of a [rows, cols] matrix, filled by quantize().
-Dense quantized_storage(Loader& ld, DenseFormat f, int rows, int cols) {
+Dense create_quantized(Loader& ld, DenseFormat f, int rows, int cols) {
   void* q = ld.heap.alloc(std::size_t(rows) * cols);
   void* s = ld.heap.alloc(std::size_t(rows) * 4);
   return Dense{rm(q, f == DenseFormat::int8 ? DType::I8 : DType::FP8_E4M3FN, {rows, cols}), rm(s, DType::FP32, {rows})};
@@ -162,12 +162,6 @@ void quantize(const Dense& d, int row, const void* bf16, int n, cudaStream_t str
   const auto* w = static_cast<const __nv_bfloat16*>(bf16);
   if (d.int8()) kernels::dense::int8_rows(w, n, d.cols(), q, s, stream);
   else kernels::dense::fp8_rows(w, n, d.cols(), q, s, stream);
-}
-
-Dense quantized(Loader& ld, DenseFormat f, const Tensor& bf16, int rows, int cols) {
-  Dense d = quantized_storage(ld, f, rows, cols);
-  quantize(d, 0, bf16.data, rows, ld.stream());
-  return d;
 }
 
 Dense row_view(const Dense& d, int begin, int end) {
@@ -317,8 +311,10 @@ Layer load_layer_into(Loader& ld, int l, ExpertFormat fmt, DenseFormat dense) {
 
   ld.flush();
   if (quant) {
-    layer.wproj = quantized(ld, dense, wproj_bf16, R, H);
-    layer.wo = quantized(ld, dense, wo_bf16, H, HEADS * HEAD_DIM);
+    layer.wproj = create_quantized(ld, dense, R, H);
+    quantize(layer.wproj, 0, wproj_bf16.data, R, ld.stream());
+    layer.wo = create_quantized(ld, dense, H, HEADS * HEAD_DIM);
+    quantize(layer.wo, 0, wo_bf16.data, H, ld.stream());
     CUDA_CHECK(cudaStreamSynchronize(ld.stream()));  // before the BF16 temporaries are freed
   } else {
     layer.wproj = Dense{wproj_bf16, {}};
@@ -381,7 +377,7 @@ Weights load_weights(const fs::path& model_dir, DenseFormat dense, bool embed_ho
       // [Agent] Quantized a slice at a time: the BF16 staging is 72 MiB instead of the whole 883 MiB head. Rows are
       // quantized independently, so the bytes are those of one call over all rows. The upload of the next slice
       // waits for the kernel queued on the stream before it, which still reads the staging.
-      w.unembed = quantized_storage(ld, dense, UNPADDED_VOCAB, H);
+      w.unembed = create_quantized(ld, dense, UNPADDED_VOCAB, H);
       DeviceBuffer tmp(std::size_t(UNEMBED_SLICE) * H * 2);
       for (int r = 0; r < UNPADDED_VOCAB; r += UNEMBED_SLICE) {
         const int n = std::min(UNEMBED_SLICE, UNPADDED_VOCAB - r);

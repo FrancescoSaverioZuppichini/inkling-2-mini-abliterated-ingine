@@ -41,7 +41,10 @@ struct Weights {
   std::vector<double> code;   // fp8: decoded E4M3 value; int8: q; bf16: the value
   std::optional<DeviceArray<uint8_t>> dev;
   std::optional<DeviceArray<float>> dev_scale;
-  dense::Matrix matrix() const { return {dev->get(), fmt != BF16 ? dev_scale->get() : nullptr, rows, nullptr, fmt == INT8}; }
+  dense::Matrix matrix() const {
+    return {dev->get(), fmt != BF16 ? dev_scale->get() : nullptr, rows, nullptr,
+            fmt == INT8 ? dense::Format::int8 : fmt == BF16 ? dense::Format::bf16 : dense::Format::fp8};
+  }
   double dot(int r, const float* x) const {
     double s = 0;
     const double* c = &code[size_t(r) * K];
@@ -477,7 +480,7 @@ bool test_fp8_rows(Rng& rng) {
   DeviceArray<float> s(rows);
   DeviceArray<__nv_bfloat16> back(size_t(rows) * K);
   dense::fp8_rows(dw.get(), rows, K, q.get(), s.get(), g_stream);
-  dense::dequant_rows(q.get(), s.get(), rows, K, back.get(), g_stream);
+  dense::dequant_rows(q.get(), s.get(), rows, K, back.get(), g_stream, dense::Format::fp8);
   sync();
   const auto gq = q.download();
   const auto gs = s.download();
@@ -521,7 +524,7 @@ bool test_int8_rows(Rng& rng) {
   DeviceArray<float> s(rows);
   DeviceArray<__nv_bfloat16> back(size_t(rows) * K);
   dense::int8_rows(dw.get(), rows, K, q.get(), s.get(), g_stream);
-  dense::dequant_rows(q.get(), s.get(), rows, K, back.get(), g_stream, true);
+  dense::dequant_rows(q.get(), s.get(), rows, K, back.get(), g_stream, dense::Format::int8);
   sync();
   const auto gq = q.download();
   const auto gs = s.download();

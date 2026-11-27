@@ -690,9 +690,9 @@ void test_shortlist_head(Rng& r) {
       auto x = rand_bf16(r, std::size_t(3) * M * H);
       DeviceArray<bf16> d_x(x);
       DeviceArray<float> d_a(std::size_t(M) * n), d_b(std::size_t(M) * n);
-      kdense::proj(d_x.get(), M, kdense::Matrix{d_src.get(), fp8 ? d_scale.get() : nullptr, n, d_ids.get()}, d_seg.get(),
+      kdense::proj(d_x.get(), M, kdense::Matrix{d_src.get(), fp8 ? d_scale.get() : nullptr, n, d_ids.get(), fp8 ? kdense::Format::fp8 : kdense::Format::bf16}, d_seg.get(),
                    1, d_a.get(), false, nullptr);
-      kdense::proj(d_x.get(), M, kdense::Matrix{d_copy.get(), fp8 ? d_cscale.get() : nullptr, n}, d_seg.get(), 1,
+      kdense::proj(d_x.get(), M, kdense::Matrix{d_copy.get(), fp8 ? d_cscale.get() : nullptr, n, nullptr, fp8 ? kdense::Format::fp8 : kdense::Format::bf16}, d_seg.get(), 1,
                    d_b.get(), false, nullptr);
       INGINE_TEST_CUDA(cudaDeviceSynchronize());
       const auto a = d_a.download(), b = d_b.download();
