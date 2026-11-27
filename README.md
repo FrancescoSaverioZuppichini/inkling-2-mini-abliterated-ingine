@@ -83,22 +83,67 @@ driver holds CUDA programs at. On an RTX 5090 that raises the memory clock by 1.
 ## RTX 3090 and RTX 4090
 
 The installer targets the RTX 5090. On a 24 GB RTX 3090 (sm_86) or RTX 4090 (sm_89), build by hand with a system CUDA 13
-toolkit, CMake 3.28 or newer and GCC 12 to 16:
+toolkit, CMake 3.28 or newer and GCC 12 to 16, then start:
 
 ```bash
-cd native
-cmake --preset ampere            # sm_86 and sm_89 in one binary
-cmake --build --preset ampere
-build-ampere/apps/serve/ingine-serve --engine --model-dir <Inkling-2-Mini folder> --port 8003 \
-  --max-ctx 245760 --kv-fp8 --spec --spec-threshold 0.8 --no-vision --embed-host --prefill-chunk 2048
+cd native && cmake --preset ampere && cmake --build --preset ampere && cd ..   # sm_86 and sm_89 in one binary
+./start.sh <Inkling-2-Mini folder>      # http://127.0.0.1:8003/v1; PORT=..., MAX_CTX=... and extra flags work too
 ```
 
-That serves the original checkpoint in BF16 with 245,760 tokens of context in about 23.7 GB (RTX 3090) or 23.9 GB
-(RTX 4090). `--embed-host` keeps the embedding table (0.86 GiB) in host memory that the GPU reads over PCIe, which makes
-room for the context on 24 GB. `--prefill-chunk 2048` reads prompts 9-15 % faster than 1024; 3072 does not fit with
-this context. Other programs holding GPU memory (a desktop, another server) can push 2048 over the edge: then use 1024. Without clusters, PDL or FP4/FP8 converts these GPUs take their own
-kernel paths (exact decoders, a cooperative exchange for the router and message gates, one-wave attention); the
-`ampere-dev` preset adds the tests.
+`start.sh` reads the GPU and starts the profile for agentic coding with 512,000 tokens of context. Both 24 GB cards hold 524,288 (`MAX_CTX=524288`); the default leaves ~150 MiB of headroom, so the GPU must not drive a desktop or run other programs. Flags given after the folder win over it. On start-up the server prints what it loaded:
+
+STARTUP_BLOCK
+
+### Profiles per GPU
+
+| GPU | weights | KV cache | context | prefill chunk | embedding table | images |
+|---|---|---|---:|---:|---|---|
+| RTX 3090 24 GB | INT8 | k8v4 | 512,000 | 2048 | host RAM | off |
+| RTX 4090 24 GB | INT8 | k8v4 | 512,000 | 2048 | host RAM | off |
+| RTX 5090 32 GB | FP8 | FP8 | 512,000 (fits on paper; untested) | 3072 | GPU | on |
+
+**Why these choices:**
+- **INT8 weights:** the same size as FP8 (1 GB less than BF16). They are as fast or faster: +2.5 % over FP8 on the 3090, equal on the 4090. They are also closer to BF16: about 20 % lower KL; next-token agreement 97–98 % for both at 32K–128K, and 97.5 % vs 95.0 % at 230K on the 4090.
+- **k8v4 KV:** 8-bit keys and 4-bit values, 6.06 bits per value. Keys go through the softmax, which amplifies their errors; values are only averaged.
+- **Prefill chunk 2048:** 3072 reads long prompts 6–10 % faster but needs 0.37 GB more, which these cards spend on context.
+- **Embedding table in host RAM:** 0.86 GiB; the GPU reads one row per token over PCIe.
+- **No images:** the image tower takes 0.6 GB plus up to 0.85 GiB while encoding.
+
+### Options
+
+`ingine-serve --help` lists them all. The ones that matter:
+
+| option | default | what it does |
+|---|---|---|
+| `--model-dir DIR` | required | the Inkling-2-Mini checkpoint |
+| `--engine` / `--fake` | required, one of them | serve the model / serve canned answers (tests) |
+| `--host`, `--port` | 127.0.0.1, 8003 | where the OpenAI-compatible API listens |
+| `--max-ctx N` | 65,536 | tokens the full-attention caches hold (`start.sh`: 512,000) |
+| `--kv-cache F` | int8 below compute capability 8.9 (3090), fp8 from 8.9 (4090, 5090) | full-attention cache format: `int8` (8.13 bits per value), `fp8` (8), `k8v4` (6.06), `fp4` (4.5), `int4` (4.06), `bf16` (exact, 16). `--kv-fp8` = `--kv-cache fp8` |
+| `--dense F` | bf16 | dense weights (projections, wo, head): `bf16` (the checkpoint), `int8` or `fp8` (one byte plus a scale per row, quantized at load, about 1 GB less). `--dense-fp8` = `--dense fp8` |
+| `--spec`, `--spec-threshold X` | off, 0.8 | DSpark speculative decoding: a drafter proposes up to 7 tokens and the model checks them all, so the output does not change |
+| `--prefill-chunk N` | 3072 | prompt tokens per prefill step; each 1,024 tokens of chunk need about 0.37 GB |
+| `--embed-host` | off | keep the embedding table (0.86 GiB) in pinned host RAM |
+| `--no-vision` | images on | do not load the image tower (0.6 GB) and reject image requests |
+| `--park-host-mb N` | auto | pinned host RAM for conversations displaced by another one; switching back restores them instead of re-reading the prompt. Auto: room for two conversations at `--max-ctx`, at least a quarter of RAM up to 32 GiB, never over half. 0 turns it off |
+| `--temperature`, `--top-p`, `--top-k` | from `generation_config.json` | sampling for requests that set none |
+| `--image-max-tokens`, `--max-images`, `--max-image-tokens` | 4096, 16, 32768 | image limits per image and per request |
+| `--max-queue N` | 4 | requests that may wait behind the running one |
+| `--max-model-len N` | `--max-ctx` | the context limit the API reports and enforces |
+| `--ablation FILE` | none | the abliteration direction file (`inkling-2-mini-abliterated`) |
+| `--log-level L` | INFO | DEBUG, INFO, WARNING or ERROR |
+
+### Speed and context on 24 GB
+
+AMPERE_TABLES
+
+These GPUs have no thread-block clusters and no FP4 convert, and the 3090 has no FP8 convert either, so they take their own kernel paths:
+- exact decoders;
+- a cooperative exchange for the router and message gates;
+- one-wave attention;
+- a low-bit KV reader.
+
+The `ampere-dev` preset adds the tests.
 
 ## Use
 
