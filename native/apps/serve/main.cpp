@@ -80,8 +80,8 @@ int main(int argc, char** argv) {
 
   ingine::serve::ArgParser ap("ingine-serve", "OpenAI-compatible chat completions server for ingine.");
   ap.option("--model-dir", "", "checkpoint dir (tokenizer + chat template)", &model_dir, {}, true);
-  ap.option("--host", "", "", &host);
-  ap.option("--port", "", "", &port);
+  ap.option("--host", "", "address to listen on (default 127.0.0.1: this machine only)", &host);
+  ap.option("--port", "", "port to listen on (default 8003)", &port);
   ap.flag("--engine", "serve the model with ingine", &engine);
   ap.flag("--fake", "serve canned outputs (FakeGenerator)", &fake);
   ap.exclusive({"--engine", "--fake"}, true);
@@ -124,7 +124,7 @@ int main(int argc, char** argv) {
   ap.option("--max-queue", "", "requests allowed to wait behind the running one", &max_queue);
   ap.option("--max-model-len", "",
             "context limit (default: generator.max_model_len or tokenizer model_max_length)", &max_model_len);
-  ap.option("--log-level", "", "", &log_level);
+  ap.option("--log-level", "", "DEBUG, INFO (default), WARNING or ERROR", &log_level);
   ap.option("--temperature", "", "temperature of requests that omit it (default: generation_config.json, else 1)",
             &temperature);
   ap.option("--top-p", "", "top_p of requests that omit it (default: generation_config.json, else 1)", &top_p);
