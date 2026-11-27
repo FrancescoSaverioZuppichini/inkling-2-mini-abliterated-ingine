@@ -217,15 +217,17 @@ bool check_pack(const std::vector<float>& rk, const std::vector<float>& rv, int 
         std::fill(blk.begin(), blk.end(), uint8_t(0));
         encode(c, kv == 0, row, blk.data(), j);
         const bool loose = c == Code::i4 && kv == 0;  // FP32 norm and least-squares sums in another order
+        size_t flips = 0;
         for (int d = 0; d < D; ++d) {
           const auto [byte, mask] = code_at(c, kv == 0, j, d);
           const int a = code_of_byte(got[byte] & mask, mask), b = code_of_byte(blk[byte] & mask, mask);
-          (loose ? loose_off : exact_off) += a != b;
+          (loose ? flips : exact_off) += a != b;
           loose_big += loose && std::abs(a - b) > 1;
         }
+        loose_off += flips;
         if (!loose)
           for (int o : scale_bytes(c, kv == 0, j)) exact_off += got[o] != blk[o];
-        else
+        else if (flips == 0)  // a flipped code moves the least-squares scale legitimately
           scales_bad += std::fabs(half_at(got, kvf::int4::k_scale_off(j)) - half_at(blk.data(), kvf::int4::k_scale_off(j))) >
                         2e-3 * std::fabs(half_at(blk.data(), kvf::int4::k_scale_off(j))) + 1e-6;
         const std::vector<double>& deq = kv ? q.v : q.k;
@@ -240,7 +242,7 @@ bool check_pack(const std::vector<float>& rk, const std::vector<float>& rv, int 
   const double ek = std::sqrt(se[0] / sr[0]), ev = std::sqrt(se[1] / sr[1]);
   const bool ok = codes_ok && ek <= bound_of(g_f->k) && ev <= bound_of(g_f->v);
   std::printf("%s %s pack_rows %d rows: %zu codes / scale bytes differ from the exact host encoder; int4 keys: %zu codes "
-              "off by one, %zu by more, %zu scales off; row error K %.4f V %.4f (bounds %.3f / %.3f)\n",
+              "off by one, %zu by more, %zu scales off on rows with no flipped code; row error K %.4f V %.4f (bounds %.3f / %.3f)\n",
               ok ? "PASS" : "FAIL", g_f->name, rows, exact_off, loose_off, loose_big, scales_bad, ek, ev,
               bound_of(g_f->k), bound_of(g_f->v));
   return ok;
