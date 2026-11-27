@@ -124,16 +124,23 @@ __device__ __forceinline__ uint32_t ld4(const char* ptr) {
 // [Agent] The magic-number decode: OR a nibble into the mantissa of 1024 (0x6400) gives 1024 + n exactly; one
 // subtraction (low nibbles) or one FMA by 1/16 (high nibbles, which sit 4 bits up) leaves n - 8. 9 instructions per
 // 8 codes. The levels are n - 7.5; the +0.5 is added once per score / output (Qsum, l) instead of per code.
+// [Agent] (a & b) | c as ONE lop3: ptxas splits the C expression into two (13 instead of 9 per 8 codes, S4-13's SASS).
+__device__ __forceinline__ uint32_t lop3_and_or(uint32_t a, uint32_t b, uint32_t c) {
+    uint32_t d;
+    asm("lop3.b32 %0, %1, %2, %3, 0xea;" : "=r"(d) : "r"(a), "r"(b), "r"(c));
+    return d;
+}
+
 __device__ __forceinline__ void dq4(uint32_t w, uint32_t (&h)[4]) {
     const uint32_t EX = 0x64006400u;
     const __half2 SUB = __halves2half2(__ushort_as_half(0x6408), __ushort_as_half(0x6408));  // 1032
     const __half2 MUL = __halves2half2(__ushort_as_half(0x2c00), __ushort_as_half(0x2c00));  // 1/16
     const __half2 ADD = __halves2half2(__ushort_as_half(0xd480), __ushort_as_half(0xd480));  // -72
-    uint32_t lo = (w & 0x000f000fu) | EX, hi = (w & 0x00f000f0u) | EX;
+    uint32_t lo = lop3_and_or(w, 0x000f000fu, EX), hi = lop3_and_or(w, 0x00f000f0u, EX);
     __half2 r0 = __hsub2(*reinterpret_cast<__half2*>(&lo), SUB);
     __half2 r1 = __hfma2(*reinterpret_cast<__half2*>(&hi), MUL, ADD);
     w >>= 8;
-    lo = (w & 0x000f000fu) | EX, hi = (w & 0x00f000f0u) | EX;
+    lo = lop3_and_or(w, 0x000f000fu, EX), hi = lop3_and_or(w, 0x00f000f0u, EX);
     __half2 r2 = __hsub2(*reinterpret_cast<__half2*>(&lo), SUB);
     __half2 r3 = __hfma2(*reinterpret_cast<__half2*>(&hi), MUL, ADD);
     h[0] = *reinterpret_cast<uint32_t*>(&r0), h[1] = *reinterpret_cast<uint32_t*>(&r1);
