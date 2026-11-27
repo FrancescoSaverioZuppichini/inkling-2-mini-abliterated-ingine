@@ -55,6 +55,11 @@ __device__ __forceinline__ void cp_async16(void* smem_dst, const void* gmem_src,
                : "r"(smem_addr(smem_dst)), "l"(gmem_src), "r"(src_bytes));
 }
 
+// The same at a shared-window address (no generic-to-shared conversion in the loop).
+__device__ __forceinline__ void cp_async16(unsigned smem_dst, const void* gmem_src, int src_bytes) {
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" : : "r"(smem_dst), "l"(gmem_src), "r"(src_bytes));
+}
+
 __device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;\n"); }
 
 template <int Groups>
