@@ -303,12 +303,11 @@ void prefill_attend(const PrefillArgs& a, cudaStream_t stream) {
     require(a.T > 0 && a.q && a.rel && a.proj && a.k_cache && a.v_cache && a.out, "prefill_attend: null argument");
     with_format(a.kv, [&](auto t) {
         using F = typename decltype(t)::type;
-        static const bool attr = [] {
+        [[maybe_unused]] static const bool attr = [] {
             CUDA_CHECK(cudaFuncSetAttribute(lb_prefill_kernel<F>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                             int(PfSmem<F>::BYTES)));
             return true;
         }();
-        (void)attr;
         lb_prefill_kernel<F><<<dim3((GQA * a.T + PF_ROWS - 1) / PF_ROWS, HKV), NT, PfSmem<F>::BYTES, stream>>>(a);
     });
     CUDA_CHECK(cudaGetLastError());

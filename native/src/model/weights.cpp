@@ -381,11 +381,10 @@ Weights load_weights(const fs::path& model_dir, DenseFormat dense, bool embed_ho
       // [Agent] Quantized a slice at a time: the BF16 staging is 72 MiB instead of the whole 883 MiB head. Rows are
       // quantized independently, so the bytes are those of one call over all rows. The upload of the next slice
       // waits for the kernel queued on the stream before it, which still reads the staging.
-      constexpr int SLICE = 16384;
       w.unembed = quantized_storage(ld, dense, UNPADDED_VOCAB, H);
-      DeviceBuffer tmp(std::size_t(SLICE) * H * 2);
-      for (int r = 0; r < UNPADDED_VOCAB; r += SLICE) {
-        const int n = std::min(SLICE, UNPADDED_VOCAB - r);
+      DeviceBuffer tmp(std::size_t(UNEMBED_SLICE) * H * 2);
+      for (int r = 0; r < UNPADDED_VOCAB; r += UNEMBED_SLICE) {
+        const int n = std::min(UNEMBED_SLICE, UNPADDED_VOCAB - r);
         ld.queue(name, tmp.p, n, r);
         ld.flush();
         quantize(w.unembed, r, tmp.p, n, stream);

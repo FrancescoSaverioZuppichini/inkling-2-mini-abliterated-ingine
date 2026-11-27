@@ -310,8 +310,9 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
     if (layer.full || !split_sliding_) {
       pk::rel_logits(rel16_, f32p(layer.rel_proj), T, rel_, s);
       if (packed)
-        kernels::attn::prefill_attend({q_, rel_, proj_, R, T, pos0, st.k_full_at(FULL_INDEX[v]).data,
-                                       st.v_full_at(FULL_INDEX[v]).data, st.kv, attn_out_}, s);
+        kernels::attn::prefill_attend({.q = q_, .rel = rel_, .proj = proj_, .ld = R, .T = T, .pos0 = pos0,
+                                       .k_cache = st.k_full_at(FULL_INDEX[v]).data,
+                                       .v_cache = st.v_full_at(FULL_INDEX[v]).data, .kv = st.kv, .out = attn_out_}, s);
       else
         pk::attention(at, s);
     } else {

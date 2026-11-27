@@ -250,7 +250,6 @@ __device__ __forceinline__ void mma_bf16(float (&c)[4], uint32_t a0, uint32_t a1
                : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 
-
 #ifndef MMA_U_BF16
 #define MMA_U_BF16 6
 #endif
@@ -411,7 +410,6 @@ bool int8_m1_tensor_cores() {
   }();
   return tc;
 }
-
 
 // BLOCK: threads per block of the M = 1 kernel (0: M = 1 runs the tensor-core kernel too, for K whose
 // whole row per lane would not fit in registers); SPLITK: warps per 16-row block of the M >= 2 kernel;

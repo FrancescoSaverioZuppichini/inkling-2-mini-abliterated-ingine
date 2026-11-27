@@ -56,7 +56,7 @@ Drafter::Drafter(const std::filesystem::path& model_dir, const Weights& w, int m
                  int shortlist_rows)
     : w_(w), stream_(stream), ctx_(std::min(max_ctx, DRAFT_CTX)) {
   if (max_ctx < 2 * BLOCK) throw std::invalid_argument("Drafter: max_ctx must hold two blocks");
-  head_ = {w.unembed.w.data, w.unembed.quantized() ? static_cast<const float*>(w.unembed.scale.data) : nullptr,
+  head_ = {w.unembed.w.data, static_cast<const float*>(w.unembed.scale.data),
            w.unembed.rows(), nullptr, w.unembed.int8()};
   V_ = w.unembed.rows();
   load(model_dir);
@@ -304,14 +304,13 @@ void Drafter::load(const std::filesystem::path& model_dir) {
     // BF16 or FP8 rows, so each slice of the unembedding reaches it dequantized (bf16(q * scale), the weights.dequant
     // value it would compute itself) in `cat`, its BF16 fold rows land in `cat` behind them and are quantized from
     // there: no memory beyond `cat`, which is freed on return.
-    constexpr int SLICE = 16384;
-    if (std::size_t(SLICE) * (H + kd::RANK) * 2 > cat.bytes) throw std::logic_error("Drafter: fold slice exceeds cat");
+    if (std::size_t(UNEMBED_SLICE) * (H + kd::RANK) * 2 > cat.bytes) throw std::logic_error("Drafter: fold slice exceeds cat");
     fold_w_ = heap_.alloc(std::size_t(V_) * kd::RANK);
     fold_s_ = static_cast<float*>(heap_.alloc(std::size_t(V_) * 4));
     auto* u = static_cast<__nv_bfloat16*>(cat.p);
-    auto* f16 = u + std::size_t(SLICE) * H;
-    for (int r = 0; r < V_; r += SLICE) {
-      const int n = std::min(SLICE, V_ - r);
+    auto* f16 = u + std::size_t(UNEMBED_SLICE) * H;
+    for (int r = 0; r < V_; r += UNEMBED_SLICE) {
+      const int n = std::min(UNEMBED_SLICE, V_ - r);
       kdense::dequant_rows(static_cast<const std::int8_t*>(head_.w) + std::size_t(r) * H, head_.scale + r, n, H, u,
                            stream_, true);
       kd::fold_head(u, nullptr, n, hw, hb, f16, fold_b_ + r, stream_);

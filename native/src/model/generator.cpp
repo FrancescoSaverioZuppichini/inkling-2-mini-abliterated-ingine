@@ -74,11 +74,8 @@ class EngineGenerator final : public Generator {
     // checkpoint layout: target state | drafter context | last prompt logits
     checkpoint_drafter_ = carved(rt_.checkpoint_bytes());
     checkpoint_logits_ = checkpoint_drafter_ + (drafter_ ? carved(drafter_->checkpoint_bytes()) : 0);
-    // [Agent] The checkpoint holds data only between the end of one prefill and the restore at the start of the next
-    // (the restore is queued before the prompt's chunks, the save after them); the Prefiller's front scratch holds data
-    // only inside a chunk. So the checkpoint lives in that scratch (301 MiB with the drafter, 164 without), and so does
-    // the drafter's large-commit scratch, which runs between chunks. The chunk taps are written inside a chunk and read
-    // after it, so they keep memory of their own. A chunk too small to hold the checkpoint gets a buffer of its own.
+    // [Agent] The checkpoint is live only between prompts and the Prefiller's front scratch only inside a chunk, so the
+    // checkpoint and the drafter's between-chunk commit scratch share that scratch (a chunk too small gets its own buffer).
     const DeviceSpan idle = prefiller_.idle();
     const std::size_t bytes = std::max(checkpoint_logits_ + logits_.bytes, drafter_ ? drafter_->commit_scratch_bytes() : 0);
     if (bytes > idle.bytes) own_checkpoint_ = DeviceBuffer(bytes);

@@ -48,6 +48,8 @@ struct Visit {
   int pass;  // loop pass (0 outside the loop)
 };
 
+// Rows of the unembedding processed per pass when it is quantized or folded at load (bounds the BF16 staging).
+inline constexpr int UNEMBED_SLICE = 16384;
 inline constexpr int NUM_VISITS = 48;
 inline constexpr int NUM_FULL_VISITS = 8;
 inline constexpr int NUM_SLIDING_VISITS = NUM_VISITS - NUM_FULL_VISITS;
