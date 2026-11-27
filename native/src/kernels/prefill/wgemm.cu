@@ -4,13 +4,14 @@
 // FP32 accumulation. The 8 warps split the weight rows (16 each) and every warp covers all of the tile's
 // activation rows, so each weight element is decoded exactly once per CTA, straight from the staged checkpoint
 // codes into the MMA B fragments in registers (no BF16 weight tile in shared memory):
-//   NVFP4: bf16((e2m1 * e4m3 block scale) * factor)      (model.decode_experts)
+//   NVFP4: bf16((e2m1 * e4m3 block scale) * factor)      (model.decode_experts), looked up in a per-tile table
 //   MXFP8: bf16(e4m3 * 2^(e8m0 - 127))                    (model.decode_experts)
 // Activation rows (gathered by pair for the experts) and the weight codes stream in through 16-byte cp.async:
-// activations in 3 stages of 64 elements, the codes in 2 slots of 128-byte (64-byte for the NVFP4 down
-// projection) row pieces, so DRAM reads whole lines and small chunks, which are bound by the weight bytes, keep
-// enough loads in flight. One barrier per step. Code rows are padded in shared memory so the 8 rows of a fragment
-// load hit distinct banks. m16 row blocks past the tile's row count skip their MMAs (zero-filled copies).
+// activations in 3 stages of 64 elements, the codes in 64-byte row pieces (NVFP4: 128 elements plus their 8 block
+// scales in the row padding), several slots ahead, so DRAM reads whole lines and small chunks, which are bound by
+// the weight bytes, keep enough loads in flight. One barrier per step. Code rows are padded in shared memory so the
+// 8 rows of a fragment load hit distinct banks. m16 row blocks past the tile's row count skip their MMAs
+// (zero-filled copies).
 // The per-element products and the k order of the FP32 sums are those of the BF16 MMA over decoded rows.
 // Epilogues: gate/up (w13 rows interleaved, 2i gate and 2i + 1 up, so each thread holds gate and up of the same
 // i): act = bf16(softcap(bf16 g, 4) * sigmoid(bf16 g) * softcap(bf16 u, 25)); down: bf16 per pair placed at
@@ -20,6 +21,7 @@
 
 #include <cmath>
 #include <stdexcept>
+#include <type_traits>
 
 namespace ingine::kernels::prefill {
 namespace {
@@ -47,13 +49,15 @@ struct Cfg {
   static constexpr int WS = TM <= 32 ? (FMT == FMT_NVFP4 ? 6 : 7) : (FMT == FMT_NVFP4 ? 3 : 4);
   static_assert(R * (WS - 1) >= AS);
   static constexpr int WCODE = FMT == FMT_NVFP4 ? WK / 2 : WK;  // code bytes per row per chunk
-  static constexpr int WSTRIDE = WCODE + 16;                    // padded: fragment loads on distinct banks
+  // padded: fragment loads on distinct banks; NVFP4 keeps the chunk's 8 block scales of the row in the padding
+  static constexpr int WSTRIDE = WCODE + 16;
   static constexpr int W_BYTES = TN * WSTRIDE;
   static constexpr int A_BYTES = TM * BK * 2;
-  static constexpr int SC_BYTES = TN * SCALE_ROW;               // block scales of the whole tile
+  static constexpr int SC_BYTES = FMT == FMT_NVFP4 ? 0 : TN * SCALE_ROW;  // MXFP8: block scales of the whole tile
   static constexpr int OFF_W = AS * A_BYTES, OFF_SC = OFF_W + WS * W_BYTES;
-  static constexpr int OFF_LUT = (OFF_SC + SC_BYTES + 15) / 16 * 16;
-  static constexpr int SMEM = OFF_LUT + 64;
+  // NVFP4: BF16 value of every (block scale code, E2M1 code) pair for this tile's expert, 256 x 16
+  static constexpr int OFF_TBL = (OFF_SC + SC_BYTES + 31) / 32 * 32;
+  static constexpr int SMEM = OFF_TBL + (FMT == FMT_NVFP4 ? 256 * 16 * 2 : 0);
   static_assert(K % WK == 0 && SMEM <= 101376);
 };
 
@@ -70,20 +74,23 @@ __device__ __forceinline__ void cp_async4(void* smem_dst, const void* gmem_src) 
   asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" ::"r"(smem_addr(smem_dst)), "l"(gmem_src));
 }
 
+__device__ __forceinline__ void cp_async8(void* smem_dst, const void* gmem_src) {
+  asm volatile("cp.async.ca.shared.global [%0], [%1], 8;\n" ::"r"(smem_addr(smem_dst)), "l"(gmem_src));
+}
+
 __device__ __forceinline__ float softcap(float x, float cap) { return tanhf(x * (1.f / cap)) * cap; }
 
 // One activation step of MMAs for the first MT 16-row blocks: per k16 group, the A fragments by ldmatrix, then the
 // MMAs, then `after(kk)` (the next step's B decoding, which runs under the issued MMAs).
 template <int MT, int TM, class After>
-__device__ __forceinline__ void mma_step(float (&acc)[TM / 16][2][4], const uint16_t* A,
-                                         const unsigned (&b)[BK / 16][2][2], int lane, After&& after) {
+__device__ __forceinline__ void mma_step(float (&acc)[TM / 16][2][4], unsigned a_addr, const unsigned (&a_off)[BK / 16],
+                                         const unsigned (&b)[BK / 16][2][2], After&& after) {
 #pragma unroll
   for (int kk = 0; kk < BK / 16; ++kk) {
     unsigned a[MT][4];
 #pragma unroll
-    for (int mt = 0; mt < MT; ++mt)
-      ldmatrix_x4(a[mt][0], a[mt][1], a[mt][2], a[mt][3],
-                  smem_addr(A + swz<KCH>(mt * 16 + (lane & 15), kk * 2 + (lane >> 4))));
+    for (int mt = 0; mt < MT; ++mt)  // 16 rows further down = 16 * BK * 2 bytes, the swizzle repeats every 8 rows
+      ldmatrix_x4(a[mt][0], a[mt][1], a[mt][2], a[mt][3], a_addr + a_off[kk] + mt * 16 * BK * 2);
 #pragma unroll
     for (int mt = 0; mt < MT; ++mt) {
       mma_bf16(acc[mt][0], a[mt], b[kk][0][0], b[kk][0][1]);
@@ -104,7 +111,7 @@ __global__ void __launch_bounds__(NT, 1) wgemm_kernel(const GemmArgs g) {
   unsigned char* a_smem = smem;
   unsigned char* w_smem = smem + C::OFF_W;
   uint8_t* sc_smem = smem + C::OFF_SC;
-  float* lut = reinterpret_cast<float*>(smem + C::OFF_LUT);
+  const unsigned char* tbl = smem + C::OFF_TBL;
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
 
   // ---- tile: n pair rows (from pb) of expert e x weight rows n0..n0+127
@@ -116,7 +123,6 @@ __global__ void __launch_bounds__(NT, 1) wgemm_kernel(const GemmArgs g) {
   const int n0 = (blockIdx.x % NTILES_N) * TN;
   const uint8_t* code_tile = g.codes + (int64_t(e) * NE + n0) * C::CODE_ROW;
   const uint8_t* scale_tile = g.scales + (int64_t(e) * NE + n0) * C::SCALE_ROW;
-  if (tid < 16) lut[tid] = kE2M1[tid];
 
   // activation rows of this thread's cp.async chunks: rows tid / 8 + 32 i, chunk tid % 8
   const uint16_t* arow[TM / 32];
@@ -128,40 +134,79 @@ __global__ void __launch_bounds__(NT, 1) wgemm_kernel(const GemmArgs g) {
     else arow[i] = g.a + size_t(pb + rr) * K;
   }
 
-  auto load_a = [&](int ks) {
-    uint16_t* A = reinterpret_cast<uint16_t*>(a_smem + (ks % AS) * C::A_BYTES);
+  // [Agent] Stages and slots are tracked as running byte offsets and the global sources as running pointers: the
+  // `% 3` of a 3-stage ring and the per-step 64-bit address rebuild cost ~3 instructions per weight in the K loop.
+  const uint16_t* asrc[TM / 32];  // activation source of the next load (step j), this thread's 16 bytes
+  unsigned adst[TM / 32];         // its byte offset inside a stage (swizzled)
+  int asz[TM / 32];
+#pragma unroll
+  for (int i = 0; i < TM / 32; ++i) {
+    const int r = (tid >> 3) + 32 * i, ch = tid & 7;
+    asrc[i] = arow[i] + ch * 8, adst[i] = 2 * swz<KCH>(r, ch), asz[i] = r < n ? 16 : 0;
+  }
+  const unsigned a_smem_addr = smem_addr(a_smem);
+  auto load_a = [&](unsigned stage) {
 #pragma unroll
     for (int i = 0; i < TM / 32; ++i) {
-      const int r = (tid >> 3) + 32 * i, c = tid & 7;
-      cp_async16(A + swz<KCH>(r, c), arow[i] + ks * BK + c * 8, r < n ? 16 : 0);
+      cp_async16(a_smem_addr + stage + adst[i], asrc[i], asz[i]);
+      asrc[i] += BK;
     }
   };
-  auto load_w = [&](int chunk) {
-    unsigned char* ws = w_smem + (chunk % C::WS) * C::W_BYTES;
-    constexpr int CPR = C::WCODE / 16;  // 16-byte pieces per row
+  constexpr int CPR = C::WCODE / 16;  // 16-byte pieces per row
+  const uint8_t* wsrc[TN * CPR / NT];
+  unsigned wdst[TN * CPR / NT];
+#pragma unroll
+  for (int i = 0; i < TN * CPR / NT; ++i) {
+    const int id = tid + i * NT, row = id / CPR, ch = id % CPR;
+    wsrc[i] = code_tile + int64_t(row) * C::CODE_ROW + ch * 16, wdst[i] = row * C::WSTRIDE + ch * 16;
+  }
+  const uint8_t* ssrc = scale_tile + int64_t(tid) * C::SCALE_ROW;
+  // the next chunk in K order into `slot`
+  auto load_w = [&](unsigned slot) {
+    unsigned char* ws = w_smem + slot;
 #pragma unroll
     for (int i = 0; i < TN * CPR / NT; ++i) {
-      const int id = tid + i * NT, row = id / CPR, ch = id % CPR;
-      cp_async16(ws + row * C::WSTRIDE + ch * 16, code_tile + int64_t(row) * C::CODE_ROW + chunk * C::WCODE + ch * 16);
+      cp_async16(ws + wdst[i], wsrc[i]);
+      wsrc[i] += C::WCODE;
     }
+    if constexpr (FMT == FMT_NVFP4)
+      if (tid < TN) {
+        cp_async8(ws + tid * C::WSTRIDE + C::WCODE, ssrc);
+        ssrc += C::WK / 16;
+      }
   };
-  // group j: activation step j (plus whatever weight chunk was issued since the previous commit)
-  auto issue = [&](int j) {
-    if (j < KS) load_a(j);
-    cp_commit();
-  };
+  auto ring = [](unsigned off, unsigned size, unsigned count) { return off + size == size * count ? 0u : off + size; };
 
-  // the tile's block scales, with the first activation group
+  // MXFP8: the tile's block scales, with the first activation group
   for (int id = tid; id < C::SC_BYTES / 4; id += NT)
     cp_async4(sc_smem + id * 4, scale_tile + (id * 4 / C::SCALE_ROW) * int64_t(C::SCALE_ROW) + (id * 4) % C::SCALE_ROW);
 #pragma unroll
   for (int j = 0; j < C::WS - 1; ++j)
-    if (j < C::KC) load_w(j);
+    if (j < C::KC) load_w(j * C::W_BYTES);
+  // group j: activation step j (plus whatever weight chunk was issued since the previous commit)
 #pragma unroll
-  for (int j = 0; j < AS - 1; ++j) issue(j);
+  for (int j = 0; j < AS - 1; ++j) {
+    load_a(j * C::A_BYTES);
+    cp_commit();
+  }
 
   const int c = lane & 3;
   const float factor = FMT == FMT_NVFP4 ? __ldg(g.factors + e) : 1.f;
+  // [Agent] NVFP4: a weight's BF16 value bf16((e2m1 * scale) * factor) depends only on its 4-bit code, its block's
+  // 8-bit scale code and the expert's factor, so the tile builds all 256 x 16 values once (same expression, same
+  // bits) and the decode becomes one shared-memory lookup per weight: no scale conversion, no FP32 multiplies, no
+  // rounding in the loop. Published by the first barrier of the K loop.
+  if constexpr (FMT == FMT_NVFP4) {
+    const float s = e4m3x2_to_float2(uint16_t(tid)).x;  // thread = scale code
+    uint4 w[2];
+    uint32_t* wv = reinterpret_cast<uint32_t*>(w);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) wv[j] = pack_bf16x2((kE2M1[2 * j] * s) * factor, (kE2M1[2 * j + 1] * s) * factor);
+    uint4* dst = reinterpret_cast<uint4*>(smem + C::OFF_TBL + tid * 32);
+    dst[0] = w[0], dst[1] = w[1];
+  }
+  // NVFP4 decode: bytes c (elements 2c, 2c + 1) of the k16 group's two code words, side by side
+  const uint32_t sel_c = uint32_t(c) | uint32_t(c + 4) << 4;
   const int mact = min((n + 15) / 16, TM / 16);  // active m16 row blocks (same for every warp)
   float acc[TM / 16][2][4];
 #pragma unroll
@@ -169,15 +214,16 @@ __global__ void __launch_bounds__(NT, 1) wgemm_kernel(const GemmArgs g) {
 #pragma unroll
     for (int b = 0; b < 2; ++b) acc[a][b][0] = acc[a][b][1] = acc[a][b][2] = acc[a][b][3] = 0.f;
 
-  // B fragments of step ks (k16 group kk) decoded from the staged codes of its weight chunk
-  auto scales_of = [&](int ks, float (&sc)[2][4]) {
+  // B fragments of step ks (k16 group kk) decoded from the staged codes of its weight chunk: step ks reads chunk
+  // ks / R from weight slot `slot`, part = ks % R (a template constant at every call). NVFP4 scales: the step's 4
+  // scale codes per row, raw (they index the table); MXFP8: the 4 k16 groups' power-of-two factors.
+  using Scales = std::conditional_t<FMT == FMT_NVFP4, uint32_t[2], float[2][4]>;
+  auto scales_of = [&](int ks, unsigned slot, int part, Scales& sc) __attribute__((always_inline)) {
 #pragma unroll
     for (int nt = 0; nt < 2; ++nt) {
       const int row = warp * 16 + nt * 8 + (lane >> 2);
       if constexpr (FMT == FMT_NVFP4) {
-        const uint32_t s4 = *reinterpret_cast<const uint32_t*>(sc_smem + row * C::SCALE_ROW + ks * 4);
-        const float2 lo = e4m3x2_to_float2(uint16_t(s4 & 0xffff)), hi = e4m3x2_to_float2(uint16_t(s4 >> 16));
-        sc[nt][0] = lo.x, sc[nt][1] = lo.y, sc[nt][2] = hi.x, sc[nt][3] = hi.y;
+        sc[nt] = *reinterpret_cast<const uint32_t*>(w_smem + slot + row * C::WSTRIDE + C::WCODE + part * 4);
       } else {
         const uint8_t* ms = sc_smem + row * C::SCALE_ROW + ks * 2;
         sc[nt][0] = sc[nt][1] = exp2f(float(ms[0]) - 127.f);
@@ -185,20 +231,26 @@ __global__ void __launch_bounds__(NT, 1) wgemm_kernel(const GemmArgs g) {
       }
     }
   };
-  auto decode = [&](int ks, int kk, const float (&sc)[2][4], unsigned (&b)[BK / 16][2][2]) {
-    const unsigned char* ws = w_smem + ((ks / C::R) % C::WS) * C::W_BYTES;
-    const int kc = (ks % C::R) * BK + kk * 16;  // first element of the k16 group inside the chunk
+  auto decode = [&](unsigned slot, int part, int kk, const Scales& sc, unsigned (&b)[BK / 16][2][2]) __attribute__((always_inline)) {
+    const unsigned char* ws = w_smem + slot;
+    const int kc = part * BK + kk * 16;  // first element of the k16 group inside the chunk
 #pragma unroll
     for (int nt = 0; nt < 2; ++nt) {
       const int row = warp * 16 + nt * 8 + (lane >> 2);
-      const float s = sc[nt][kk];
       if constexpr (FMT == FMT_NVFP4) {
-        // elements 2c, 2c+1 (byte c) and 8 + 2c, +1 (byte 4 + c) of the k16 group
+        // elements 2c, 2c+1 (byte c) and 8 + 2c, +1 (byte 4 + c) of the k16 group: v = 4 codes, low nibble first;
+        // table byte offset = scale code * 32 | code * 2
         const uint2 wd = *reinterpret_cast<const uint2*>(ws + row * C::WSTRIDE + kc / 2);
-        const uint32_t b0 = (wd.x >> (8 * c)) & 0xffu, b1 = (wd.y >> (8 * c)) & 0xffu;
-        b[kk][nt][0] = pack_bf16x2((lut[b0 & 0xf] * s) * factor, (lut[b0 >> 4] * s) * factor);
-        b[kk][nt][1] = pack_bf16x2((lut[b1 & 0xf] * s) * factor, (lut[b1 >> 4] * s) * factor);
+        const uint32_t v = __byte_perm(wd.x, wd.y, sel_c);
+        const uint32_t sb = ((sc[nt] >> (8 * kk)) & 0xffu) << 5;
+        const uint32_t t0 = *reinterpret_cast<const uint16_t*>(tbl + (((v << 1) & 0x1eu) | sb));
+        const uint32_t t1 = *reinterpret_cast<const uint16_t*>(tbl + (((v >> 3) & 0x1eu) | sb));
+        const uint32_t t2 = *reinterpret_cast<const uint16_t*>(tbl + (((v >> 7) & 0x1eu) | sb));
+        const uint32_t t3 = *reinterpret_cast<const uint16_t*>(tbl + (((v >> 11) & 0x1eu) | sb));
+        b[kk][nt][0] = __byte_perm(t0, t1, 0x5410);
+        b[kk][nt][1] = __byte_perm(t2, t3, 0x5410);
       } else {
+        const float s = sc[nt][kk];
         const uint4 q = *reinterpret_cast<const uint4*>(ws + row * C::WSTRIDE + kc);
         const uint32_t w0 = (c >> 1) ? q.y : q.x, w1 = (c >> 1) ? q.w : q.z;
         const float2 f0 = e4m3x2_to_float2(uint16_t(w0 >> (16 * (c & 1))));
@@ -212,44 +264,77 @@ __global__ void __launch_bounds__(NT, 1) wgemm_kernel(const GemmArgs g) {
 
   // Software pipeline: step ks's MMAs run on fragments decoded during step ks - 1; the decoding of step ks + 1
   // is interleaved with them (its chunk has landed: R (WS - 1) >= AS, and the barrier published it).
-  unsigned bcur[BK / 16][2][2], bnext[BK / 16][2][2];
-#pragma unroll 1
-  for (int ks = 0; ks < KS; ++ks) {
-    cp_wait<AS - 2>();
-    __syncthreads();
-    const int chunk = ks / C::R;
-    // first step of a chunk: the chunk WS - 1 ahead into the slot the previous chunk used (read before the barrier)
-    if (ks % C::R == 0 && chunk + C::WS - 1 < C::KC) load_w(chunk + C::WS - 1);
-    issue(ks + AS - 1);
-    if (ks == 0) {
-      float sc0[2][4];
-      scales_of(0, sc0);
+  // [Agent] The row-block count is a template constant of the whole K loop, not a switch inside it: a runtime
+  // `mt < mact` test would be if-converted into predicated MMAs (8x the tensor work for a 16-row tile), and a switch
+  // per step costs an indirect branch and splits the step into blocks the scheduler cannot interleave. The loop runs
+  // two steps per trip with the fragment sets swapped (no copy of the 16 next-step registers) and peels the last
+  // step, so every decode is unconditional and sits in one basic block with the MMAs it hides under.
+  unsigned b0[BK / 16][2][2], b1[BK / 16][2][2];
+  static_assert(KS % 2 == 0 && (C::R == 1 || C::R == 2) && KS > AS);
+  unsigned a_off[BK / 16];  // ldmatrix row address of this lane per k16 group, rows 0..15 of a stage
 #pragma unroll
-      for (int kk = 0; kk < BK / 16; ++kk) decode(0, kk, sc0, bcur);
-    }
-    const uint16_t* A = reinterpret_cast<const uint16_t*>(a_smem + (ks % AS) * C::A_BYTES);
-    const bool more = ks + 1 < KS;
-    float scn[2][4];
-    if (more) scales_of(ks + 1, scn);
-    auto after = [&](int kk) {
-      if (more) decode(ks + 1, kk, scn, bnext);
+  for (int kk = 0; kk < BK / 16; ++kk) a_off[kk] = 2 * swz<KCH>(lane & 15, kk * 2 + (lane >> 4));
+  unsigned a_rd = 0, a_wr = (AS - 1) * C::A_BYTES;  // stage of step ks; stage step ks + AS - 1 loads into
+  unsigned w_rd = 0, w_wr = (C::WS - 1) * C::W_BYTES;  // slot of chunk ks / R; slot of chunk ks / R + WS - 1
+  // [Agent] The K-loop lambdas are force-inlined: for the MXFP8 kernels sm_86's larger software FP8 decode pushed
+  // them past the inliner's size limit, the fragment arrays passed by reference then lived in an 800-byte stack
+  // frame with local-memory loads and stores in every step, which made the RTX 3090's MoE GEMMs ~2x slower.
+  auto kloop = [&](auto mt_c) __attribute__((always_inline)) {
+    constexpr int MT = decltype(mt_c)::value;
+    // par = ks % 2. first = step 0: its own fragments are decoded right after the barrier that publishes chunk 0.
+    // tail = the last AS - 1 steps, which load no activations.
+    auto step = [&](int ks, auto par_c, auto dec_c, auto first_c, auto tail_c, unsigned (&bc)[BK / 16][2][2],
+                    unsigned (&bn)[BK / 16][2][2]) __attribute__((always_inline)) {
+      constexpr int part = decltype(par_c)::value % C::R, part_n = (decltype(par_c)::value + 1) % C::R;
+      constexpr bool DEC = decltype(dec_c)::value;
+      cp_wait<AS - 2>();
+      __syncthreads();
+      // first step of a chunk: the chunk WS - 1 ahead into the slot the previous chunk used (read before the barrier)
+      if (part == 0 && ks / C::R + C::WS - 1 < C::KC) {
+        load_w(w_wr);
+        w_wr = ring(w_wr, C::W_BYTES, C::WS);
+      }
+      if constexpr (!decltype(tail_c)::value) load_a(a_wr);
+      cp_commit();
+      a_wr = ring(a_wr, C::A_BYTES, AS);
+      if constexpr (decltype(first_c)::value) {
+        Scales sc0;
+        scales_of(0, 0, 0, sc0);
+#pragma unroll
+        for (int kk = 0; kk < BK / 16; ++kk) decode(0, 0, kk, sc0, bc);
+      }
+      const unsigned w_nx = part_n == 0 ? ring(w_rd, C::W_BYTES, C::WS) : w_rd;  // slot of step ks + 1
+      Scales scn;
+      if constexpr (DEC) scales_of(ks + 1, w_nx, part_n, scn);
+      mma_step<MT, TM>(acc, a_smem_addr + a_rd, a_off, bc, [&](int kk) {
+        if constexpr (DEC) decode(w_nx, part_n, kk, scn, bn);
+      });
+      a_rd = ring(a_rd, C::A_BYTES, AS);
+      w_rd = w_nx;
     };
-    // the row-block count is a template constant inside mma_step: a runtime `mt < mact` test would be if-converted
-    // into predicated MMAs, which still occupy the tensor pipe (8x the work for a 16-row tile)
-    switch (mact) {
-      case 1: if constexpr (1 <= TM / 16) mma_step<1, TM>(acc, A, bcur, lane, after); break;
-      case 2: if constexpr (2 <= TM / 16) mma_step<2, TM>(acc, A, bcur, lane, after); break;
-      case 3: if constexpr (3 <= TM / 16) mma_step<3, TM>(acc, A, bcur, lane, after); break;
-      case 4: if constexpr (4 <= TM / 16) mma_step<4, TM>(acc, A, bcur, lane, after); break;
-      case 5: if constexpr (5 <= TM / 16) mma_step<5, TM>(acc, A, bcur, lane, after); break;
-      case 6: if constexpr (6 <= TM / 16) mma_step<6, TM>(acc, A, bcur, lane, after); break;
-      case 7: if constexpr (7 <= TM / 16) mma_step<7, TM>(acc, A, bcur, lane, after); break;
-      default: mma_step<TM / 16, TM>(acc, A, bcur, lane, after); break;
+    using T0 = std::integral_constant<int, 0>;
+    using T1 = std::integral_constant<int, 1>;
+    using Y = std::true_type;
+    using N = std::false_type;
+    step(0, T0{}, Y{}, Y{}, N{}, b0, b1);
+    step(1, T1{}, Y{}, N{}, N{}, b1, b0);
+#pragma unroll 1
+    for (int ks = 2; ks < KS - 2; ks += 2) {
+      step(ks, T0{}, Y{}, N{}, N{}, b0, b1);
+      step(ks + 1, T1{}, Y{}, N{}, N{}, b1, b0);
     }
-#pragma unroll
-    for (int kk = 0; kk < BK / 16; ++kk)
-#pragma unroll
-      for (int nt = 0; nt < 2; ++nt) bcur[kk][nt][0] = bnext[kk][nt][0], bcur[kk][nt][1] = bnext[kk][nt][1];
+    step(KS - 2, T0{}, Y{}, N{}, Y{}, b0, b1);
+    step(KS - 1, T1{}, N{}, N{}, Y{}, b1, b0);
+  };
+  switch (mact) {
+    case 1: if constexpr (1 <= TM / 16) kloop(std::integral_constant<int, 1>{}); break;
+    case 2: if constexpr (2 <= TM / 16) kloop(std::integral_constant<int, 2>{}); break;
+    case 3: if constexpr (3 <= TM / 16) kloop(std::integral_constant<int, 3>{}); break;
+    case 4: if constexpr (4 <= TM / 16) kloop(std::integral_constant<int, 4>{}); break;
+    case 5: if constexpr (5 <= TM / 16) kloop(std::integral_constant<int, 5>{}); break;
+    case 6: if constexpr (6 <= TM / 16) kloop(std::integral_constant<int, 6>{}); break;
+    case 7: if constexpr (7 <= TM / 16) kloop(std::integral_constant<int, 7>{}); break;
+    default: kloop(std::integral_constant<int, TM / 16>{}); break;
   }
   cp_wait<0>();
 

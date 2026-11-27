@@ -122,6 +122,29 @@ void test_buffers() {
     INGINE_CHECK(attrs.type == cudaMemoryTypeHost);
 }
 
+// DeviceHeap packs buffers back to back (aligned), maps memory in whole pages only as it grows across them, keeps
+// every byte written through the growth, and survives a move.
+void test_heap() {
+    ingine::DeviceHeap heap;
+    void* a = heap.alloc(1000);
+    void* b = heap.alloc(10, 1024);
+    INGINE_CHECK(addr(b) % 1024 == 0 && addr(b) - addr(a) == 1024);
+    const std::size_t page = heap.mapped();
+    INGINE_CHECK(page >= (2u << 20) && heap.used() == 1034);
+    std::vector<std::uint8_t> src(3 * page + 12345);
+    std::iota(src.begin(), src.end(), std::uint8_t(7));
+    void* c = heap.alloc(src.size());  // spans pages mapped by this call
+    INGINE_CHECK(heap.mapped() >= heap.used() && heap.mapped() - heap.used() < page);
+    INGINE_TEST_CUDA(cudaMemcpy(c, src.data(), src.size(), cudaMemcpyHostToDevice));
+    for (int i = 0; i < 40; ++i) heap.alloc(page / 3);  // more growth after the write
+    ingine::DeviceHeap moved = std::move(heap);
+    std::vector<std::uint8_t> back(src.size());
+    INGINE_TEST_CUDA(cudaMemcpy(back.data(), c, back.size(), cudaMemcpyDeviceToHost));
+    INGINE_CHECK(back == src);
+    INGINE_CHECK(heap.used() == 0 && moved.used() > 0);
+    INGINE_CHECK(throws([&] { moved.alloc(0); }));
+}
+
 } // namespace
 
 int main() {
@@ -130,6 +153,7 @@ int main() {
     ingine::DeviceContext ctx(0);
     test_arena();
     test_buffers();
+    test_heap();
     std::printf("PASS core_arena\n");
     return 0;
 }

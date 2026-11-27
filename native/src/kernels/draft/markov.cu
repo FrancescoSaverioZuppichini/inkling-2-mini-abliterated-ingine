@@ -183,7 +183,8 @@ __global__ void __launch_bounds__(TOPK_THREADS) topk_collect_kernel(const float*
 
 // CTA per row, thread per candidate. map: element index -> token id, or null.
 __global__ void __launch_bounds__(GATHER_THREADS) topk_gather_kernel(TopkRowWs* ws, const std::int32_t* map,
-                                                                     float* cand_val, std::int32_t* cand_idx) {
+                                                                     float* cand_val, std::int32_t* cand_idx,
+                                                                     std::int32_t* cand_row) {
   __shared__ int pre_gt[TOPK_SLICES + 1], pre_tie[TOPK_SLICES + 1];
   pdl_trigger();
   pdl_wait();
@@ -220,6 +221,7 @@ __global__ void __launch_bounds__(GATHER_THREADS) topk_gather_kernel(TopkRowWs* 
   const size_t at = size_t(blockIdx.x) * CANDIDATES + tid;
   cand_val[at] = it.val;
   cand_idx[at] = map != nullptr ? map[it.idx] : it.idx;
+  cand_row[at] = it.idx;
 }
 
 // ---- rnn projection ------------------------------------------------------------------------------------
@@ -274,18 +276,24 @@ __global__ void __launch_bounds__(PRE_THREADS) markov_pre_kernel(const __nv_bflo
   }
 }
 
-__device__ __forceinline__ int step_prev(int i, const unsigned long long* picks, const std::int32_t* cand_idx,
-                                         const DraftParams* p) {
-  if (i == 0) return p->anchor;
-  return cand_idx[(i - 1) * CANDIDATES + int(unpack_argmax_index(picks[i - 1]))];
+// [Agent] Step i's W1 row: the anchor's row of the full table (i = 0), else the row of step i - 1's pick in the table of
+// the candidates' rows (the drafter keeps only the shortlist's rows on the device and the full table in host memory,
+// so a round reads one 512-byte row over PCIe).
+__device__ __forceinline__ const __nv_bfloat16* step_prev_row(int i, const unsigned long long* picks,
+                                                             const std::int32_t* cand_row,
+                                                             const __nv_bfloat16* w1_rows,
+                                                             const __nv_bfloat16* w1_anchor, const DraftParams* p) {
+  if (i == 0) return w1_anchor + size_t(p->anchor) * RANK;
+  return w1_rows + size_t(cand_row[(i - 1) * CANDIDATES + int(unpack_argmax_index(picks[i - 1]))]) * RANK;
 }
 
 // warp per state element j (rows j, 256 + j, 512 + j of the projection); weights loaded before the wait
 __global__ void __launch_bounds__(256) markov_step_kernel(int i, const __nv_bfloat16* __restrict__ rnn_w,
                                                           const __nv_bfloat16* __restrict__ rnn_b,
-                                                          const __nv_bfloat16* __restrict__ w1, const float* part,
+                                                          const __nv_bfloat16* w1_rows,
+                                                          const __nv_bfloat16* w1_anchor, const float* part,
                                                           const unsigned long long* picks,
-                                                          const std::int32_t* cand_idx, const DraftParams* p,
+                                                          const std::int32_t* cand_row, const DraftParams* p,
                                                           __nv_bfloat16* state, __nv_bfloat16* latent) {
   pdl_trigger();
   const int j = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
@@ -297,10 +305,10 @@ __global__ void __launch_bounds__(256) markov_step_kernel(int i, const __nv_bflo
     wb[g] = ld_weight(wr + RANK + 8 * lane);
   }
   pdl_wait();
-  const int prev = step_prev(i, picks, cand_idx, p);
+  const __nv_bfloat16* w1 = step_prev_row(i, picks, cand_row, w1_rows, w1_anchor, p);
   float z0[8], z1[8];
   unpack8(*reinterpret_cast<const uint4*>(state + size_t(i) * RANK + 8 * lane), z0);
-  unpack8(*reinterpret_cast<const uint4*>(w1 + size_t(prev) * RANK + 8 * lane), z1);
+  unpack8(*reinterpret_cast<const uint4*>(w1 + 8 * lane), z1);
   float raw[3];
 #pragma unroll
   for (int g = 0; g < 3; ++g) {
@@ -398,29 +406,7 @@ __global__ void __launch_bounds__(CANDIDATES) markov_finish_kernel(const std::in
   }
 }
 
-// block per row
-__global__ void gather_head_rows_kernel(const uint4* __restrict__ src, const float* __restrict__ src_scale,
-                                        int row_chunks, const std::int32_t* __restrict__ ids, uint4* dst,
-                                        float* dst_scale, std::int32_t* map) {
-  const int i = blockIdx.x, id = ids[i];
-  for (int c = threadIdx.x; c < row_chunks; c += blockDim.x)
-    dst[std::size_t(i) * row_chunks + c] = src[std::size_t(id) * row_chunks + c];
-  if (threadIdx.x == 0) {
-    if (src_scale != nullptr) dst_scale[i] = src_scale[id];
-    map[i] = id;
-  }
-}
-
 }  // namespace
-
-void gather_head_rows(const void* src, const float* src_scale, std::size_t row_bytes, const std::int32_t* ids, int n,
-                      void* dst, float* dst_scale, std::int32_t* map, cudaStream_t stream) {
-  if (row_bytes % 16 != 0) throw std::invalid_argument("gather_head_rows: rows must be 16-byte multiples");
-  if (n <= 0) return;
-  gather_head_rows_kernel<<<n, 128, 0, stream>>>(static_cast<const uint4*>(src), src_scale, int(row_bytes / 16), ids,
-                                                  static_cast<uint4*>(dst), dst_scale, map);
-  CUDA_CHECK(cudaGetLastError());
-}
 
 std::size_t topk_workspace_bytes(int rows, int V) {
   (void)V;
@@ -428,7 +414,7 @@ std::size_t topk_workspace_bytes(int rows, int V) {
 }
 
 void topk_candidates(const float* base, int rows, int V, const std::int32_t* map, float* cand_val,
-                     std::int32_t* cand_idx, void* ws, cudaStream_t stream) {
+                     std::int32_t* cand_idx, std::int32_t* cand_row, void* ws, cudaStream_t stream) {
   if (V < CANDIDATES) throw std::invalid_argument("topk_candidates: V must be at least 1024");
   if (rows <= 0) return;
   auto* w = static_cast<TopkRowWs*>(ws);
@@ -436,7 +422,7 @@ void topk_candidates(const float* base, int rows, int V, const std::int32_t* map
   launch_pdl(topk_hist_hi_kernel, grid, dim3(TOPK_THREADS), stream, base, V, w);
   launch_pdl(topk_hist_lo_kernel, grid, dim3(TOPK_THREADS), stream, base, V, w);
   launch_pdl(topk_collect_kernel, grid, dim3(TOPK_THREADS), stream, base, V, w);
-  launch_pdl(topk_gather_kernel, dim3(rows), dim3(GATHER_THREADS), stream, w, map, cand_val, cand_idx);
+  launch_pdl(topk_gather_kernel, dim3(rows), dim3(GATHER_THREADS), stream, w, map, cand_val, cand_idx, cand_row);
 }
 
 void markov_pre(const __nv_bfloat16* rnn_w, const __nv_bfloat16* h, const __nv_bfloat16* f_rnn, float* part,
@@ -444,12 +430,13 @@ void markov_pre(const __nv_bfloat16* rnn_w, const __nv_bfloat16* h, const __nv_b
   launch_pdl(markov_pre_kernel, dim3(RNN_OUT * 32 / PRE_THREADS), dim3(PRE_THREADS), stream, rnn_w, h, f_rnn, part);
 }
 
-void markov_step(int i, const __nv_bfloat16* rnn_w, const __nv_bfloat16* rnn_b, const __nv_bfloat16* w1,
-                 const float* part, const unsigned long long* picks, const std::int32_t* cand_idx,
-                 const DraftParams* p, __nv_bfloat16* state, __nv_bfloat16* latent, cudaStream_t stream) {
+void markov_step(int i, const __nv_bfloat16* rnn_w, const __nv_bfloat16* rnn_b, const __nv_bfloat16* w1_rows,
+                 const __nv_bfloat16* w1_anchor, const float* part, const unsigned long long* picks,
+                 const std::int32_t* cand_row, const DraftParams* p, __nv_bfloat16* state, __nv_bfloat16* latent,
+                 cudaStream_t stream) {
   if (i < 0 || i >= GAMMA) throw std::invalid_argument("markov_step: step out of range");
-  launch_pdl(markov_step_kernel, dim3(RANK * 32 / 256), dim3(256), stream, i, rnn_w, rnn_b, w1, part, picks,
-             cand_idx, p, state, latent);
+  launch_pdl(markov_step_kernel, dim3(RANK * 32 / 256), dim3(256), stream, i, rnn_w, rnn_b, w1_rows, w1_anchor, part,
+             picks, cand_row, p, state, latent);
 }
 
 void markov_logits(int i, const __nv_bfloat16* fold_w, const __nv_bfloat16* fold_b, const float* cand_val,

@@ -15,10 +15,7 @@ void lt_check(cublasStatus_t s, const char* what) {
 
 }  // namespace
 
-Bf16Gemm::Bf16Gemm(std::size_t workspace_bytes) : workspace_bytes_(workspace_bytes) {
-  lt_check(cublasLtCreate(&handle_), "create");
-  CUDA_CHECK(cudaMalloc(&workspace_, workspace_bytes_));
-}
+Bf16Gemm::Bf16Gemm() { lt_check(cublasLtCreate(&handle_), "create"); }
 
 Bf16Gemm::~Bf16Gemm() {
   for (auto& [key, p] : plans_) {
@@ -27,7 +24,6 @@ Bf16Gemm::~Bf16Gemm() {
     cublasLtMatrixLayoutDestroy(p.c);
     cublasLtMatmulDescDestroy(p.op);
   }
-  if (workspace_ != nullptr) cudaFree(workspace_);
   if (handle_ != nullptr) cublasLtDestroy(handle_);
 }
 
@@ -46,8 +42,8 @@ Bf16Gemm::Plan& Bf16Gemm::plan(int n, int N, int K) {
   lt_check(cublasLtMatrixLayoutCreate(&p.c, CUDA_R_16BF, N, n, N), "layout c");
   cublasLtMatmulPreference_t pref = nullptr;
   lt_check(cublasLtMatmulPreferenceCreate(&pref), "preference");
-  lt_check(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspace_bytes_,
-                                                sizeof(workspace_bytes_)),
+  const std::size_t ws = kWorkspaceBytes;
+  lt_check(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws, sizeof(ws)),
            "workspace preference");
   cublasLtMatmulHeuristicResult_t result{};
   int found = 0;
@@ -66,12 +62,12 @@ Bf16Gemm::Plan& Bf16Gemm::plan(int n, int N, int K) {
 }
 
 void Bf16Gemm::run(const __nv_bfloat16* a, int n, const __nv_bfloat16* w, int N, int K, __nv_bfloat16* c,
-                   cudaStream_t stream) {
+                   void* workspace, cudaStream_t stream) {
   if (n <= 0) return;
   Plan& p = plan(n, N, K);
   const float alpha = 1.f, beta = 0.f;
-  lt_check(cublasLtMatmul(handle_, p.op, &alpha, w, p.a, a, p.b, &beta, c, p.c, c, p.c, &p.algo, workspace_,
-                          workspace_bytes_, stream),
+  lt_check(cublasLtMatmul(handle_, p.op, &alpha, w, p.a, a, p.b, &beta, c, p.c, c, p.c, &p.algo, workspace,
+                          kWorkspaceBytes, stream),
            "matmul");
 }
 

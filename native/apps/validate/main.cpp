@@ -331,7 +331,7 @@ int main(int argc, char** argv) {
       RuntimeOptions opt;
       opt.model_dir = a.model_dir;
       opt.ablation = key.first ? a.ablation : fs::path();
-      opt.kv_fp8 = key.second;
+      opt.kv = key.second ? ingine::model::KvFormat::fp8 : ingine::model::KvFormat::bf16;
       opt.dense_fp8 = manifest.value("dense_fp8", true);
       opt.max_ctx = manifest.value("max_ctx", 8192);
       opt.prefill_chunk = manifest.value("prefill_chunk", 2048);

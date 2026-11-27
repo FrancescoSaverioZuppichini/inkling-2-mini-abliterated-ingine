@@ -26,6 +26,7 @@
 #include "model/model_data.h"
 
 #include "core/arena.h"
+#include "core/host_memory.h"
 #include "core/tensor.h"
 
 #include <cuda_bf16.h>
@@ -123,6 +124,11 @@ class Drafter {
 
   int vocab() const { return V_; }
 
+  // Scratch of large commits (prompt chunks): commit_scratch_bytes() of device memory the caller lends before the
+  // first commit of more than BLOCK rows, live only while such a commit runs (ordered on the drafter's stream).
+  std::size_t commit_scratch_bytes() const;
+  void lend_commit_scratch(void* p);
+
   // Device scratch of the acceptance step (engine._accept), owned here so it is allocated once.
   struct AcceptScratch {
     std::int32_t* target;                    // int32 [8]: argmax of the verify rows
@@ -145,7 +151,6 @@ class Drafter {
     std::int32_t* ctx_pos;                // local layers: int32 [WINDOW]; null for the global layer
   };
 
-  void* alloc(std::size_t bytes);
   void load(const std::filesystem::path& model_dir);
   void run_draft(int bucket);
   void run_layers(int bucket);                                                  // a draft after its input rows
@@ -166,19 +171,21 @@ class Drafter {
   int checkpoint_length_ = 0;
   bool checkpoint_clobbered_ = false;
   void global_written(int begin, int end);  // positions [begin, end) written into the global ring
-  std::vector<DeviceBuffer> storage_;
+  DeviceHeap heap_;  // every buffer of the drafter, packed (core/arena.h)
   kernels::draft::Bf16Gemm gemm_;
 
   std::array<DraftLayer, 3> layers_{};
   const __nv_bfloat16* alpha_ = nullptr;  // bf16 [4, 4] softmax(fuse_weight)
   const __nv_bfloat16 *final_norm_ = nullptr, *mask_embed_ = nullptr, *f_norm_ = nullptr;
-  const __nv_bfloat16 *w1_ = nullptr, *rnn_w_ = nullptr, *rnn_b_ = nullptr;
+  const __nv_bfloat16 *rnn_w_ = nullptr, *rnn_b_ = nullptr;
+  MappedHostBuffer w1_host_;              // markov_w1, all rows (mapped host memory)
+  __nv_bfloat16* w1_rows_ = nullptr;      // markov_w1 rows of the shortlist head's rows (device)
+  void put_w1_rows(std::span<const std::int32_t> ids, int row);
   __nv_bfloat16 *fold_w_ = nullptr, *fold_b_ = nullptr;
   kernels::dense::Matrix head_{};         // the unembedding
   // the shortlist head: rows [0, short_K_) = ranked tokens and specials (ascending ids), then context tokens
-  kernels::dense::Matrix short_head_{};   // [short_K_ + CONTEXT_ROWS, H] like head_
+  kernels::dense::Matrix short_head_{};   // [short_K_ + CONTEXT_ROWS, H]: head_'s rows through short_map_
   std::int32_t* short_map_ = nullptr;     // row -> token id
-  std::int32_t* short_ids_ = nullptr;     // staging of ids to gather
   int short_K_ = 0, short_E_ = 0;         // ranked rows, context rows in use
   std::vector<std::uint8_t> short_in_;    // host: token has a row
   std::vector<std::int32_t> short_extra_; // host: the context tokens, in row order
@@ -194,13 +201,14 @@ class Drafter {
   float *qkv_out_ = nullptr, *gu_out_ = nullptr, *delta_ = nullptr, *base_ = nullptr, *attn_ws_ = nullptr;
   float *cand_val_ = nullptr, *cand_logits_ = nullptr, *part_ = nullptr;
   void* topk_ws_ = nullptr;
-  std::int32_t *cand_idx_ = nullptr, *prev_cand_ = nullptr;
+  std::int32_t *cand_idx_ = nullptr, *cand_row_ = nullptr, *prev_cand_ = nullptr;
   unsigned long long* picks_ = nullptr;
   float *draft_logits_ = nullptr, *conf_ = nullptr, *qstats_ = nullptr;
   std::int32_t* tokens_ = nullptr;
   int *seg_qkv_ = nullptr, *seg_gate_up_ = nullptr, *seg_short_ = nullptr, *seg_kv_ = nullptr;
   // commit scratch: large commits (cuBLASLt) and the small commit (dense proj over the three layers)
   __nv_bfloat16 *warm_feats_ = nullptr, *ctx_c_ = nullptr, *ctx_kv_ = nullptr, *commit_xin_ = nullptr;
+  void* gemm_ws_ = nullptr;  // in the lent commit scratch
   float* commit_kv_ = nullptr;
 
   AcceptScratch accept_{};

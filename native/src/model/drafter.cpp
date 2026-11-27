@@ -51,10 +51,6 @@ cudaGraphExec_t capture_end(cudaStream_t s) {
 
 }  // namespace
 
-void* Drafter::alloc(std::size_t bytes) {
-  storage_.emplace_back(bytes);
-  return storage_.back().p;
-}
 
 Drafter::Drafter(const std::filesystem::path& model_dir, const Weights& w, int max_ctx, cudaStream_t stream,
                  int shortlist_rows)
@@ -65,11 +61,11 @@ Drafter::Drafter(const std::filesystem::path& model_dir, const Weights& w, int m
   V_ = w.unembed.rows();
   load(model_dir);
 
-  auto bf16s = [&](std::size_t n) { return static_cast<__nv_bfloat16*>(alloc(n * 2)); };
-  auto f32s = [&](std::size_t n) { return static_cast<float*>(alloc(n * 4)); };
-  auto i32s = [&](std::size_t n) { return static_cast<std::int32_t*>(alloc(n * 4)); };
+  auto bf16s = [&](std::size_t n) { return static_cast<__nv_bfloat16*>(heap_.alloc(n * 2)); };
+  auto f32s = [&](std::size_t n) { return static_cast<float*>(heap_.alloc(n * 4)); };
+  auto i32s = [&](std::size_t n) { return static_cast<std::int32_t*>(heap_.alloc(n * 4)); };
 
-  params_ = static_cast<kd::DraftParams*>(alloc(sizeof(kd::DraftParams)));
+  params_ = static_cast<kd::DraftParams*>(heap_.alloc(sizeof(kd::DraftParams)));
   CUDA_CHECK(cudaMemsetAsync(params_, 0, sizeof(kd::DraftParams), stream_));
   res_ = bf16s(BLOCK * H);
   xn_ = bf16s(BLOCK * H);
@@ -85,21 +81,20 @@ Drafter::Drafter(const std::filesystem::path& model_dir, const Weights& w, int m
   // the shortlist head's base logits (rows past the ones in use stay -inf)
   base_ = f32s(std::size_t(GAMMA) * std::max(V_, shortlist_rows + 256 + CONTEXT_ROWS));
   attn_ws_ = f32s(std::max(kd::attention_workspace_floats(LOCAL_SLOTS), kd::attention_workspace_floats(ctx_)));
-  topk_ws_ = alloc(kd::topk_workspace_bytes(GAMMA, V_));
+  topk_ws_ = heap_.alloc(kd::topk_workspace_bytes(GAMMA, V_));
   CUDA_CHECK(cudaMemsetAsync(topk_ws_, 0, kd::topk_workspace_bytes(GAMMA, V_), stream_));  // kept zeroed
   cand_val_ = f32s(GAMMA * kd::CANDIDATES);
   cand_logits_ = f32s(GAMMA * kd::CANDIDATES);
   part_ = f32s(GAMMA * kd::RNN_OUT);
   cand_idx_ = i32s(GAMMA * kd::CANDIDATES);
+  cand_row_ = i32s(GAMMA * kd::CANDIDATES);
   prev_cand_ = i32s(GAMMA * kd::CANDIDATES);
-  picks_ = static_cast<unsigned long long*>(alloc(GAMMA * sizeof(unsigned long long)));
+  picks_ = static_cast<unsigned long long*>(heap_.alloc(GAMMA * sizeof(unsigned long long)));
   draft_logits_ = f32s(std::size_t(GAMMA) * V_);
   conf_ = f32s(GAMMA);
   qstats_ = f32s(2 * GAMMA);
   tokens_ = i32s(GAMMA);
   warm_feats_ = bf16s(std::size_t(BLOCK) * 4 * H);
-  ctx_c_ = bf16s(std::size_t(COMMIT_PIECE) * H);
-  ctx_kv_ = bf16s(std::size_t(COMMIT_PIECE) * 2 * kd::KV_DIM);
   commit_xin_ = bf16s(std::size_t(3) * BLOCK * H);
   commit_kv_ = f32s(std::size_t(BLOCK) * 3 * 2 * kd::KV_DIM);
   CUDA_CHECK(cudaMemsetAsync(warm_feats_, 0, std::size_t(BLOCK) * 4 * H * 2, stream_));
@@ -136,15 +131,14 @@ Drafter::Drafter(const std::filesystem::path& model_dir, const Weights& w, int m
       if (short_in_[t]) list.push_back(t);
     short_K_ = int(list.size());
     const int rows = short_K_ + CONTEXT_ROWS;
-    const std::size_t row_bytes = head_.scale ? std::size_t(H) : std::size_t(H) * 2;
-    void* q = alloc(std::size_t(rows) * row_bytes);
-    auto* qs = head_.scale ? f32s(rows) : nullptr;
+    // [Agent] The shortlist head is a row map over the unembedding (dense::Matrix::row_map), not a copy of its rows:
+    // the same bytes reach the same GEMV, so the base logits keep their bits and 216 MiB stay free.
     short_map_ = i32s(rows);
-    short_ids_ = i32s(rows);
     CUDA_CHECK(cudaMemsetAsync(short_map_, 0, std::size_t(rows) * 4, stream_));
-    CUDA_CHECK(cudaMemcpyAsync(short_ids_, list.data(), list.size() * 4, cudaMemcpyHostToDevice, stream_));
-    kd::gather_head_rows(head_.w, head_.scale, row_bytes, short_ids_, short_K_, q, qs, short_map_, stream_);
-    short_head_ = kdense::Matrix{q, qs, rows};
+    CUDA_CHECK(cudaMemcpyAsync(short_map_, list.data(), list.size() * 4, cudaMemcpyHostToDevice, stream_));
+    w1_rows_ = bf16s(std::size_t(rows) * kd::RANK);
+    put_w1_rows(list, 0);
+    short_head_ = kdense::Matrix{head_.w, head_.scale, rows, short_map_};
     seg_short_ = segments({short_K_});
     kd::fill(base_, std::size_t(GAMMA) * rows, -INFINITY, stream_);
   }
@@ -153,8 +147,8 @@ Drafter::Drafter(const std::filesystem::path& model_dir, const Weights& w, int m
   for (int l = 0; l < 3; ++l) {
     DraftLayer& L = layers_[l];
     const std::size_t bytes = is_local(l) ? std::size_t(LOCAL_SLOTS) * kd::KV_DIM * 2 : ctx_ * GLOBAL_SLOT_BYTES;
-    L.k_ctx = alloc(bytes);
-    L.v_ctx = alloc(bytes);
+    L.k_ctx = heap_.alloc(bytes);
+    L.v_ctx = heap_.alloc(bytes);
     CUDA_CHECK(cudaMemsetAsync(L.k_ctx, 0, bytes, stream_));
     CUDA_CHECK(cudaMemsetAsync(L.v_ctx, 0, bytes, stream_));
     L.ctx_pos = is_local(l) ? i32s(kd::WINDOW) : nullptr;
@@ -172,7 +166,7 @@ Drafter::Drafter(const std::filesystem::path& model_dir, const Weights& w, int m
   accept_.resid = f32s(V_);
   accept_.uniforms = f32s(GAMMA);
   accept_.ws = f32s(kd::sampled_accept_workspace_floats(V_));
-  accept_.result = static_cast<kd::AcceptResult*>(alloc(sizeof(kd::AcceptResult)));
+  accept_.result = static_cast<kd::AcceptResult*>(heap_.alloc(sizeof(kd::AcceptResult)));
 
   reset();
   CUDA_CHECK(cudaStreamSynchronize(stream_));
@@ -186,36 +180,27 @@ Drafter::~Drafter() {
 
 void Drafter::load(const std::filesystem::path& model_dir) {
   SafetensorsFile f(model_dir / "mtp.safetensors");
-  // Whole data region on the device, then the persistent (aligned, derived) tensors from it.
-  const std::uint64_t base = f.data_offset();
-  DeviceBuffer raw(f.file_size() - base);
-  {
-    std::vector<UploadRequest> reqs;
-    for (const SafetensorsTensor& t : f.tensors())
-      reqs.push_back(upload_request(f, t, static_cast<std::byte*>(raw.p) + (t.offset - base)));
-    DeviceUploader up(UploadOptions{std::size_t(16) << 20, 4, 4});
-    up.upload(reqs, stream_);
-  }
-  auto src = [&](const std::string& name, std::initializer_list<std::int64_t> shape) {
+  // [Agent] Every tensor is uploaded straight into its persistent buffer (or into the BF16 staging of an FP8
+  // conversion), never through a device copy of the whole file: that copy (606 MiB) was live next to the target's
+  // weights and KV at startup and set the server's peak once the steady state shrank below it.
+  DeviceUploader up(UploadOptions{std::size_t(16) << 20, 4, 4});
+  auto request = [&](const std::string& name, const std::vector<std::int64_t>& shape, void* dst) {
     const SafetensorsTensor& t = f.at(name);
-    if (t.dtype != "BF16") throw std::runtime_error("mtp.safetensors: " + name + " is not BF16");
-    if (!std::equal(t.shape.begin(), t.shape.end(), shape.begin(), shape.end()))
-      throw std::runtime_error("mtp.safetensors: unexpected shape of " + name);
-    return static_cast<const std::byte*>(raw.p) + (t.offset - base);
+    if (t.dtype != "BF16" || t.shape != shape) throw std::runtime_error("mtp.safetensors: unexpected " + name);
+    return upload_request(f, t, dst);
   };
-  // Copies tensors (concatenated along rows) into one new aligned device buffer.
+  // Uploads tensors (concatenated along rows) into one new aligned device buffer.
   auto persist = [&](std::initializer_list<std::pair<std::string, std::vector<std::int64_t>>> parts) {
     std::size_t bytes = 0;
     for (const auto& [name, shape] : parts) bytes += f.at(name).bytes;
-    auto* dst = static_cast<std::byte*>(alloc(bytes));
+    auto* dst = static_cast<std::byte*>(heap_.alloc(bytes));
+    std::vector<UploadRequest> reqs;
     std::size_t off = 0;
     for (const auto& [name, shape] : parts) {
-      const SafetensorsTensor& t = f.at(name);
-      if (t.dtype != "BF16" || t.shape != shape) throw std::runtime_error("mtp.safetensors: unexpected " + name);
-      CUDA_CHECK(cudaMemcpyAsync(dst + off, static_cast<const std::byte*>(raw.p) + (t.offset - base), t.bytes,
-                                 cudaMemcpyDeviceToDevice, stream_));
-      off += t.bytes;
+      reqs.push_back(request(name, shape, dst + off));
+      off += f.at(name).bytes;
     }
+    up.upload(reqs, stream_);
     return reinterpret_cast<__nv_bfloat16*>(dst);
   };
   const std::int64_t h = H;
@@ -236,7 +221,7 @@ void Drafter::load(const std::filesystem::path& model_dir) {
       for (int c = 0; c < 4; ++c) s += (e[c] = std::exp(fw[r * 4 + c] - m));
       for (int c = 0; c < 4; ++c) host[r * 4 + c] = __float2bfloat16_rn(e[c] / s);
     }
-    auto* d = static_cast<__nv_bfloat16*>(alloc(sizeof(host)));
+    auto* d = static_cast<__nv_bfloat16*>(heap_.alloc(sizeof(host)));
     CUDA_CHECK(cudaMemcpyAsync(d, host, sizeof(host), cudaMemcpyHostToDevice, stream_));
     CUDA_CHECK(cudaStreamSynchronize(stream_));
     alpha_ = d;
@@ -246,14 +231,14 @@ void Drafter::load(const std::filesystem::path& model_dir) {
   DeviceBuffer cat(std::size_t(2) * I * h * 2);
   auto fp8 = [&](std::initializer_list<std::pair<std::string, std::int64_t>> parts, std::int64_t K = H) {
     std::int64_t rows = 0;
+    std::vector<UploadRequest> reqs;
     for (const auto& [name, r] : parts) {
-      const std::byte* s = src(name, {r, K});
-      CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(cat.p) + rows * K * 2, s, std::size_t(r * K * 2),
-                                 cudaMemcpyDeviceToDevice, stream_));
+      reqs.push_back(request(name, {r, K}, static_cast<std::byte*>(cat.p) + rows * K * 2));
       rows += r;
     }
-    void* q = alloc(std::size_t(rows * K));
-    auto* scale = static_cast<float*>(alloc(std::size_t(rows) * 4));
+    up.upload(reqs, stream_);  // queued after the previous conversion's read of cat
+    void* q = heap_.alloc(std::size_t(rows * K));
+    auto* scale = static_cast<float*>(heap_.alloc(std::size_t(rows) * 4));
     kdense::fp8_rows(static_cast<const __nv_bfloat16*>(cat.p), int(rows), int(K), q, scale, stream_);
     return kdense::Matrix{q, scale, int(rows)};
   };
@@ -287,20 +272,29 @@ void Drafter::load(const std::filesystem::path& model_dir) {
   final_norm_ = persist({{"norm.weight", {h}}});
   mask_embed_ = persist({{"mask_embed", {h}}});
   const std::string mh = "markov_head.";
-  w1_ = persist({{mh + "markov_w1.weight", {f.at(mh + "markov_w1.weight").shape.at(0), kd::RANK}}});
-  if (f.at(mh + "markov_w1.weight").shape.at(0) < V_)
-    throw std::runtime_error("mtp.safetensors: markov_w1 has fewer rows than the vocabulary");
+  {
+    // [Agent] markov_w1 (98 MiB) is read one 512-byte row per draft step. The rows of shortlist tokens, the only
+    // tokens a step past the first can follow, are copied to the device (w1_rows_, built with the shortlist); the
+    // whole table stays in pinned host memory for the anchor's row, one PCIe read per round.
+    const SafetensorsTensor& t = f.at(mh + "markov_w1.weight");
+    if (t.dtype != "BF16" || t.shape.size() != 2 || t.shape[1] != kd::RANK)
+      throw std::runtime_error("mtp.safetensors: unexpected markov_w1");
+    if (t.shape[0] < V_) throw std::runtime_error("mtp.safetensors: markov_w1 has fewer rows than the vocabulary");
+    const std::vector<std::byte> bytes = f.read(mh + "markov_w1.weight");
+    w1_host_ = MappedHostBuffer(bytes.size());
+    std::memcpy(w1_host_.data(), bytes.data(), bytes.size());
+  }
   rnn_w_ = persist({{mh + "rnn_proj.weight", {kd::RNN_OUT, kd::RNN_IN}}});
   rnn_b_ = persist({{mh + "rnn_proj.bias", {kd::RNN_OUT}}});
   f_norm_ = persist({{mh + "dflare_norm.weight", {h}}});
 
   // fold_w / fold_b (FP64, from the unembedding as the decoder stores it)
-  fold_w_ = static_cast<__nv_bfloat16*>(alloc(std::size_t(V_) * kd::RANK * 2));
-  fold_b_ = static_cast<__nv_bfloat16*>(alloc(std::size_t(V_) * 2));
+  fold_w_ = static_cast<__nv_bfloat16*>(heap_.alloc(std::size_t(V_) * kd::RANK * 2));
+  fold_b_ = static_cast<__nv_bfloat16*>(heap_.alloc(std::size_t(V_) * 2));
   const __nv_bfloat16* hw = persist({{mh + "hidden_out.weight", {h, kd::RANK}}});
   const __nv_bfloat16* hb = persist({{mh + "hidden_out.bias", {h}}});
   kd::fold_head(w_.unembed.w.data, head_.scale, V_, hw, hb, fold_w_, fold_b_, stream_);
-  CUDA_CHECK(cudaStreamSynchronize(stream_));  // raw and cat are freed on return
+  CUDA_CHECK(cudaStreamSynchronize(stream_));  // cat is freed on return
 }
 
 void Drafter::reset() {
@@ -332,16 +326,23 @@ void Drafter::note_tokens(std::span<const std::int32_t> ids) {
     }
   if (add.empty()) return;
   const std::size_t row = std::size_t(short_K_ + short_E_);
-  const std::size_t row_bytes = head_.scale ? std::size_t(H) : std::size_t(H) * 2;
-  // pageable sources: copied before cudaMemcpyAsync returns; short_ids_ is free once earlier gathers ran
-  CUDA_CHECK(cudaMemcpyAsync(short_ids_, add.data(), add.size() * 4, cudaMemcpyHostToDevice, stream_));
-  kd::gather_head_rows(head_.w, head_.scale, row_bytes, short_ids_, int(add.size()),
-                       static_cast<std::uint8_t*>(const_cast<void*>(short_head_.w)) + row * row_bytes,
-                       head_.scale ? const_cast<float*>(short_head_.scale) + row : nullptr, short_map_ + row, stream_);
+  // pageable source: copied before cudaMemcpyAsync returns
+  CUDA_CHECK(cudaMemcpyAsync(short_map_ + row, add.data(), add.size() * 4, cudaMemcpyHostToDevice, stream_));
+  put_w1_rows(add, int(row));
   short_extra_.insert(short_extra_.end(), add.begin(), add.end());
   short_E_ += int(add.size());
   const int seg[3] = {0, short_K_ + short_E_, 0};
   CUDA_CHECK(cudaMemcpyAsync(seg_short_, seg, sizeof seg, cudaMemcpyHostToDevice, stream_));
+}
+
+// markov_w1 rows of `ids` into w1_rows_ from shortlist row `row` on (pageable staging: copied before the call returns)
+void Drafter::put_w1_rows(std::span<const std::int32_t> ids, int row) {
+  std::vector<__nv_bfloat16> rows(ids.size() * kd::RANK);
+  const auto* all = static_cast<const __nv_bfloat16*>(w1_host_.data());
+  for (std::size_t i = 0; i < ids.size(); ++i)
+    std::memcpy(rows.data() + i * kd::RANK, all + std::size_t(ids[i]) * kd::RANK, kd::RANK * 2);
+  CUDA_CHECK(cudaMemcpyAsync(w1_rows_ + std::size_t(row) * kd::RANK, rows.data(), rows.size() * 2,
+                             cudaMemcpyHostToDevice, stream_));
 }
 
 void Drafter::set_seed(std::uint64_t seed) { kd::set_seed(params_, seed, stream_); }
@@ -434,11 +435,25 @@ void Drafter::restore_checkpoint(const void* src) {
   if (!prefix) note_tokens(checkpoint_extra_);
 }
 
+namespace {
+constexpr std::size_t CTX_C_BYTES = std::size_t(COMMIT_PIECE) * H * 2;
+constexpr std::size_t CTX_KV_BYTES = std::size_t(COMMIT_PIECE) * 2 * kd::KV_DIM * 2;
+}
+
+std::size_t Drafter::commit_scratch_bytes() const { return CTX_C_BYTES + CTX_KV_BYTES + kd::Bf16Gemm::kWorkspaceBytes; }
+
+void Drafter::lend_commit_scratch(void* p) {
+  auto* b = static_cast<std::byte*>(p);
+  ctx_c_ = reinterpret_cast<__nv_bfloat16*>(b);
+  ctx_kv_ = reinterpret_cast<__nv_bfloat16*>(b + CTX_C_BYTES);
+  gemm_ws_ = b + CTX_C_BYTES + CTX_KV_BYTES;
+}
+
 void Drafter::run_commit(const __nv_bfloat16* feats, int n, int row0, bool last_piece) {
   for (int l = 0; l < 3; ++l) {
     const DraftLayer& L = layers_[l];
     kd::mix_rmsnorm(feats, n, alpha_ + 4 * l, L.ctx_norm, ctx_c_, stream_);
-    gemm_.run(ctx_c_, n, L.wkv_ctx, 2 * kd::KV_DIM, H, ctx_kv_, stream_);
+    gemm_.run(ctx_c_, n, L.wkv_ctx, 2 * kd::KV_DIM, H, ctx_kv_, gemm_ws_, stream_);
     const int size = is_local(l) ? kd::WINDOW : ctx_;
     kd::ctx_kv_store(ctx_kv_, n, params_, row0, n - std::min(n, size), L.k_norm_ctx, L.k_ctx, L.v_ctx,
                      !is_local(l) && GLOBAL_FP8, size, L.ctx_pos, stream_);
@@ -501,10 +516,11 @@ void Drafter::run_layers(int bucket) {
   }
   const __nv_bfloat16* h = xn_ + H;  // rows 1..7
   kdense::proj(h, GAMMA, short_head_, seg_short_, 1, base_, true, stream_);
-  kd::topk_candidates(base_, GAMMA, short_head_.rows, short_map_, cand_val_, cand_idx_, topk_ws_, stream_);
+  kd::topk_candidates(base_, GAMMA, short_head_.rows, short_map_, cand_val_, cand_idx_, cand_row_, topk_ws_, stream_);
   kd::markov_pre(rnn_w_, h, f_rnn_, part_, stream_);
   for (int i = 0; i < GAMMA; ++i) {
-    kd::markov_step(i, rnn_w_, rnn_b_, w1_, part_, picks_, cand_idx_, params_, state_, latent_, stream_);
+    kd::markov_step(i, rnn_w_, rnn_b_, w1_rows_, static_cast<const __nv_bfloat16*>(w1_host_.device_ptr()), part_,
+                    picks_, cand_row_, params_, state_, latent_, stream_);
     kd::markov_logits(i, fold_w_, fold_b_, cand_val_, cand_idx_, latent_, params_, cand_logits_, picks_, stream_);
   }
   kd::markov_finish(cand_idx_, cand_logits_, picks_, prev_cand_, draft_logits_, V_, tokens_, conf_, qstats_, params_,

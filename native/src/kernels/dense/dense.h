@@ -19,6 +19,10 @@ struct Matrix {
   const void* w = nullptr;
   const float* scale = nullptr;
   int rows = 0;
+  // [Agent] Optional int32 [rows]: row r of the matrix is row row_map[r] of `w` (and of `scale`). The drafter's
+  // shortlist head reads its rows straight out of the unembedding this way instead of keeping a 216 MiB copy; each
+  // row is still one contiguous run, so the loads stay coalesced and every dot product keeps its bits. proj only.
+  const int* row_map = nullptr;
 };
 
 // proj: multi-segment GEMV. xin bf16 [3, M, H]; segments int32 device [nseg, 3] = (row_begin, row_end,
@@ -45,10 +49,10 @@ void fp8_rows(const __nv_bfloat16* w, int rows, int K, void* q, float* scale, cu
 // dequant_rows: weights.dequant: out = bf16(float(q) * scale[row]) for FP8 rows [rows, K].
 void dequant_rows(const void* q, const float* scale, int rows, int K, __nv_bfloat16* out, cudaStream_t stream);
 
-// router: x bf16 [M, H]; w [128, H] fp32 (w_fp32) or bf16 holding BF16 values; bias fp32 [128];
+// router: x bf16 [M, H]; w bf16 [128, H]; bias fp32 [128];
 // idx int32 [M, 8] (descending score), wts fp32 [M, 8] = 8 s / (sum s + 1e-20).
-void router(const __nv_bfloat16* x, int M, const void* w, bool w_fp32, const float* bias, int* idx, float* wts,
-            bool pdl, cudaStream_t stream);
+void router(const __nv_bfloat16* x, int M, const __nv_bfloat16* w, const float* bias, int* idx, float* wts, bool pdl,
+            cudaStream_t stream);
 
 // mix: ablated residual update + attention residual over block states + RMS norm (KERNELS.md).
 // Side copies: FP32 rows copied by the same launch (dst + m * dst_stride <- src + m * src_stride, `cols`
@@ -89,10 +93,10 @@ void mix(const MixParams& p, bool pdl, cudaStream_t stream);
 void mix_pair(const MixParams& p, const MixParams& msg, bool pdl, cudaStream_t stream);
 
 // message_gates (loop passes 1-2): h, msg fp32 [G, M, H] (G <= 3; h_shared: every gate reads h[0], i.e. h is
-// [M, H]); w_down bf16 [G, 64, 2H]; w_forget/w_gain [G, H, 64] fp32 (fg_fp32) or bf16; norm_w fp32 [G, H];
+// [M, H]); w_down bf16 [G, 64, 2H]; w_forget/w_gain bf16 [G, H, 64]; norm_w fp32 [G, H];
 // out_bf16 [G, M, H]; out_f32 [G, M, H] (gated, before the norm) or null.
 void message_gates(const float* h, bool h_shared, const float* msg, int G, int M, const __nv_bfloat16* w_down,
-                   const void* w_forget, const void* w_gain, bool fg_fp32, const float* norm_w,
+                   const __nv_bfloat16* w_forget, const __nv_bfloat16* w_gain, const float* norm_w,
                    __nv_bfloat16* out_bf16, float* out_f32, bool pdl, cudaStream_t stream);
 
 // embed: out[m] = float(bf16(rms_norm(float(table[token[m]])) * norm_w)), bit-exact with model.Model.embed.

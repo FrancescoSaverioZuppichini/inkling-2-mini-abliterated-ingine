@@ -141,7 +141,7 @@ bool run(Rng& rng, const Case& cs) {
   a.conv_v_state = dcv.get();
   a.k_cache = cache.dk->get();
   a.v_cache = cache.dv->get();
-  a.cache_fp8 = fp8;
+  a.kv = fp8 ? attn::KvFormat::fp8 : attn::KvFormat::bf16;
   a.cache_rows = rows;
   a.kpos = full ? nullptr : dkpos.get();
   a.pos = dpos.get();

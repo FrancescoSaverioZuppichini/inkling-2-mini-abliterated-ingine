@@ -25,6 +25,7 @@ dense::Matrix matrix(const Dense& d) {
 const float* f32p(const Tensor& t) { return static_cast<const float*>(t.data); }
 float* f32m(const Tensor& t) { return static_cast<float*>(t.data); }
 __nv_bfloat16* bf16m(const Tensor& t) { return static_cast<__nv_bfloat16*>(t.data); }
+const __nv_bfloat16* bf16p(const Tensor& t) { return static_cast<const __nv_bfloat16*>(t.data); }
 
 // fast.proj_layout(full, single_input) as an int32 [S, 3] table (row_begin, row_end, input)
 std::vector<int> proj_layout(bool full, bool single_input) {
@@ -156,10 +157,9 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
     if (msgs) dense::mix_pair(ap, msg_mix, pdl, stream);
     else dense::mix(ap, pdl, stream);
     if (msgs)  // sliding layers mix one query: all three gates read b.mixf[0]
-      dense::message_gates(f32p(b.mixf), !layer.full, f32p(b.msgs), 3, m,
-                           static_cast<const __nv_bfloat16*>(layer.qkv_gate_down.data), layer.qkv_gate_forget16.data,
-                           layer.qkv_gate_gain16.data, false, f32p(layer.attn_norm3), bf16m(b.xin), nullptr, pdl,
-                           stream);
+      dense::message_gates(f32p(b.mixf), !layer.full, f32p(b.msgs), 3, m, bf16p(layer.qkv_gate_down),
+                           bf16p(layer.qkv_gate_forget), bf16p(layer.qkv_gate_gain), f32p(layer.attn_norm3),
+                           bf16m(b.xin), nullptr, pdl, stream);
     // ---- attention
     const bool single = !layer.full && !msgs;
     const DeviceBuffer& seg = layer.full ? full_segments_ : segments_[single ? 0 : 1];
@@ -186,7 +186,7 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
       a.v_conv = f32p(layer.v_static);
       a.k_cache = st.k_full_at(fi).data;
       a.v_cache = st.v_full_at(fi).data;
-      a.cache_fp8 = st.kv_fp8;
+      a.kv = st.kv;
       a.cache_rows = st.max_ctx;
       a.kpos = nullptr;
       a.window = 0;
@@ -197,7 +197,6 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
       a.v_conv = f32p(layer.v_conv);
       a.k_cache = st.k_ring_at(ri).data;
       a.v_cache = st.v_ring_at(ri).data;
-      a.cache_fp8 = false;
       a.cache_rows = WINDOW;
       a.kpos = st.ring_pos_at(ri);
       a.window = WINDOW;
@@ -223,12 +222,11 @@ void Decoder::decode(Buffers& b, const std::int64_t* pos, bool history, cudaStre
     }
     dense::mix(mp, pdl, stream);
     if (msgs)
-      dense::message_gates(f32p(b.mixm), false, f32p(b.msgs) + 3 * slab, 1, m,
-                           static_cast<const __nv_bfloat16*>(layer.mlp1_gate_down.data), layer.mlp1_gate_forget16.data,
-                           layer.mlp1_gate_gain16.data, false, f32p(layer.mlp_norm1), bf16m(b.xm), nullptr, pdl,
-                           stream);
-    dense::router(bf16m(b.xm), m, layer.router_bf16.data, false, f32p(layer.router_bias),
-                  static_cast<int*>(b.idx.data), f32m(b.wts), pdl, stream);
+      dense::message_gates(f32p(b.mixm), false, f32p(b.msgs) + 3 * slab, 1, m, bf16p(layer.mlp1_gate_down),
+                           bf16p(layer.mlp1_gate_forget), bf16p(layer.mlp1_gate_gain), f32p(layer.mlp_norm1),
+                           bf16m(b.xm), nullptr, pdl, stream);
+    dense::router(bf16m(b.xm), m, bf16p(layer.router), f32p(layer.router_bias), static_cast<int*>(b.idx.data),
+                  f32m(b.wts), pdl, stream);
     const Experts& ex = layer.experts;
     const moe::Format fmt = ex.fmt == ExpertFormat::NVFP4 ? moe::Format::NVFP4 : moe::Format::MXFP8;
     moe::moe_up(bf16m(b.xm), m, static_cast<const int*>(b.idx.data), ex.w13.data, ex.w13_scale.data,

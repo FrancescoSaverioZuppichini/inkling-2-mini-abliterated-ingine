@@ -12,4 +12,4 @@ ingine_cuda_target(ingine_core)
 ingine_internal_includes(ingine_core)
 target_include_directories(ingine_core PUBLIC ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/include)
 target_link_libraries(ingine_core PUBLIC
-  CUDA::cudart CUDA::nvtx3 Threads::Threads spdlog::spdlog nlohmann_json::nlohmann_json)
+  CUDA::cudart CUDA::cuda_driver CUDA::nvtx3 Threads::Threads spdlog::spdlog nlohmann_json::nlohmann_json)

@@ -62,16 +62,13 @@ std::vector<float> host_f32(const SafetensorsModel& m, const std::string& name) 
 
 class Loader {
  public:
-  Loader(const SafetensorsModel& m, DeviceUploader& up, cudaStream_t stream, std::vector<DeviceBuffer>& storage)
-      : m_(m), up_(up), stream_(stream), storage_(storage) {}
+  Loader(const SafetensorsModel& m, DeviceUploader& up, cudaStream_t stream, DeviceHeap& heap)
+      : heap(heap), m_(m), up_(up), stream_(stream) {}
 
-  void* alloc(std::size_t bytes) {
-    storage_.emplace_back(bytes);
-    return storage_.back().p;
-  }
+  DeviceHeap& heap;
 
   Tensor upload_f32(const std::vector<float>& host, std::initializer_list<std::int32_t> shape) {
-    void* d = alloc(host.size() * 4);
+    void* d = heap.alloc(host.size() * 4);
     CUDA_CHECK(cudaMemcpy(d, host.data(), host.size() * 4, cudaMemcpyHostToDevice));
     return rm(d, DType::FP32, shape);
   }
@@ -79,7 +76,7 @@ class Loader {
   Tensor upload_bf16(const std::vector<float>& host, std::initializer_list<std::int32_t> shape) {
     std::vector<std::uint16_t> b(host.size());
     for (std::size_t i = 0; i < host.size(); ++i) b[i] = float_to_bf16_bits(host[i]);
-    void* d = alloc(b.size() * 2);
+    void* d = heap.alloc(b.size() * 2);
     CUDA_CHECK(cudaMemcpy(d, b.data(), b.size() * 2, cudaMemcpyHostToDevice));
     return rm(d, DType::BF16, shape);
   }
@@ -100,7 +97,7 @@ class Loader {
   // Raw checkpoint tensor (any dtype) in new device memory, uploaded at flush().
   Tensor raw(const std::string& name) {
     const SafetensorsRef ref = m_.at(name);
-    void* d = alloc(ref->bytes);
+    void* d = heap.alloc(ref->bytes);
     queue(name, d);
     return ref->view(d);
   }
@@ -117,7 +114,6 @@ class Loader {
   const SafetensorsModel& m_;
   DeviceUploader& up_;
   cudaStream_t stream_;
-  std::vector<DeviceBuffer>& storage_;
   std::vector<UploadRequest> pending_;
 };
 
@@ -151,8 +147,8 @@ std::array<ExpertFormat, LAYERS> expert_formats(const fs::path& model_dir) {
 
 // FP8 rows + scales of a BF16 matrix (dense fp8_rows), into new storage.
 Dense to_fp8(Loader& ld, const Tensor& bf16, int rows, int cols) {
-  void* q = ld.alloc(std::size_t(rows) * cols);
-  float* s = static_cast<float*>(ld.alloc(std::size_t(rows) * 4));
+  void* q = ld.heap.alloc(std::size_t(rows) * cols);
+  float* s = static_cast<float*>(ld.heap.alloc(std::size_t(rows) * 4));
   kernels::dense::fp8_rows(static_cast<const __nv_bfloat16*>(bf16.data), rows, cols, q, s, ld.stream());
   return Dense{rm(q, DType::FP8_E4M3FN, {rows, cols}), rm(s, DType::FP32, {rows})};
 }
@@ -200,11 +196,11 @@ Layer load_layer_into(Loader& ld, int l, ExpertFormat fmt, bool dense_fp8) {
     ld.queue(name, dst);
   };
   {
-    void* d = dense_fp8 ? (proj_tmp = DeviceBuffer(std::size_t(R) * H * 2)).p : ld.alloc(std::size_t(R) * H * 2);
+    void* d = dense_fp8 ? (proj_tmp = DeviceBuffer(std::size_t(R) * H * 2)).p : ld.heap.alloc(std::size_t(R) * H * 2);
     for (int s = 0; s < num_segs(layer.full); ++s)
       queue_bf16_rows(p + seg_names[s], static_cast<char*>(d) + std::size_t(SEG_BEGIN[s]) * H * 2, SEG_ROWS[s], H);
     wproj_bf16 = rm(d, DType::BF16, {R, H});
-    void* o = dense_fp8 ? (wo_tmp = DeviceBuffer(std::size_t(H) * 3072 * 2)).p : ld.alloc(std::size_t(H) * 3072 * 2);
+    void* o = dense_fp8 ? (wo_tmp = DeviceBuffer(std::size_t(H) * 3072 * 2)).p : ld.heap.alloc(std::size_t(H) * 3072 * 2);
     queue_bf16_rows(p + "attn.wo_ud.weight", o, H, HEADS * HEAD_DIM);
     wo_bf16 = rm(o, DType::BF16, {H, HEADS * HEAD_DIM});
   }
@@ -221,9 +217,8 @@ Layer load_layer_into(Loader& ld, int l, ExpertFormat fmt, bool dense_fp8) {
   }
   layer.attn_conv = ld.f32(p + "attn_sconv.weight", {H, CONV_K});
   layer.mlp_conv = ld.f32(p + "mlp_sconv.weight", {H, CONV_K});
-  layer.router = ld.f32(p + "mlp.gate.weight", {EXPERTS, H});
   layer.router_bias = ld.f32(p + "mlp.gate.bias", {EXPERTS});
-  layer.router_bf16 = ld.upload_bf16(host_f32(m, p + "mlp.gate.weight"), {EXPERTS, H});  // exact
+  layer.router = ld.upload_bf16(host_f32(m, p + "mlp.gate.weight"), {EXPERTS, H});  // exact
   if (l > 0) {
     const std::string qn = "model.llm.attn_res.attn_queries." + std::to_string(l - 1);
     const std::int32_t nq = std::int32_t(m.at(qn)->numel() / H);
@@ -266,30 +261,17 @@ Layer load_layer_into(Loader& ld, int l, ExpertFormat fmt, bool dense_fp8) {
     };
     const int D2 = 2 * H;
     layer.qkv_gate_down = ld.upload_bf16(stack(down, 3), {3, GATE_RANK, D2});  // exact (BF16 checkpoint)
-    layer.qkv_gate_forget = ld.upload_f32(stack(forget, 3), {3, H, GATE_RANK});
-    layer.qkv_gate_gain = ld.upload_f32(stack(gain, 3), {3, H, GATE_RANK});
-    layer.qkv_gate_forget16 = ld.upload_bf16(stack(forget, 3), {3, H, GATE_RANK});
-    layer.qkv_gate_gain16 = ld.upload_bf16(stack(gain, 3), {3, H, GATE_RANK});
+    layer.qkv_gate_forget = ld.upload_bf16(stack(forget, 3), {3, H, GATE_RANK});
+    layer.qkv_gate_gain = ld.upload_bf16(stack(gain, 3), {3, H, GATE_RANK});
     layer.mlp1_gate_down = ld.upload_bf16(down[3], {1, GATE_RANK, D2});
-    layer.mlp1_gate_forget = ld.upload_f32(forget[3], {1, H, GATE_RANK});
-    layer.mlp1_gate_gain = ld.upload_f32(gain[3], {1, H, GATE_RANK});
-    layer.mlp1_gate_forget16 = ld.upload_bf16(forget[3], {1, H, GATE_RANK});
-    layer.mlp1_gate_gain16 = ld.upload_bf16(gain[3], {1, H, GATE_RANK});
-    auto at = [](const Tensor& stack, int g, DType dt, std::int32_t a, std::int32_t b) {
-      const std::size_t es = dt == DType::FP32 ? 4 : 2;
-      return rm(static_cast<char*>(stack.data) + std::size_t(g) * a * b * es, dt, {a, b});
+    layer.mlp1_gate_forget = ld.upload_bf16(forget[3], {1, H, GATE_RANK});
+    layer.mlp1_gate_gain = ld.upload_bf16(gain[3], {1, H, GATE_RANK});
+    auto at = [](const Tensor& stack, int g, std::int32_t a, std::int32_t b) {
+      return rm(static_cast<char*>(stack.data) + std::size_t(g) * a * b * 2, DType::BF16, {a, b});
     };
     Tensor* downs[3] = {&layer.q_gate_down, &layer.k_gate_down, &layer.v_gate_down};
-    Tensor* forgets[3] = {&layer.q_gate_forget, &layer.k_gate_forget, &layer.v_gate_forget};
-    Tensor* gains[3] = {&layer.q_gate_gain, &layer.k_gate_gain, &layer.v_gate_gain};
-    for (int g = 0; g < 3; ++g) {
-      *downs[g] = at(layer.qkv_gate_down, g, DType::BF16, GATE_RANK, D2);
-      *forgets[g] = at(layer.qkv_gate_forget, g, DType::FP32, H, GATE_RANK);
-      *gains[g] = at(layer.qkv_gate_gain, g, DType::FP32, H, GATE_RANK);
-    }
-    layer.mlp_gate_down = at(layer.mlp1_gate_down, 0, DType::BF16, GATE_RANK, D2);
-    layer.mlp_gate_forget = at(layer.mlp1_gate_forget, 0, DType::FP32, H, GATE_RANK);
-    layer.mlp_gate_gain = at(layer.mlp1_gate_gain, 0, DType::FP32, H, GATE_RANK);
+    for (int g = 0; g < 3; ++g) *downs[g] = at(layer.qkv_gate_down, g, GATE_RANK, D2);
+    layer.mlp_gate_down = at(layer.mlp1_gate_down, 0, GATE_RANK, D2);
   }
 
   // routed experts in checkpoint encoding
@@ -338,8 +320,7 @@ Weights load_weights(const fs::path& model_dir, bool dense_fp8, bool embed_host,
   Weights w;
   w.dense_fp8 = dense_fp8;
   w.expert_formats = expert_formats(model_dir);
-  w.storage.reserve(4096);
-  Loader ld(m, up, stream, w.storage);
+  Loader ld(m, up, stream, w.heap);
   const int H = HIDDEN;
   for (int l = 0; l < LAYERS; ++l) w.layers.push_back(load_layer_into(ld, l, w.expert_formats[l], dense_fp8));
 
@@ -375,7 +356,7 @@ Weights load_weights(const fs::path& model_dir, bool dense_fp8, bool embed_host,
     const std::string name = "model.llm.unembed.weight";
     if (m.at(name)->dtype != "BF16") throw std::runtime_error("weights: unembed must be BF16");
     const std::size_t bytes = std::size_t(UNPADDED_VOCAB) * H * 2;
-    void* d = dense_fp8 ? (unembed_tmp = DeviceBuffer(bytes)).p : ld.alloc(bytes);
+    void* d = dense_fp8 ? (unembed_tmp = DeviceBuffer(bytes)).p : ld.heap.alloc(bytes);
     ld.queue(name, d, UNPADDED_VOCAB);  // unembed[:UNPADDED_VOCAB]
     ld.flush();
     const Tensor bf = rm(d, DType::BF16, {UNPADDED_VOCAB, H});
@@ -390,12 +371,11 @@ Weights load_weights(const fs::path& model_dir, bool dense_fp8, bool embed_host,
   return w;
 }
 
-Layer load_layer(const fs::path& model_dir, int l, bool dense_fp8, cudaStream_t stream,
-                 std::vector<DeviceBuffer>& storage) {
+Layer load_layer(const fs::path& model_dir, int l, bool dense_fp8, cudaStream_t stream, DeviceHeap& heap) {
   if (l < 0 || l >= LAYERS) throw std::invalid_argument("load_layer: layer out of range");
   const SafetensorsModel m(model_dir);
   DeviceUploader up;
-  Loader ld(m, up, stream, storage);
+  Loader ld(m, up, stream, heap);
   Layer layer = load_layer_into(ld, l, expert_formats(model_dir)[l], dense_fp8);
   CUDA_CHECK(cudaStreamSynchronize(stream));
   return layer;

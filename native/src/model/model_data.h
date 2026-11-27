@@ -10,6 +10,7 @@
 #include "core/arena.h"
 #include "core/host_memory.h"
 #include "core/tensor.h"
+#include "ingine/generator.h"
 
 #include <array>
 #include <cstdint>
@@ -167,22 +168,17 @@ struct Layer {
   Tensor k_static, v_static;  // full: fp32 [4, 1024] by lag (row 0 = current token)
   Tensor k_conv, v_conv;      // sliding: fp32 [1024, 4] conv1d order (tap 3 = current token)
   Tensor attn_conv, mlp_conv;  // fp32 [H, 4]
-  Tensor router;       // fp32 [128, H]
   Tensor router_bias;  // fp32 [128]
-  Tensor router_bf16;  // bf16 [128, H] (exact copy of the checkpoint values)
+  Tensor router;       // bf16 [128, H] (the checkpoint values)
   Tensor attn_query;   // fp32 [Q, H] (Q = 3 full, 1 sliding), layers > 0
   Tensor mlp_query;    // fp32 [1, H]
 
   // loop layers: message gates. Stacks the kernels take, with per-gate views into them.
   Tensor qkv_gate_down;                      // bf16 [3, 64, 2H]
-  Tensor qkv_gate_forget, qkv_gate_gain;     // fp32 [3, H, 64]
-  Tensor qkv_gate_forget16, qkv_gate_gain16; // bf16 [3, H, 64]
+  Tensor qkv_gate_forget, qkv_gate_gain;     // bf16 [3, H, 64]
   Tensor mlp1_gate_down;                     // bf16 [1, 64, 2H] (= mlp_gate_down)
-  Tensor mlp1_gate_forget, mlp1_gate_gain;   // fp32 [1, H, 64]
-  Tensor mlp1_gate_forget16, mlp1_gate_gain16;
+  Tensor mlp1_gate_forget, mlp1_gate_gain;   // bf16 [1, H, 64]
   Tensor q_gate_down, k_gate_down, v_gate_down, mlp_gate_down;          // bf16 [64, 2H] views
-  Tensor q_gate_forget, k_gate_forget, v_gate_forget, mlp_gate_forget;  // fp32 [H, 64] views
-  Tensor q_gate_gain, k_gate_gain, v_gate_gain, mlp_gate_gain;          // fp32 [H, 64] views
 
   // stacked norm weights (fast._stack_layer_params)
   Tensor attn_norm3;     // fp32 [3, H]: (q, k, v) norms, or attn_norm three times
@@ -204,7 +200,7 @@ struct Weights {
   std::array<ExpertFormat, LAYERS> expert_formats{};
   bool dense_fp8 = false;     // wproj (+ views), wo and unembed are FP8 rows
 
-  std::vector<DeviceBuffer> storage;  // device allocations behind the views
+  DeviceHeap heap;                    // device memory behind the views (one packed range)
   MappedHostBuffer embed_host;        // the embedding table when it is kept in host memory
 };
 
@@ -228,10 +224,10 @@ struct Ablation {
 // model.State: per-request caches.
 struct State {
   int max_ctx = 0;
-  bool kv_fp8 = false;
+  KvFormat kv = KvFormat::bf16;
   Tensor k_ring, v_ring;      // bf16 [40, 1024, 8, 128] (sliding visits, RING_INDEX)
   Tensor ring_pos;            // int64 [40, 1024], absolute position per slot, -1 = empty
-  Tensor k_full, v_full;      // bf16 or fp8 e4m3 [8, max_ctx, 8, 128] (full visits, FULL_INDEX)
+  Tensor k_full, v_full;      // bf16 or fp8 e4m3 [8, max_ctx, 8, 128]; int4 u8 [8, bytes] (full visits, FULL_INDEX)
   Tensor conv_k, conv_v;      // fp32 [48, 3, 1024] previous 3 key/value conv inputs (oldest first)
   Tensor conv_attn, conv_mlp; // fp32 [48, 3, H]
   int length = 0;             // tokens in the context (host copy; decode steps do not advance it)

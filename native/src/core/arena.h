@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <functional>
 #include <initializer_list>
+#include <vector>
 
 namespace ingine {
 
@@ -53,6 +54,35 @@ using ReleaseHook = std::function<bool()>;
 int add_release_hook(ReleaseHook hook);
 void remove_release_hook(int id);
 void fail_next_allocations(int n);
+
+// [Agent] Long-lived buffers packed back to back in one virtual address range that is backed by physical memory 2 MiB
+// at a time (CUDA virtual memory management). One cudaMalloc per tensor rounds every allocation of 2 MiB or more up to
+// a whole number of 2 MiB pages and puts small ones in pools: on Inkling's ~1,000 weight and drafter tensors that wasted
+// ~150 MiB. Here the only slack is the tail of the last page. Buffers are never freed one by one: the heap releases
+// everything when it is destroyed. Kernels see ordinary device pointers, so values and speed do not change.
+class DeviceHeap {
+public:
+    DeviceHeap() noexcept = default;
+    ~DeviceHeap();
+    DeviceHeap(const DeviceHeap&)            = delete;
+    DeviceHeap& operator=(const DeviceHeap&) = delete;
+    DeviceHeap(DeviceHeap&& other) noexcept;
+    DeviceHeap& operator=(DeviceHeap&& other) noexcept;
+
+    // Zero-filled is not promised: like cudaMalloc, contents start undefined.
+    void* alloc(std::size_t bytes, std::size_t align = 256);
+    std::size_t used() const noexcept { return off_; }
+    std::size_t mapped() const noexcept { return mapped_; }
+
+private:
+    void release() noexcept;
+
+    std::uintptr_t base_  = 0;  // CUdeviceptr of the reservation
+    std::size_t reserved_ = 0, mapped_ = 0, off_ = 0, gran_ = 0;
+    int device_           = 0;
+    std::vector<unsigned long long> handles_;  // CUmemGenericAllocationHandle per mapped piece
+    std::vector<std::size_t> sizes_;
+};
 
 class DeviceArena {
 public:

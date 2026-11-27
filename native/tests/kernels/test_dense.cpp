@@ -163,7 +163,7 @@ bool test_head(Rng& rng, int M, bool fp8) {
 
 // ties: groups of experts with identical rows and biases (identical scores, the lower index must win), one
 // group pushed into the top 8 so that the tie straddles the cut; some biases below -1 (negative scores).
-bool test_router(Rng& rng, int M, bool wf32, bool ties = false) {
+bool test_router(Rng& rng, int M, bool ties = false) {
   std::vector<float> w = randn_bf16(rng, size_t(128) * H, 0.02);
   std::vector<float> bias = randn(rng, 128, 0.1);
   if (ties) {
@@ -181,10 +181,9 @@ bool test_router(Rng& rng, int M, bool wf32, bool ties = false) {
   }
   const std::vector<float> x = randn_bf16(rng, size_t(M) * H, 1.0);
   DeviceArray<__nv_bfloat16> dx(to_bf16(x)), dwb(to_bf16(w));
-  DeviceArray<float> dwf(w), db(bias), wts(size_t(M) * 8);
+  DeviceArray<float> db(bias), wts(size_t(M) * 8);
   DeviceArray<int> idx(size_t(M) * 8);
-  dense::router(dx.get(), M, wf32 ? static_cast<const void*>(dwf.get()) : static_cast<const void*>(dwb.get()), wf32,
-                db.get(), idx.get(), wts.get(), true, g_stream);
+  dense::router(dx.get(), M, dwb.get(), db.get(), idx.get(), wts.get(), true, g_stream);
   sync();
   const auto gi = idx.download();
   const auto gw = wts.download();
@@ -208,8 +207,8 @@ bool test_router(Rng& rng, int M, bool wf32, bool ties = false) {
       rw[size_t(m) * 8 + k] = s[order[k]] / (sum + 1e-20) * 8.0;
     }
   }
-  std::printf("%s router M=%d %s%s: expert ids %s\n", ok ? "PASS" : "FAIL", M, wf32 ? "fp32" : "bf16",
-              ties ? " ties" : "", ok ? "match" : "differ");
+  std::printf("%s router M=%d%s: expert ids %s\n", ok ? "PASS" : "FAIL", M, ties ? " ties" : "",
+              ok ? "match" : "differ");
   return Check{"router weights", 1e-5, 1e-6, 1.0}(gw, rw) && ok;
 }
 
@@ -367,19 +366,17 @@ bool test_mix(Rng& rng, int M, const MixCase& c) {
   return ok;
 }
 
-bool test_gates(Rng& rng, int G, int M, bool fg32, bool h_shared = false) {
+bool test_gates(Rng& rng, int G, int M, bool h_shared = false) {
   const size_t n = size_t(G) * M * H;
   const std::vector<float> h = randn(rng, h_shared ? size_t(M) * H : n, 1.0), msg = randn(rng, n, 1.0);
   const std::vector<float> wd = randn_bf16(rng, size_t(G) * 64 * 2 * H, 0.02);
   const std::vector<float> wf = randn_bf16(rng, size_t(G) * H * 64, 0.1), wg = randn_bf16(rng, size_t(G) * H * 64, 0.1);
   std::vector<float> nw = randn(rng, size_t(G) * H, 0.1);
   for (auto& v : nw) v += 1.f;
-  DeviceArray<float> dh(h), dm(msg), dwf32(wf), dwg32(wg), dn(nw), of(n);
+  DeviceArray<float> dh(h), dm(msg), dn(nw), of(n);
   DeviceArray<__nv_bfloat16> dwd(to_bf16(wd)), dwf16(to_bf16(wf)), dwg16(to_bf16(wg)), ob(n);
-  dense::message_gates(dh.get(), h_shared, dm.get(), G, M, dwd.get(),
-                       fg32 ? (const void*)dwf32.get() : (const void*)dwf16.get(),
-                       fg32 ? (const void*)dwg32.get() : (const void*)dwg16.get(), fg32, dn.get(), ob.get(), of.get(),
-                       true, g_stream);
+  dense::message_gates(dh.get(), h_shared, dm.get(), G, M, dwd.get(), dwf16.get(), dwg16.get(), dn.get(), ob.get(),
+                       of.get(), true, g_stream);
   sync();
   std::vector<double> gated(n), out(n), outr(n);
   for (int g = 0; g < G; ++g)
@@ -413,8 +410,7 @@ bool test_gates(Rng& rng, int G, int M, bool fg32, bool h_shared = false) {
       }
     }
   char what[64];
-  std::snprintf(what, sizeof what, "message_gates G=%d M=%d %s%s", G, M, fg32 ? "fp32" : "bf16",
-                h_shared ? " shared-h" : "");
+  std::snprintf(what, sizeof what, "message_gates G=%d M=%d%s", G, M, h_shared ? " shared-h" : "");
   // the BF16 roundings of the normalised inputs and of g may flip against the oracle: loose bounds
   bool ok = Check{(std::string(what) + " gated").c_str(), 2e-3, 2e-3, 1.0}(of.download(), gated);
   ok &= Check{(std::string(what) + " out").c_str(), 1.0 / 64, 4e-3, 0.05}(bf16_download(ob), out, &outr);
@@ -596,8 +592,8 @@ uint64_t lock_gates(LockGen& g, int M) {
     DeviceArray<__nv_bfloat16> wd(to_bf16(g.vec_bf16(size_t(G) * 64 * 2 * H, 0.04f)));
     DeviceArray<__nv_bfloat16> wf(to_bf16(g.vec_bf16(size_t(G) * H * 64, 0.2f))), wg(to_bf16(g.vec_bf16(size_t(G) * H * 64, 0.2f)));
     DeviceArray<__nv_bfloat16> ob(n);
-    dense::message_gates(h.get(), shared, msg.get(), G, M, wd.get(), wf.get(), wg.get(), false, nw.get(), ob.get(),
-                         of.get(), true, g_stream);
+    dense::message_gates(h.get(), shared, msg.get(), G, M, wd.get(), wf.get(), wg.get(), nw.get(), ob.get(), of.get(),
+                         true, g_stream);
     sync();
     f.add(ob.download()), f.add(of.download());
   }
@@ -613,7 +609,7 @@ uint64_t lock_router(LockGen& g, int M) {
   DeviceArray<__nv_bfloat16> x(to_bf16(g.vec_bf16(size_t(M) * H, 2.f))), dw(to_bf16(w));
   DeviceArray<float> db(bias), wts(size_t(M) * 8);
   DeviceArray<int> idx(size_t(M) * 8);
-  dense::router(x.get(), M, dw.get(), false, db.get(), idx.get(), wts.get(), true, g_stream);
+  dense::router(x.get(), M, dw.get(), db.get(), idx.get(), wts.get(), true, g_stream);
   sync();
   Fnv f;
   f.add(idx.download()), f.add(wts.download());
@@ -683,12 +679,10 @@ int main() {
   for (int M : {1, 8}) {
     ok &= test_head(rng, M, false);
     ok &= test_head(rng, M, true);
-    ok &= test_router(rng, M, true);
-    ok &= test_router(rng, M, false);
+    ok &= test_router(rng, M);
   }
-  ok &= test_router(rng, 3, false);
-  ok &= test_router(rng, 2, false, true);
-  ok &= test_router(rng, 8, true, true);
+  ok &= test_router(rng, 3);
+  ok &= test_router(rng, 2, true);
   const MixCase cases[] = {
       {0, 1, true, false, false, true, false, false},   // layer 0: base only, no mix
       {0, 1, true, true, true, true, true, true},       // skip path with an ablated write
@@ -710,12 +704,10 @@ int main() {
   };
   for (int M : {1, 3})
     for (const auto& c : cases) ok &= test_mix(rng, M, c);
-  ok &= test_gates(rng, 3, 1, false);
-  ok &= test_gates(rng, 3, 2, true);
-  ok &= test_gates(rng, 1, 8, false);
-  ok &= test_gates(rng, 3, 4, false, true);
-  ok &= test_gates(rng, 3, 8, false, true);
-  ok &= test_gates(rng, 1, 5, true);  // FP32 forget/gain with several tokens: one staging buffer
+  ok &= test_gates(rng, 3, 1);
+  ok &= test_gates(rng, 1, 8);
+  ok &= test_gates(rng, 3, 4, true);
+  ok &= test_gates(rng, 3, 8, true);
   for (int M : {1, 3, 8}) ok &= test_embed(rng, M);
   ok &= test_fp8_rows(rng);
   ok &= test_bit_lock();

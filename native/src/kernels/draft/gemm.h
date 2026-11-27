@@ -15,12 +15,16 @@ namespace ingine::kernels::draft {
 
 class Bf16Gemm {
  public:
-  explicit Bf16Gemm(std::size_t workspace_bytes = std::size_t(32) << 20);
+  // [Agent] Every call takes a workspace of kWorkspaceBytes the caller owns (the drafter's lives in memory dead while
+  // prompt chunks run). Its size, not its address, steers cuBLASLt's algorithm choice, so results do not depend on it.
+  static constexpr std::size_t kWorkspaceBytes = std::size_t(32) << 20;
+
+  Bf16Gemm();
   ~Bf16Gemm();
   Bf16Gemm(const Bf16Gemm&) = delete;
   Bf16Gemm& operator=(const Bf16Gemm&) = delete;
 
-  void run(const __nv_bfloat16* a, int n, const __nv_bfloat16* w, int N, int K, __nv_bfloat16* c,
+  void run(const __nv_bfloat16* a, int n, const __nv_bfloat16* w, int N, int K, __nv_bfloat16* c, void* workspace,
            cudaStream_t stream);
 
  private:
@@ -32,8 +36,6 @@ class Bf16Gemm {
   Plan& plan(int n, int N, int K);
 
   cublasLtHandle_t handle_ = nullptr;
-  void* workspace_ = nullptr;
-  std::size_t workspace_bytes_ = 0;
   std::map<std::tuple<int, int, int>, Plan> plans_;
 };
 

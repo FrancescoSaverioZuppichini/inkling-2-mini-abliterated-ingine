@@ -40,13 +40,13 @@ constexpr int H = HIDDEN;
 
 struct Gen {
   Rng rng{77};
-  std::vector<DeviceBuffer>& st;
+  DeviceHeap& heap;
   cudaStream_t stream;
 
   void* up(const void* host, std::size_t bytes) {
-    st.emplace_back(bytes);
-    st.back().copy_from_host(host, bytes);
-    return st.back().p;
+    void* d = heap.alloc(bytes);
+    INGINE_TEST_CUDA(cudaMemcpy(d, host, bytes, cudaMemcpyHostToDevice));
+    return d;
   }
   Tensor f32(std::initializer_list<std::int32_t> shape, double sd, double mean = 0) {
     std::size_t n = 1;
@@ -64,10 +64,8 @@ struct Gen {
   }
   Dense fp8(int rows, int cols, double sd) {
     const Tensor b = bf16({rows, cols}, sd);
-    st.emplace_back(std::size_t(rows) * cols);
-    void* q = st.back().p;
-    st.emplace_back(std::size_t(rows) * 4);
-    float* s = static_cast<float*>(st.back().p);
+    void* q = heap.alloc(std::size_t(rows) * cols);
+    float* s = static_cast<float*>(heap.alloc(std::size_t(rows) * 4));
     kernels::dense::fp8_rows(static_cast<const __nv_bfloat16*>(b.data), rows, cols, q, s, stream);
     INGINE_TEST_CUDA(cudaStreamSynchronize(stream));
     return Dense{rm(q, DType::FP8_E4M3FN, {rows, cols}), rm(s, DType::FP32, {rows})};
@@ -83,8 +81,7 @@ struct Gen {
 
 Weights synthetic_weights(cudaStream_t stream) {
   Weights w;
-  w.storage.reserve(1024);
-  Gen g{Rng(77), w.storage, stream};
+  Gen g{Rng(77), w.heap, stream};
   w.dense_fp8 = true;
   // experts shared by every layer (NVFP4); only experts 0..7 exist, the router bias selects exactly them
   Experts ex;
@@ -121,7 +118,7 @@ Weights synthetic_weights(cudaStream_t stream) {
     }
     L.attn_conv = g.f32({H, CONV_K}, 0.3);
     L.mlp_conv = g.f32({H, CONV_K}, 0.3);
-    L.router_bf16 = g.bf16({EXPERTS, H}, 0.02);
+    L.router = g.bf16({EXPERTS, H}, 0.02);
     L.router_bias = router_bias;
     if (l > 0) L.attn_query = g.f32({L.full ? 3 : 1, H}, 0.05);
     L.mlp_query = g.f32({1, H}, 0.05);
@@ -130,11 +127,11 @@ Weights synthetic_weights(cudaStream_t stream) {
     L.mlp_norm1 = ones1;
     if (L.loop) {
       L.qkv_gate_down = g.bf16({3, GATE_RANK, 2 * H}, 0.02);
-      L.qkv_gate_forget16 = g.bf16({3, H, GATE_RANK}, 0.1);
-      L.qkv_gate_gain16 = g.bf16({3, H, GATE_RANK}, 0.1);
+      L.qkv_gate_forget = g.bf16({3, H, GATE_RANK}, 0.1);
+      L.qkv_gate_gain = g.bf16({3, H, GATE_RANK}, 0.1);
       L.mlp1_gate_down = g.bf16({1, GATE_RANK, 2 * H}, 0.02);
-      L.mlp1_gate_forget16 = g.bf16({1, H, GATE_RANK}, 0.1);
-      L.mlp1_gate_gain16 = g.bf16({1, H, GATE_RANK}, 0.1);
+      L.mlp1_gate_forget = g.bf16({1, H, GATE_RANK}, 0.1);
+      L.mlp1_gate_gain = g.bf16({1, H, GATE_RANK}, 0.1);
     }
     L.experts = ex;
     w.layers.push_back(L);
@@ -149,10 +146,8 @@ Weights synthetic_weights(cudaStream_t stream) {
   // the random rows, so greedy and top-k sampled tokens stay below kVocab
   const Dense used = g.fp8(kVocab, H, 0.05);
   const std::size_t q_bytes = std::size_t(UNPADDED_VOCAB) * H, s_bytes = std::size_t(UNPADDED_VOCAB) * 4;
-  w.storage.emplace_back(q_bytes);
-  void* q = w.storage.back().p;
-  w.storage.emplace_back(s_bytes);
-  void* sc = w.storage.back().p;
+  void* q = w.heap.alloc(q_bytes);
+  void* sc = w.heap.alloc(s_bytes);
   INGINE_TEST_CUDA(cudaMemsetAsync(q, 0, q_bytes, stream));
   INGINE_TEST_CUDA(cudaMemsetAsync(sc, 0, s_bytes, stream));
   INGINE_TEST_CUDA(cudaMemcpyAsync(q, used.w.data, std::size_t(kVocab) * H, cudaMemcpyDeviceToDevice, stream));
@@ -231,7 +226,7 @@ bool run(bool kv_fp8) {
   RuntimeOptions opt;
   opt.max_ctx = 2048;
   opt.spec = true;
-  opt.kv_fp8 = kv_fp8;
+  opt.kv = kv_fp8 ? KvFormat::fp8 : KvFormat::bf16;
   cudaStream_t s0;
   INGINE_TEST_CUDA(cudaStreamCreate(&s0));
   Weights w = synthetic_weights(s0);
@@ -546,7 +541,7 @@ bool run(bool kv_fp8) {
 bool run_generator() {
   RuntimeOptions opt;
   opt.max_ctx = 2048;
-  opt.kv_fp8 = true;
+  opt.kv = KvFormat::fp8;
   opt.prefill_chunk = 64;
   cudaStream_t s0;
   INGINE_TEST_CUDA(cudaStreamCreate(&s0));
@@ -727,7 +722,7 @@ bool run_ablation_layouts() {
   auto tokens = [&](const std::filesystem::path& ablation) {
     RuntimeOptions opt;
     opt.max_ctx = 2048;
-    opt.kv_fp8 = true;
+    opt.kv = KvFormat::fp8;
     opt.prefill_chunk = 64;
     cudaStream_t s0;
     INGINE_TEST_CUDA(cudaStreamCreate(&s0));

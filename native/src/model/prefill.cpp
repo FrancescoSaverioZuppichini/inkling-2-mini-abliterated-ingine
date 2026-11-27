@@ -11,6 +11,7 @@
 
 #include "core/device.h"
 #include "ingine/generator.h"
+#include "kernels/attn/attn.h"
 #include "kernels/dense/dense.h"
 #include "kernels/prefill/prefill.h"
 
@@ -224,7 +225,7 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
       mix(blocks, base, write, r_prev, w_prev, partial_out, queries, nq, nullptr, nullptr, mixf_);
       pk::GateRows rows;
       for (int g = 0; g < 3; ++g) rows.h[g] = mixf_ + (layer.full ? g : 0) * slab, rows.msg[g] = msgs_ + g * slab;
-      gates(rows, 3, layer.qkv_gate_down, layer.qkv_gate_forget16, layer.qkv_gate_gain16, f32p(layer.attn_norm3),
+      gates(rows, 3, layer.qkv_gate_down, layer.qkv_gate_forget, layer.qkv_gate_gain, f32p(layer.attn_norm3),
             xin_);
     } else {
       mix(blocks, base, write, r_prev, w_prev, partial_out, l > 0 ? queries : nullptr, l > 0 ? nq : 1,
@@ -267,14 +268,24 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
     ap.q = q_, ap.rel = rel16_;
     pk::AttnParams at;
     at.q = q_, at.T = T, at.pos0 = pos0, at.rel = rel_, at.proj = proj_, at.ld = R, at.out = attn_out_;
-    if (layer.full) {
+    const bool packed = layer.full && kernels::attn::low_bit(st.kv);
+    if (packed) {
+      // [Agent] int4 caches: attn_prep writes the chunk's BF16 rows into the sliding-ring scratch (free during a
+      // full visit) and pack_rows encodes them into the cache, so every key, the chunk's own included, is attended
+      // from the cache exactly as decode will read it.
+      ap.k_out = krows_, ap.v_out = vrows_, ap.out_fp8 = false;
+      pk::attn_prep(ap, s);
+      kernels::attn::pack_rows(krows_, vrows_, T, pos0, st.k_full_at(FULL_INDEX[v]).data,
+                               st.v_full_at(FULL_INDEX[v]).data, s);
+    } else if (layer.full) {
       const int fi = FULL_INDEX[v];
-      const std::size_t es = st.kv_fp8 ? 1 : 2, off = std::size_t(pos0) * KV_DIM * es;
+      const bool fp8 = st.kv == KvFormat::fp8;
+      const std::size_t off = std::size_t(pos0) * KV_DIM * (fp8 ? 1 : 2);
       void* kc = st.k_full_at(fi).data;
       void* vc = st.v_full_at(fi).data;
-      ap.k_out = static_cast<char*>(kc) + off, ap.v_out = static_cast<char*>(vc) + off, ap.out_fp8 = st.kv_fp8;
+      ap.k_out = static_cast<char*>(kc) + off, ap.v_out = static_cast<char*>(vc) + off, ap.out_fp8 = fp8;
       pk::attn_prep(ap, s);
-      at.k = kc, at.v = vc, at.kv_fp8 = st.kv_fp8, at.kpos = nullptr, at.bounds = nullptr, at.L = pos0 + T;
+      at.k = kc, at.v = vc, at.kv_fp8 = fp8, at.kpos = nullptr, at.bounds = nullptr, at.L = pos0 + T;
       at.window = 0;
     } else {
       const int ri = RING_INDEX[v];
@@ -297,7 +308,11 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
     // a half-empty wave per part.
     if (layer.full || !split_sliding_) {
       pk::rel_logits(rel16_, f32p(layer.rel_proj), T, rel_, s);
-      pk::attention(at, s);
+      if (packed)
+        kernels::attn::prefill_attend({q_, rel_, proj_, R, T, pos0, st.k_full_at(FULL_INDEX[v]).data,
+                                       st.v_full_at(FULL_INDEX[v]).data, attn_out_}, s);
+      else
+        pk::attention(at, s);
     } else {
       for (int t0 = 0; t0 < T; t0 += kSlideRows) {
         const int n = std::min(kSlideRows, T - t0);
@@ -324,7 +339,7 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
           nullptr, mixm_);
       pk::GateRows rows;
       rows.h[0] = mixm_, rows.msg[0] = msgs_ + 3 * slab;
-      gates(rows, 1, layer.mlp1_gate_down, layer.mlp1_gate_forget16, layer.mlp1_gate_gain16, f32p(layer.mlp_norm1),
+      gates(rows, 1, layer.mlp1_gate_down, layer.mlp1_gate_forget, layer.mlp1_gate_gain, f32p(layer.mlp_norm1),
             xm_);
     } else {
       mix(mlp_blocks, mbase, y_, attn_dirs + std::size_t(v) * H, attn_w + 4 * std::size_t(v), part_, f32p(layer.mlp_query), 1,
@@ -332,7 +347,7 @@ void Prefiller::run(State& st, const std::int32_t* tokens, int T, int pos0, floa
     }
 
     // ---- routed experts (model._moe_grouped) + post-MLP conv
-    gemm_->run(xm_, H, bf16p(layer.router_bf16), H, router_logits_, EXPERTS, true, T, EXPERTS, H, s);
+    gemm_->run(xm_, H, bf16p(layer.router), H, router_logits_, EXPERTS, true, T, EXPERTS, H, s);
     CUDA_CHECK(cudaMemsetAsync(counts_, 0, EXPERTS * sizeof(int), s));
     pk::moe_topk(router_logits_, f32p(layer.router_bias), T, idx_, wts_, counts_, s);
     const pk::MoeWork work{counts_, tiles_n_, tiles_, pair_token_, pair_dst_};

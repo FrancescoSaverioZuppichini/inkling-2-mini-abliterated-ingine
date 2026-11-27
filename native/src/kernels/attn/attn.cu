@@ -77,6 +77,7 @@
 // * Positions are int32 on the device (row offsets 64-bit); the host caps full caches at 2^30 rows.
 // Ported from engine/csrc/attn/attn.cu (kernel bodies unchanged; torch launcher -> raw pointers).
 #include "kernels/attn/attn.h"
+#include "kernels/attn/attn_common.cuh"
 
 #include "kernels/common/fp8x.cuh"
 #include "kernels/common/l2.cuh"
@@ -96,36 +97,9 @@
 namespace ingine::kernels::attn {
 namespace {
 
-constexpr int HQ = 24, HKV = 8, D = 128, DREL = 16, EXT = 1024, WIN = 1024, GQA = 3, CONV_C = HKV * D;
-constexpr int OFF_GATE = 3072, OFF_REL = 6144, OFF_SINK = 6528, OFF_K = 6552, OFF_V = 7576, OFF_KDYN = 8600,
-              OFF_VDYN = 8632;
-constexpr int R_SLIDING = 8600, R_FULL = 8664;
-constexpr int CS = 16;  // blocks per KV head = cluster size; block r outputs dims [8r, 8r + 8)
 constexpr int OD = D / CS;
-// [Agent] Without clusters (sm_86, sm_89) nothing ties the split to the output layout: the head's last block merges
-// all its partials. So the blocks per KV head (Params::cs) are chosen per GPU and width, up to MAXCS; with clusters
-// cs is always CS.
-constexpr int MAXCS = 16;
-constexpr int MAXM = 8;
 constexpr int U = 2;  // key pairs per warp per register buffer
 constexpr int MAXWARPS = 8;
-constexpr float CLIP_QK = 22.627416997969522f, CLIP_REL = 8.f;
-constexpr float LOG2E = 1.4426950408889634f;
-constexpr float QSCALE = 0.08838834764831845f * LOG2E;  // 1/sqrt(128) * log2(e)
-constexpr float NEG_INIT = -1e30f;
-constexpr float INV_SQRT5 = 1.f / 2.2360679774997896f;  // torch: x / scalar == x * (1 / float(scalar))
-constexpr float INV_3 = 1.f / 3.f;
-// workspace: int32 counter (kpos ordering for M > 1, zeroed once at allocation) then the split partials
-// fp32 [HKV][CS][3M][PSTR]: o (D) then (max, sum)
-constexpr size_t WS_PART = 256;
-constexpr int PSTR = D + 4;
-constexpr size_t ws_part_bytes(int M) { return size_t(HKV) * MAXCS * GQA * M * PSTR * 4; }
-// [Agent] Pre-sm_90 only: counters 1..8 (one per KV head, in the reserved first 256 bytes) and the owner's new K/V
-// rows staged bf16 [HKV][2][M][D] after the partials, for the head's last block to write into the ring.
-constexpr size_t ws_bytes(int M) { return WS_PART + ws_part_bytes(M) + size_t(HKV) * 2 * M * D * 2; }
-
-constexpr int NT = 256;  // threads per block (8 warps) for every M
-
 // dynamic shared memory layout (floats), per M
 template <int M, bool F8 = false>
 struct Smem {
@@ -231,20 +205,6 @@ struct Params {
     int cs;    // blocks per KV head (gridDim.x): CS with clusters, else 1..MAXCS
 };
 
-__device__ __forceinline__ float bf16r(float x) { return __bfloat162float(__float2bfloat16_rn(x)); }
-
-__device__ __forceinline__ float hsum16(float x) {
-#pragma unroll
-    for (int o = 1; o < 16; o <<= 1) x += __shfl_xor_sync(0xffffffffu, x, o);
-    return x;
-}
-
-__device__ __forceinline__ float wsum(float x) {
-#pragma unroll
-    for (int o = 1; o < 32; o <<= 1) x += __shfl_xor_sync(0xffffffffu, x, o);
-    return x;
-}
-
 __device__ __forceinline__ void unpack8(const uint4 u, float f[8]) {
     f[0] = __uint_as_float(u.x << 16), f[1] = __uint_as_float(u.x & 0xffff0000u);
     f[2] = __uint_as_float(u.y << 16), f[3] = __uint_as_float(u.y & 0xffff0000u);
@@ -276,27 +236,7 @@ __device__ __forceinline__ uint32_t pack_e4m3x2(float a, float b) {
     return __nv_cvt_float2_to_fp8x2(make_float2(a, b), __NV_SATFINITE, __NV_E4M3);
 }
 
-// Loads of anything an earlier kernel writes (caches, kpos, pos) are coherent `asm volatile` with a memory
-// clobber, so the compiler cannot hoist them above griddepcontrol.wait (programmatic dependent launch).
-// Cached K/V rows are read once per step (the next read of a ring row is a full step, ~1.5 GB of streams,
-// later): their L2 lines are filled evict-first (kernels/common/l2.cuh).
-constexpr l2::Evict KV_L2 = l2::Evict::first;
-
-__device__ __forceinline__ uint4 ld_kv(const void* ptr, std::uint64_t pol) {
-    uint4 v;
-    if constexpr (l2::hinted<KV_L2>)
-        asm volatile("ld.global.L1::no_allocate.L2::cache_hint.v4.u32 {%0,%1,%2,%3}, [%4], %5;"
-                     : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
-                     : "l"(ptr), "l"(pol)
-                     : "memory");
-    else
-        asm volatile("ld.global.L1::no_allocate.v4.u32 {%0,%1,%2,%3}, [%4];"
-                     : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
-                     : "l"(ptr)
-                     : "memory");
-    return v;
-}
-
+// ld_kv for 8 bytes (E4M3 rows)
 __device__ __forceinline__ uint2 ld_kv8(const void* ptr, std::uint64_t pol) {
     uint2 v;
     if constexpr (l2::hinted<KV_L2>)
@@ -307,23 +247,6 @@ __device__ __forceinline__ uint2 ld_kv8(const void* ptr, std::uint64_t pol) {
     else
         asm volatile("ld.global.L1::no_allocate.v2.u32 {%0,%1}, [%2];" : "=r"(v.x), "=r"(v.y) : "l"(ptr) : "memory");
     return v;
-}
-
-__device__ __forceinline__ long long ld_s64(const long long* ptr) {
-    long long v;
-    asm volatile("ld.global.s64 %0, [%1];" : "=l"(v) : "l"(ptr) : "memory");
-    return v;
-}
-
-__device__ __forceinline__ void cp16(float* dst, const float* src) {
-    asm volatile("cp.async.ca.shared.global [%0], [%1], 16;" ::"r"(unsigned(__cvta_generic_to_shared(dst))),
-                 "l"(src)
-                 : "memory");
-}
-
-__device__ __forceinline__ void cp4(float* dst, const float* src) {
-    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;" ::"r"(unsigned(__cvta_generic_to_shared(dst))), "l"(src)
-                 : "memory");
 }
 
 // zero-filling variants: nothing is read when !ok (cp16z: cached K/V rows, KV_L2 lines)
@@ -348,13 +271,6 @@ __device__ __forceinline__ void cp4z(float* dst, const float* src, bool ok) {
 __device__ __forceinline__ uint32_t pack2(float a, float b) {
     const __nv_bfloat162 v = __floats2bfloat162_rn(a, b);
     return *reinterpret_cast<const uint32_t*>(&v);
-}
-
-// clip factor min(1, t / (sqrt(ss) + 1e-6)) without the IEEE sqrt / div slow-path branches (which
-// serialise the six reductions of the q / rel prologue); differs from torch by a couple of FP32 ulp
-__device__ __forceinline__ float clip_factor(float ss, float t) {
-    const float norm = ss > 0.f ? ss * rsqrtf(ss) : 0.f;
-    return fminf(1.f, __fdividef(t, norm + 1e-6f));
 }
 
 template <typename KV>  // 8 dims of a cache row: uint4 = BF16, uint2 = E4M3
@@ -598,20 +514,12 @@ __global__ void __launch_bounds__(MAXWARPS * 32, min_blocks(M, FULL)) attn_decod
             const float tau = tau_of(0);
             if (warp < GQA) {
                 float4* qa = reinterpret_cast<float4*>(sm + L::Q + i * D) + lane;
-                const float4 a = *qa, s = reinterpret_cast<const float4*>(sm + L::QS + i * D)[lane];
-                float x[4] = {a.x * s.x, a.y * s.y, a.z * s.z, a.w * s.w};
-                const float f = clip_factor(wsum(x[0] * x[0] + x[1] * x[1] + x[2] * x[2] + x[3] * x[3]), CLIP_QK);
-#pragma unroll
-                for (int e = 0; e < 4; ++e) {
-                    x[e] = bf16r(x[e] * f);
-                    if (p.log_scaling) x[e] = bf16r(x[e] * tau);
-                }
+                float x[4];
+                q_post(x, *qa, reinterpret_cast<const float4*>(sm + L::QS + i * D)[lane], tau, p.log_scaling);
                 *qa = make_float4(x[0] * QSCALE, x[1] * QSCALE, x[2] * QSCALE, x[3] * QSCALE);
             } else {
                 float* ra = sm + L::REL + i * DREL + c;
-                const float r = *ra * sm[L::RS + i * DREL + c];
-                float y = bf16r(r * clip_factor(hsum16(r * r), CLIP_REL));
-                if (p.log_scaling) y = bf16r(y * tau);
+                const float y = rel_post(*ra * sm[L::RS + i * DREL + c], tau, p.log_scaling);
                 __syncwarp();
                 if (half == 0) *ra = y;
             }
@@ -620,16 +528,9 @@ __global__ void __launch_bounds__(MAXWARPS * 32, min_blocks(M, FULL)) attn_decod
 #pragma unroll
         for (int k = 0; k < (ROWS + 7) / 8; ++k) {
             const int rq = warp + 8 * k, row = min(rq, ROWS - 1), i = row % GQA;
-            const float tau = tau_of(row / GQA);
-            const float4 a = reinterpret_cast<const float4*>(sm + L::Q + row * D)[lane];
-            const float4 s = reinterpret_cast<const float4*>(sm + L::QS + i * D)[lane];
-            float x[4] = {a.x * s.x, a.y * s.y, a.z * s.z, a.w * s.w};
-            const float f = clip_factor(wsum(x[0] * x[0] + x[1] * x[1] + x[2] * x[2] + x[3] * x[3]), CLIP_QK);
-#pragma unroll
-            for (int e = 0; e < 4; ++e) {
-                x[e] = bf16r(x[e] * f);
-                if (p.log_scaling) x[e] = bf16r(x[e] * tau);
-            }
+            float x[4];
+            q_post(x, reinterpret_cast<const float4*>(sm + L::Q + row * D)[lane],
+                   reinterpret_cast<const float4*>(sm + L::QS + i * D)[lane], tau_of(row / GQA), p.log_scaling);
             if (rq < ROWS) {  // exact bf16 q for the tensor cores (scale applied to the scores)
                 __nv_bfloat16* qb = reinterpret_cast<__nv_bfloat16*>(sm + L::QB);
                 reinterpret_cast<uint2*>(qb + row * D + (((lane >> 1) ^ (row & 7)) * 8) + (lane & 1) * 4)[0] =
@@ -639,9 +540,7 @@ __global__ void __launch_bounds__(MAXWARPS * 32, min_blocks(M, FULL)) attn_decod
 #pragma unroll
         for (int k = 0; k < (ROWS + 15) / 16; ++k) {
             const int rr = warp * 2 + half + 16 * k, row = min(rr, ROWS - 1), i = row % GQA;
-            const float r = sm[L::REL + row * DREL + c] * sm[L::RS + i * DREL + c];
-            float y = bf16r(r * clip_factor(hsum16(r * r), CLIP_REL));
-            if (p.log_scaling) y = bf16r(y * tau_of(row / GQA));
+            const float y = rel_post(sm[L::REL + row * DREL + c] * sm[L::RS + i * DREL + c], tau_of(row / GQA), p.log_scaling);
             if (rr < ROWS) sm[L::RELD + row * DREL + c] = y;
         }
     }
@@ -665,42 +564,13 @@ __global__ void __launch_bounds__(MAXWARPS * 32, min_blocks(M, FULL)) attn_decod
     // ---- owner: new keys / values of this KV head
     if (owner) {
         float* nkf = sm + L::NKF;  // [2][M][D]
-        for (int idx = tid; idx < 2 * D; idx += NT) {
-            const int kv = idx / D, ch = idx % D;
-            float e[3 + M];  // [state, x_0..x_{M-1}]
-#pragma unroll
-            for (int j = 0; j < 3; ++j) e[j] = sm[L::ST + (j * 2 + kv) * D + ch];
-#pragma unroll
-            for (int m = 0; m < M; ++m) e[3 + m] = sm[L::X + (m * 2 + kv) * D + ch];
-#pragma unroll
-            for (int m = 0; m < M; ++m) {
-                float y;
-                if constexpr (FULL) {  // dynamic conv, weights by lag (0 = current), / sqrt(9)
-                    float o = 0.f;
-#pragma unroll
-                    for (int lag = 0; lag < 4; ++lag) {
-                        const float w = __fadd_rn(sm[L::W + (kv * 4 + lag) * D + ch], sm[L::DYN + (m * 2 + kv) * 4 + lag]);
-                        o = __fadd_rn(o, __fmul_rn(w, e[m + 3 - lag]));
-                    }
-                    y = __fmul_rn(__fadd_rn(o, e[m + 3]), INV_3);
-                } else {  // static conv, conv1d order (tap 3 = current), / sqrt(5)
-                    const float* w = sm + L::W + (kv * D + ch) * 4;
-                    float o = __fmul_rn(w[0], e[m]);
-#pragma unroll
-                    for (int j = 1; j < 4; ++j) o = __fadd_rn(o, __fmul_rn(w[j], e[m + j]));
-                    y = __fmul_rn(__fadd_rn(o, e[m + 3]), INV_SQRT5);
-                }
-                nkf[(kv * M + m) * D + ch] = bf16r(y);
-            }
-#pragma unroll
-            for (int i = 0; i < 3; ++i) sm[L::NST + (i * 2 + kv) * D + ch] = e[M + i];
-        }
+        owner_conv<M, FULL>(sm + L::ST, sm + L::X, sm + L::W, sm + L::DYN, nkf, sm + L::NST, tid);
         __syncthreads();
         for (int pr = warp; pr < 2 * M; pr += NT / 32) {
             const int kv = pr / M, m = pr % M;
             const float4 x = reinterpret_cast<const float4*>(nkf + pr * D)[lane];
             const float ss = wsum(x.x * x.x + x.y * x.y + x.z * x.z + x.w * x.w);
-            const float f = kv == 0 ? clip_factor(ss, CLIP_QK) : rsqrtf(ss / float(D) + 1e-6f);
+            const float f = kv_norm(ss, kv == 1);
             float y[4] = {x.x * f, x.y * f, x.z * f, x.w * f};
             if constexpr (F8) {  // the values the cache will hold: BF16, then E4M3 (exact in BF16)
 #pragma unroll
@@ -1276,10 +1146,6 @@ __global__ void __launch_bounds__(MAXWARPS * 32, min_blocks(M, FULL)) attn_decod
 #endif
 }
 
-void require(bool ok, const char* what) {
-    if (!ok) throw std::invalid_argument(std::string("attn: ") + what);
-}
-
 using KernelFn = void (*)(Params);
 
 struct Kernel {
@@ -1358,25 +1224,9 @@ Kernel select(int M) {
     }
 }
 
-// attrs[0]: cluster of CS blocks; attrs[1]: programmatic dependent launch (the kernel waits with
-// griddepcontrol.wait before touching anything an earlier kernel may write; a no-op without PDL)
-cudaLaunchConfig_t launch_config(const Kernel& k, cudaStream_t stream, cudaLaunchAttribute* attrs, int cs = CS) {
-    cudaLaunchConfig_t cfg{};
-    cfg.gridDim = dim3(cs, HKV);
-    cfg.blockDim = dim3(NT);
-    cfg.dynamicSmemBytes = k.smem;
-    cfg.stream = stream;
-    attrs[0].id = cudaLaunchAttributeClusterDimension;
-    attrs[0].val.clusterDim.x = CS, attrs[0].val.clusterDim.y = 1, attrs[0].val.clusterDim.z = 1;
-    attrs[1].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attrs[1].val.programmaticStreamSerializationAllowed = 1;
-    cfg.attrs = attrs;
-    cfg.numAttrs = 2;
-    if (!device_has_clusters()) cfg.attrs = attrs + 1, cfg.numAttrs = 1;  // plain grid (+ the ignored PDL attribute)
-    return cfg;
-}
-
 }  // namespace
+
+void attn_decode_lb(const DecodeArgs& a, cudaStream_t stream);  // attn_lb.cu
 
 std::size_t workspace_bytes(int max_m) {
     require(max_m >= 1 && max_m <= MAXM, "max_m must be in 1..8");
@@ -1388,7 +1238,7 @@ int max_active_clusters(int M, int window) {
     // the FP8 variants have the same launch shape, shared memory and register cap (launch bounds)
     const Kernel k = window == 0 ? select<true>(M) : select<false>(M);
     cudaLaunchAttribute attrs[2];
-    cudaLaunchConfig_t cfg = launch_config(k, nullptr, attrs);
+    cudaLaunchConfig_t cfg = launch_config(k.smem, nullptr, attrs, CS, true);
     cfg.numAttrs = 1;  // occupancy: the cluster shape only
     int n = 0;
     CUDA_CHECK(cudaOccupancyMaxActiveClusters(&n, k.fn, &cfg));
@@ -1403,7 +1253,7 @@ void attn_decode(const DecodeArgs& a, cudaStream_t stream) {
     require(a.proj && a.q_scale && a.r_scale && a.rel_proj && a.k_conv && a.v_conv && a.conv_k_state &&
                 a.conv_v_state && a.k_cache && a.v_cache && a.pos && a.workspace && a.out,
             "null argument");
-    require(full || !a.cache_fp8, "float8_e4m3fn caches are supported on full layers (window = 0) only");
+    require(full || a.kv == KvFormat::bf16, "sliding caches are bf16");
     // device positions and loop bounds are int32; 2^30 leaves headroom for the tile strides
     require(a.cache_rows >= 1 && a.cache_rows <= (int64_t(1) << 30), "caches hold 1..2^30 positions");
     if (!full) {
@@ -1411,6 +1261,7 @@ void attn_decode(const DecodeArgs& a, cudaStream_t stream) {
         require(a.kpos != nullptr, "sliding layers need kpos");
     }
     require(a.workspace_size >= ws_bytes(M), "workspace too small: need workspace_bytes(M)");
+    if (full && low_bit(a.kv)) return attn_decode_lb(a, stream);
 
     Params p{};
     p.proj = a.proj;
@@ -1431,10 +1282,10 @@ void attn_decode(const DecodeArgs& a, cudaStream_t stream) {
     p.counter = static_cast<int*>(a.workspace);
     p.part = reinterpret_cast<float*>(static_cast<char*>(a.workspace) + WS_PART);
     p.out = a.out;
-    const Kernel k = full ? (a.cache_fp8 ? select<true, true>(M) : select<true>(M)) : select<false>(M);
+    const Kernel k = full ? (a.kv == KvFormat::fp8 ? select<true, true>(M) : select<true>(M)) : select<false>(M);
     p.cs = device_has_clusters() || M == 1 ? CS : k.split;
     cudaLaunchAttribute attrs[2];
-    const cudaLaunchConfig_t cfg = launch_config(k, stream, attrs, p.cs);
+    const cudaLaunchConfig_t cfg = launch_config(k.smem, stream, attrs, p.cs, true);
     CUDA_CHECK(cudaLaunchKernelEx(&cfg, k.fn, p));
 }
 

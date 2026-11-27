@@ -39,10 +39,9 @@ namespace ingine::model {
 // model.Ablation.load/none, model.State)
 Weights load_weights(const std::filesystem::path& model_dir, bool dense_fp8, bool embed_host, cudaStream_t stream);
 // One layer as weights.load_layer (+ the decoder's derived tensors), for kernel tests; owns its memory.
-Layer load_layer(const std::filesystem::path& model_dir, int l, bool dense_fp8, cudaStream_t stream,
-                 std::vector<DeviceBuffer>& storage);
+Layer load_layer(const std::filesystem::path& model_dir, int l, bool dense_fp8, cudaStream_t stream, DeviceHeap& heap);
 Ablation load_ablation(const std::filesystem::path& path);  // empty path: Ablation.none()
-State make_state(int max_ctx, bool kv_fp8);
+State make_state(int max_ctx, KvFormat kv);
 Buffers make_buffers(int m);
 
 // model.State.reset: ring_pos = -1, conv states = 0, length = 0 (caches keep their contents).
