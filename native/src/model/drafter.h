@@ -26,6 +26,7 @@
 #include "model/model_data.h"
 
 #include "core/arena.h"
+#include "core/host_memory.h"
 #include "core/tensor.h"
 
 #include <cuda_bf16.h>
@@ -172,7 +173,10 @@ class Drafter {
   std::array<DraftLayer, 3> layers_{};
   const __nv_bfloat16* alpha_ = nullptr;  // bf16 [4, 4] softmax(fuse_weight)
   const __nv_bfloat16 *final_norm_ = nullptr, *mask_embed_ = nullptr, *f_norm_ = nullptr;
-  const __nv_bfloat16 *w1_ = nullptr, *rnn_w_ = nullptr, *rnn_b_ = nullptr;
+  const __nv_bfloat16 *w1_ = nullptr, *rnn_w_ = nullptr, *rnn_b_ = nullptr;  // w1_: mapped host memory
+  MappedHostBuffer w1_host_;              // markov_w1, all rows
+  __nv_bfloat16* w1_rows_ = nullptr;      // markov_w1 rows of the shortlist head's rows (device)
+  void put_w1_rows(std::span<const std::int32_t> ids, int row);
   __nv_bfloat16 *fold_w_ = nullptr, *fold_b_ = nullptr;
   kernels::dense::Matrix head_{};         // the unembedding
   // the shortlist head: rows [0, short_K_) = ranked tokens and specials (ascending ids), then context tokens
@@ -193,7 +197,7 @@ class Drafter {
   float *qkv_out_ = nullptr, *gu_out_ = nullptr, *delta_ = nullptr, *base_ = nullptr, *attn_ws_ = nullptr;
   float *cand_val_ = nullptr, *cand_logits_ = nullptr, *part_ = nullptr;
   void* topk_ws_ = nullptr;
-  std::int32_t *cand_idx_ = nullptr, *prev_cand_ = nullptr;
+  std::int32_t *cand_idx_ = nullptr, *cand_row_ = nullptr, *prev_cand_ = nullptr;
   unsigned long long* picks_ = nullptr;
   float *draft_logits_ = nullptr, *conf_ = nullptr, *qstats_ = nullptr;
   std::int32_t* tokens_ = nullptr;

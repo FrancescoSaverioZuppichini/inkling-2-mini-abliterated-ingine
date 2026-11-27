@@ -91,6 +91,7 @@ Drafter::Drafter(const std::filesystem::path& model_dir, const Weights& w, int m
   cand_logits_ = f32s(GAMMA * kd::CANDIDATES);
   part_ = f32s(GAMMA * kd::RNN_OUT);
   cand_idx_ = i32s(GAMMA * kd::CANDIDATES);
+  cand_row_ = i32s(GAMMA * kd::CANDIDATES);
   prev_cand_ = i32s(GAMMA * kd::CANDIDATES);
   picks_ = static_cast<unsigned long long*>(alloc(GAMMA * sizeof(unsigned long long)));
   draft_logits_ = f32s(std::size_t(GAMMA) * V_);
@@ -141,6 +142,8 @@ Drafter::Drafter(const std::filesystem::path& model_dir, const Weights& w, int m
     short_map_ = i32s(rows);
     CUDA_CHECK(cudaMemsetAsync(short_map_, 0, std::size_t(rows) * 4, stream_));
     CUDA_CHECK(cudaMemcpyAsync(short_map_, list.data(), list.size() * 4, cudaMemcpyHostToDevice, stream_));
+    w1_rows_ = bf16s(std::size_t(rows) * kd::RANK);
+    put_w1_rows(list, 0);
     short_head_ = kdense::Matrix{head_.w, head_.scale, rows, short_map_};
     seg_short_ = segments({short_K_});
     kd::fill(base_, std::size_t(GAMMA) * rows, -INFINITY, stream_);
@@ -284,9 +287,19 @@ void Drafter::load(const std::filesystem::path& model_dir) {
   final_norm_ = persist({{"norm.weight", {h}}});
   mask_embed_ = persist({{"mask_embed", {h}}});
   const std::string mh = "markov_head.";
-  w1_ = persist({{mh + "markov_w1.weight", {f.at(mh + "markov_w1.weight").shape.at(0), kd::RANK}}});
-  if (f.at(mh + "markov_w1.weight").shape.at(0) < V_)
-    throw std::runtime_error("mtp.safetensors: markov_w1 has fewer rows than the vocabulary");
+  {
+    // [Agent] markov_w1 (98 MiB) is read one 512-byte row per draft step. The rows of shortlist tokens, the only
+    // tokens a step past the first can follow, are copied to the device (w1_rows_, built with the shortlist); the
+    // whole table stays in pinned host memory for the anchor's row, one PCIe read per round.
+    const SafetensorsTensor& t = f.at(mh + "markov_w1.weight");
+    if (t.dtype != "BF16" || t.shape.size() != 2 || t.shape[1] != kd::RANK)
+      throw std::runtime_error("mtp.safetensors: unexpected markov_w1");
+    if (t.shape[0] < V_) throw std::runtime_error("mtp.safetensors: markov_w1 has fewer rows than the vocabulary");
+    const std::vector<std::byte> bytes = f.read(mh + "markov_w1.weight");
+    w1_host_ = MappedHostBuffer(bytes.size());
+    std::memcpy(w1_host_.data(), bytes.data(), bytes.size());
+    w1_ = static_cast<const __nv_bfloat16*>(w1_host_.device_ptr());
+  }
   rnn_w_ = persist({{mh + "rnn_proj.weight", {kd::RNN_OUT, kd::RNN_IN}}});
   rnn_b_ = persist({{mh + "rnn_proj.bias", {kd::RNN_OUT}}});
   f_norm_ = persist({{mh + "dflare_norm.weight", {h}}});
@@ -331,10 +344,21 @@ void Drafter::note_tokens(std::span<const std::int32_t> ids) {
   const std::size_t row = std::size_t(short_K_ + short_E_);
   // pageable source: copied before cudaMemcpyAsync returns
   CUDA_CHECK(cudaMemcpyAsync(short_map_ + row, add.data(), add.size() * 4, cudaMemcpyHostToDevice, stream_));
+  put_w1_rows(add, int(row));
   short_extra_.insert(short_extra_.end(), add.begin(), add.end());
   short_E_ += int(add.size());
   const int seg[3] = {0, short_K_ + short_E_, 0};
   CUDA_CHECK(cudaMemcpyAsync(seg_short_, seg, sizeof seg, cudaMemcpyHostToDevice, stream_));
+}
+
+// markov_w1 rows of `ids` into w1_rows_ from shortlist row `row` on (pageable staging: copied before the call returns)
+void Drafter::put_w1_rows(std::span<const std::int32_t> ids, int row) {
+  std::vector<__nv_bfloat16> rows(ids.size() * kd::RANK);
+  const auto* all = static_cast<const __nv_bfloat16*>(w1_host_.data());
+  for (std::size_t i = 0; i < ids.size(); ++i)
+    std::memcpy(rows.data() + i * kd::RANK, all + std::size_t(ids[i]) * kd::RANK, kd::RANK * 2);
+  CUDA_CHECK(cudaMemcpyAsync(w1_rows_ + std::size_t(row) * kd::RANK, rows.data(), rows.size() * 2,
+                             cudaMemcpyHostToDevice, stream_));
 }
 
 void Drafter::set_seed(std::uint64_t seed) { kd::set_seed(params_, seed, stream_); }
@@ -494,10 +518,10 @@ void Drafter::run_layers(int bucket) {
   }
   const __nv_bfloat16* h = xn_ + H;  // rows 1..7
   kdense::proj(h, GAMMA, short_head_, seg_short_, 1, base_, true, stream_);
-  kd::topk_candidates(base_, GAMMA, short_head_.rows, short_map_, cand_val_, cand_idx_, topk_ws_, stream_);
+  kd::topk_candidates(base_, GAMMA, short_head_.rows, short_map_, cand_val_, cand_idx_, topk_ws_, stream_, cand_row_);
   kd::markov_pre(rnn_w_, h, f_rnn_, part_, stream_);
   for (int i = 0; i < GAMMA; ++i) {
-    kd::markov_step(i, rnn_w_, rnn_b_, w1_, part_, picks_, cand_idx_, params_, state_, latent_, stream_);
+    kd::markov_step(i, rnn_w_, rnn_b_, w1_rows_, w1_, part_, picks_, cand_row_, params_, state_, latent_, stream_);
     kd::markov_logits(i, fold_w_, fold_b_, cand_val_, cand_idx_, latent_, params_, cand_logits_, picks_, stream_);
   }
   kd::markov_finish(cand_idx_, cand_logits_, picks_, prev_cand_, draft_logits_, V_, tokens_, conf_, qstats_, params_,

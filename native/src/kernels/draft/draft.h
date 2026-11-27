@@ -151,25 +151,27 @@ void silu_mul(const float* gu, int rows, int inter, __nv_bfloat16* out, cudaStre
 // Top-CANDIDATES per row of base fp32 [rows, V] (BF16-representable values): the elements above the 1024th
 // value and, of those equal to it, the ones with the lowest indices. Order (fixed, not sorted): the elements
 // above it by ascending index, then the ties by ascending index. cand_val fp32 [rows, 1024]; cand_idx int32
-// [rows, 1024] = the element's index, or map[index] (a shortlist head's row -> token id) if map is not null.
+// [rows, 1024] = the element's index, or map[index] (a shortlist head's row -> token id) if map is not null;
+// cand_row (optional) int32 [rows, 1024] = the element's index.
 // A radix select over many CTAs per row; ws: topk_workspace_bytes(rows, V) bytes, zeroed before the first
 // call (every call leaves its histograms zeroed).
 std::size_t topk_workspace_bytes(int rows, int V);
 void topk_candidates(const float* base, int rows, int V, const std::int32_t* map, float* cand_val,
-                     std::int32_t* cand_idx, void* ws, cudaStream_t stream);
+                     std::int32_t* cand_idx, void* ws, cudaStream_t stream, std::int32_t* cand_row = nullptr);
 
 // part[i, r] = sum_{c >= 512} rnn_w[r, c] z_i[c] in fp32, z_i[512:] = (h[i], f_rnn): the step-independent
 // part of the rnn projection. rnn_w bf16 [768, 5120], h bf16 [GAMMA, H], f_rnn bf16 [H], part fp32 [7, 768].
 void markov_pre(const __nv_bfloat16* rnn_w, const __nv_bfloat16* h, const __nv_bfloat16* f_rnn, float* part,
                 cudaStream_t stream);
 
-// Step i's cell: prev = anchor (i = 0) or cand_idx[i-1, argmax pick of step i-1];
-// raw = bf16(bf16(rnn_w [state_i, W1[prev]] + part[i]) + rnn_b); gate = bf16(sigmoid), cell = bf16(tanh),
+// Step i's cell: W1[prev] = w1_anchor[anchor] (i = 0) or w1_rows[cand_row[i-1, argmax pick of step i-1]] (rows of
+// the table the candidates were scored over); raw = bf16(bf16(rnn_w [state_i, W1[prev]] + part[i]) + rnn_b); gate = bf16(sigmoid), cell = bf16(tanh),
 // state_{i+1} = bf16(bf16(gate state) + bf16(bf16(1 - gate) cell)), latent = bf16(tanh(raw[512:])).
 // state bf16 [GAMMA + 1, 256] (row 0 must be zero), latent bf16 [256].
-void markov_step(int i, const __nv_bfloat16* rnn_w, const __nv_bfloat16* rnn_b, const __nv_bfloat16* w1,
-                 const float* part, const unsigned long long* picks, const std::int32_t* cand_idx,
-                 const DraftParams* p, __nv_bfloat16* state, __nv_bfloat16* latent, cudaStream_t stream);
+void markov_step(int i, const __nv_bfloat16* rnn_w, const __nv_bfloat16* rnn_b, const __nv_bfloat16* w1_rows,
+                 const __nv_bfloat16* w1_anchor, const float* part, const unsigned long long* picks,
+                 const std::int32_t* cand_row, const DraftParams* p, __nv_bfloat16* state, __nv_bfloat16* latent,
+                 cudaStream_t stream);
 
 // Step i's candidate logits: bias = bf16(fold_b[c] + bf16(fold_w[c] . latent)),
 // logit = bf16(30 tanh(bf16(cand_val + bias) / 30)) -> cand_logits fp32 [7, 1024]; picks[i] = argmax of the

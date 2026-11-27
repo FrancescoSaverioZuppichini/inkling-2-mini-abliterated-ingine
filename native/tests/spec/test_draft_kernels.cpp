@@ -747,8 +747,8 @@ void test_markov(Rng& r) {
     std::vector<int> picks_host(kd::GAMMA);
     bool picks_ok = true;
     for (int i = 0; i < kd::GAMMA; ++i) {
-      kd::markov_step(i, d_rnn_w.get(), d_rnn_b.get(), d_w1.get(), d_part.get(), d_picks.get(), d_idx.get(), p.get(),
-                      d_state.get(), d_latent.get(), nullptr);
+      kd::markov_step(i, d_rnn_w.get(), d_rnn_b.get(), d_w1.get(), d_w1.get(), d_part.get(), d_picks.get(), d_idx.get(),
+                      p.get(), d_state.get(), d_latent.get(), nullptr);
       INGINE_TEST_CUDA(cudaDeviceSynchronize());
       const auto part = d_part.download();
       std::vector<float> raw(kd::RNN_OUT);
