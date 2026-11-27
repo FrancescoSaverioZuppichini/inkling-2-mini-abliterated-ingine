@@ -104,7 +104,7 @@ int main(int argc, char** argv) {
             &spec_threshold);
   ap.option("--park-host-mb", "",
             "pinned host memory (MiB) for conversations displaced by another one, least recently used evicted; "
-            "0 = off (default: a quarter of system RAM, at most 32 GiB)",
+            "0 = off (default: room for two conversations at --max-ctx, at least a quarter of RAM up to 32 GiB, never over half)",
             &park_host_mb);
   ap.option("--prefill-chunk", "",
             "prompt tokens per prefill step; its workspace is ~0.37 GB per 1024 tokens, so 1024 frees ~0.75 GB of "

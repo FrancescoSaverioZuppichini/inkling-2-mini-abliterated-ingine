@@ -128,8 +128,8 @@ struct RuntimeOptions {
   bool embed_host = false;
   float spec_threshold = 0.8f;
   // Conversation parking: pinned host memory (MiB) for the checkpoints and full-attention rows of conversations
-  // displaced by another one, least recently used evicted; 0 disables; negative: a quarter of system RAM, at most
-  // 32 GiB (pinned memory cannot be swapped or used as page cache, so it is not sized to all of RAM).
+  // displaced by another one, least recently used evicted; 0 disables; negative: room for two conversations at
+  // max_ctx, at least a quarter of RAM up to 32 GiB, never over half (pinned memory cannot be swapped).
   int park_host_mb = -1;
   // Image input: load the vision tower (636 MB of the checkpoint, resident) and accept prompts with images.
   bool vision = false;
